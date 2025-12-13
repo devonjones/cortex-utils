@@ -162,7 +162,7 @@ class PartitionManager:
                             last_error, created_at
                         )
                         SELECT
-                            queue_name, payload, 'pending', attempts, max_attempts,
+                            queue_name, payload, 'pending', 0, max_attempts,
                             last_error, NOW()
                         FROM {partition_name}
                         WHERE status IN ('pending', 'processing');
