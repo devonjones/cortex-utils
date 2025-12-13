@@ -117,6 +117,10 @@ class PartitionManager:
         row_count = 0
 
         with self.conn.cursor() as cur:
+            # Lock the partition to prevent writes during this transaction
+            # SHARE MODE allows reads but blocks INSERT/UPDATE/DELETE
+            cur.execute(f"LOCK TABLE {partition_name} IN SHARE MODE;")
+
             # Count rows by status
             cur.execute(f"""
                 SELECT status, COUNT(*) FROM {partition_name}
