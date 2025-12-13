@@ -143,7 +143,7 @@ class PartitionManager:
                         pending=pending_count,
                         processing=processing_count,
                     )
-                    self.conn.commit()  # Release transaction lock
+                    self.conn.rollback()  # Release transaction lock (no changes made)
                     return {
                         "archived_failed": 0,
                         "requeued": 0,
