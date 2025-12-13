@@ -85,7 +85,7 @@ def queue_stats(ctx: click.Context, history: int) -> None:
             click.echo(f"WARNING: {len(stale)} stale jobs (processing > 30 min):")
             for job in stale[:5]:
                 click.echo(
-                    f"  - [{job['queue_name']}] id={job['id']} " f"stuck {job['minutes_stuck']} min"
+                    f"  - [{job['queue_name']}] id={job['id']} stuck {job['minutes_stuck']} min"
                 )
     finally:
         conn.close()
