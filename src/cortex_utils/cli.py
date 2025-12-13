@@ -163,11 +163,22 @@ def partitions_create(
 
 @partitions.command("drop")
 @click.option("--date", "date_str", required=True, help="Date of partition to drop (YYYY-MM-DD)")
-@click.option("--force", is_flag=True, help="Skip confirmation")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Force drop even if partition has pending/processing jobs (re-enqueues them)",
+)
 @click.option("--dry-run", is_flag=True, help="Show what would be done")
 @click.pass_context
-def partitions_drop(ctx: click.Context, date_str: str, force: bool, dry_run: bool) -> None:
-    """Drop a specific partition."""
+def partitions_drop(
+    ctx: click.Context, date_str: str, yes: bool, force: bool, dry_run: bool
+) -> None:
+    """Drop a specific partition.
+
+    By default, refuses to drop partitions with pending/processing jobs.
+    Use --force to re-enqueue those jobs to today's partition and drop anyway.
+    """
     from datetime import datetime
 
     config = ctx.obj["config"]
@@ -177,17 +188,29 @@ def partitions_drop(ctx: click.Context, date_str: str, force: bool, dry_run: boo
         pm = PartitionManager(conn)
         partition_date = datetime.strptime(date_str, "%Y-%m-%d").date()
 
-        if not force and not dry_run:
-            click.confirm(
-                f"Drop partition for {partition_date}? Failed jobs will be archived.",
-                abort=True,
-            )
+        if not yes and not dry_run:
+            msg = f"Drop partition for {partition_date}?"
+            if force:
+                msg += " Active jobs will be re-enqueued."
+            msg += " Failed jobs will be archived."
+            click.confirm(msg, abort=True)
 
-        result = pm.drop_partition(partition_date, archive_failed=True, dry_run=dry_run)
-        click.echo(
-            f"Dropped partition: {result['dropped_rows']} rows, "
-            f"{result['archived_failed']} failed jobs archived"
+        result = pm.drop_partition(
+            partition_date, archive_failed=True, force=force, dry_run=dry_run
         )
+
+        if result.get("skipped_active"):
+            click.echo(
+                f"Skipped: partition has {result['skipped_active']} active jobs. "
+                "Use --force to re-enqueue them."
+            )
+        else:
+            parts = [f"{result['dropped_rows']} rows dropped"]
+            if result.get("requeued", 0) > 0:
+                parts.append(f"{result['requeued']} jobs re-enqueued")
+            if result.get("archived_failed", 0) > 0:
+                parts.append(f"{result['archived_failed']} failed archived")
+            click.echo("Dropped partition: " + ", ".join(parts))
     finally:
         conn.close()
 
@@ -200,7 +223,10 @@ def partitions_drop(ctx: click.Context, date_str: str, force: bool, dry_run: boo
 def partitions_maintain(
     ctx: click.Context, retention_days: int, days_ahead: int, dry_run: bool
 ) -> None:
-    """Run partition maintenance (create future, drop old)."""
+    """Run partition maintenance (create future, drop old).
+
+    Skips partitions that still have pending/processing jobs.
+    """
     config = ctx.obj["config"]
     conn = get_connection(config)
 
@@ -220,8 +246,12 @@ def partitions_maintain(
         click.echo("Maintenance complete:")
         click.echo(f"  Partitions created: {result['partitions_created']}")
         click.echo(f"  Partitions dropped: {result['partitions_dropped']}")
+        if result.get("partitions_skipped", 0) > 0:
+            click.echo(f"  Partitions skipped (have active jobs): {result['partitions_skipped']}")
         click.echo(f"  Rows dropped: {result['rows_dropped']}")
         click.echo(f"  Failed jobs archived: {result['failed_archived']}")
+        if result.get("requeued", 0) > 0:
+            click.echo(f"  Jobs re-enqueued: {result['requeued']}")
     finally:
         conn.close()
 

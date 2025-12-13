@@ -204,28 +204,37 @@ def migrate_to_partitioned(
         cur.execute("ALTER TABLE queue RENAME TO queue_old;")
         cur.execute("ALTER TABLE queue_new RENAME TO queue;")
 
-        # 6. Recreate indexes (constraint was renamed with table)
+        # 6. Recreate indexes on new table
+        # Note: The old indexes stay attached to queue_old, but we need unique names
         log.info("Recreating indexes")
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_pending_new
+            ON queue(queue_name, status, created_at)
+            WHERE status = 'pending';
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_processing_new
+            ON queue(queue_name, claimed_at)
+            WHERE status = 'processing';
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_payload_gmail_id_new
+            ON queue((payload->>'gmail_id'))
+            WHERE status = 'pending';
+        """)
+
+        # 7. Drop old indexes (attached to queue_old) and rename new ones
+        cur.execute("DROP INDEX IF EXISTS idx_queue_pending;")
+        cur.execute("DROP INDEX IF EXISTS idx_queue_processing;")
+        cur.execute("DROP INDEX IF EXISTS idx_queue_payload_gmail_id;")
+        cur.execute("DROP INDEX IF EXISTS idx_queue_pending_gmail_id;")
+        cur.execute("ALTER INDEX idx_queue_pending_new RENAME TO idx_queue_pending;")
+        cur.execute("ALTER INDEX idx_queue_processing_new RENAME TO idx_queue_processing;")
         cur.execute(
-            """
-            CREATE INDEX idx_queue_pending ON queue(queue_name, status, created_at)
-                WHERE status = 'pending';
-        """
-        )
-        cur.execute(
-            """
-            CREATE INDEX idx_queue_processing ON queue(queue_name, claimed_at)
-                WHERE status = 'processing';
-        """
-        )
-        cur.execute(
-            """
-            CREATE INDEX idx_queue_payload_gmail_id ON queue((payload->>'gmail_id'))
-                WHERE status = 'pending';
-        """
+            "ALTER INDEX idx_queue_payload_gmail_id_new RENAME TO idx_queue_payload_gmail_id;"
         )
 
-        # 7. Reset sequence to continue from max id
+        # 8. Reset sequence to continue from max id
         cur.execute("SELECT MAX(id) FROM queue;")
         max_id = cur.fetchone()[0] or 0
         cur.execute(f"SELECT setval('queue_id_seq', {max_id + 1}, false);")
