@@ -117,9 +117,9 @@ class PartitionManager:
         row_count = 0
 
         with self.conn.cursor() as cur:
-            # Lock the partition to prevent writes during this transaction
-            # SHARE MODE allows reads but blocks INSERT/UPDATE/DELETE
-            cur.execute(f"LOCK TABLE {partition_name} IN SHARE MODE;")
+            # Lock the partition to prevent all writes during this transaction
+            # SHARE ROW EXCLUSIVE blocks INSERT/UPDATE/DELETE/SELECT FOR UPDATE
+            cur.execute(f"LOCK TABLE {partition_name} IN SHARE ROW EXCLUSIVE MODE;")
 
             # Count rows by status
             cur.execute(f"""
@@ -143,6 +143,7 @@ class PartitionManager:
                         pending=pending_count,
                         processing=processing_count,
                     )
+                    self.conn.commit()  # Release transaction lock
                     return {
                         "archived_failed": 0,
                         "requeued": 0,
