@@ -227,6 +227,7 @@ def migrate_to_partitioned(
         cur.execute("DROP INDEX IF EXISTS idx_queue_pending;")
         cur.execute("DROP INDEX IF EXISTS idx_queue_processing;")
         cur.execute("DROP INDEX IF EXISTS idx_queue_payload_gmail_id;")
+        # Drop legacy index that existed in some deployments (not recreated)
         cur.execute("DROP INDEX IF EXISTS idx_queue_pending_gmail_id;")
         cur.execute("ALTER INDEX idx_queue_pending_new RENAME TO idx_queue_pending;")
         cur.execute("ALTER INDEX idx_queue_processing_new RENAME TO idx_queue_processing;")

@@ -209,7 +209,7 @@ def partitions_drop(
             if result.get("requeued", 0) > 0:
                 parts.append(f"{result['requeued']} jobs re-enqueued")
             if result.get("archived_failed", 0) > 0:
-                parts.append(f"{result['archived_failed']} failed archived")
+                parts.append(f"{result['archived_failed']} failed jobs archived")
             click.echo("Dropped partition: " + ", ".join(parts))
     finally:
         conn.close()
