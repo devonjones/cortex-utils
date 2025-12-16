@@ -168,21 +168,23 @@ def classify(container: str, log_line: str) -> Classification | None:
     return None
 
 
+# Module-level constant for performance (avoid recreating on each call)
+_ERROR_INDICATORS = [
+    "ERROR",
+    "CRITICAL",
+    "FATAL",
+    "Exception",
+    "Traceback",
+    "Error:",
+    "Failed",
+    "error:",
+    "failed:",
+]
+
+
 def is_error_line(log_line: str) -> bool:
     """Quick check if a log line looks like an error.
 
     Use this to pre-filter before full classification.
     """
-    # Check for common error indicators
-    error_indicators = [
-        "ERROR",
-        "CRITICAL",
-        "FATAL",
-        "Exception",
-        "Traceback",
-        "Error:",
-        "Failed",
-        "error:",
-        "failed:",
-    ]
-    return any(indicator in log_line for indicator in error_indicators)
+    return any(indicator in log_line for indicator in _ERROR_INDICATORS)

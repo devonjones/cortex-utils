@@ -7,6 +7,7 @@ Usage:
     cortex-utils migrate-queue --dry-run
 """
 
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -518,7 +519,7 @@ def alerter() -> None:
     help="Containers to monitor (default: all cortex-* containers)",
 )
 @click.option("--no-ping", is_flag=True, help="Don't @here on critical alerts")
-@click.option("--summary-hour", default=0, type=int, help="Hour (0-23) to send daily summary")
+@click.option("--summary-hour", default=6, type=int, help="Hour (0-23) to send daily summary")
 @click.pass_context
 def alerter_run(
     ctx: click.Context,
@@ -588,8 +589,6 @@ def alerter_send(ctx: click.Context, message: str, ping: bool) -> None:
 
 def get_webhook_url() -> str:
     """Get Discord webhook URL from environment or exit with error."""
-    import os
-
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook_url:
         click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")

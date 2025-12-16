@@ -40,7 +40,7 @@ class AlerterDaemon:
         webhook_url: str,
         containers: list[str] | None = None,
         ping_critical: bool = True,
-        summary_hour: int = 0,
+        summary_hour: int = 6,
     ):
         """Initialize the alerter daemon.
 
@@ -298,7 +298,7 @@ def run_alerter(
     webhook_url: str | None = None,
     containers: list[str] | None = None,
     ping_critical: bool = True,
-    summary_hour: int = 0,
+    summary_hour: int = 6,
 ) -> None:
     """Run the alerter daemon.
 
