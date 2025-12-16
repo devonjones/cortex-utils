@@ -50,6 +50,18 @@ uv run cortex-utils --help
 uv run pytest
 ```
 
+## Git Workflow
+
+**NEVER push directly to main.** Always:
+
+1. Create a feature branch
+2. Make changes and commit
+3. Push the branch and create a PR
+4. Wait for CI and Gemini Code Assist review
+5. Merge via GitHub after approval
+
+This applies to all changes, no matter how small.
+
 ## Deployment
 
 - Docker image: `us-central1-docker.pkg.dev/cortex-gmail/cortex/utils:latest`
