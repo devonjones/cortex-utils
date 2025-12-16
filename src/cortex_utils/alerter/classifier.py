@@ -83,7 +83,7 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
         "Gmail API rate limit hit. Service is backing off.",
     ),
     (
-        re.compile(r"HttpError 5\d\d|50[0-9] |502 |503 |504 "),
+        re.compile(r"HttpError 5\d{2}|5\d{2} "),
         Severity.HIGH,
         5,
         "API Server Error",

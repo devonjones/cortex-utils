@@ -531,13 +531,7 @@ def alerter_run(
     Tails Docker logs from cortex containers and sends alerts to Discord.
     Requires DISCORD_WEBHOOK_URL environment variable.
     """
-    import os
-
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
-        raise SystemExit(1)
-
+    webhook_url = get_webhook_url()
     container_list = list(containers) if containers else None
 
     click.echo("Starting alerter daemon...")
@@ -562,13 +556,7 @@ def alerter_test(ctx: click.Context) -> None:
 
     Requires DISCORD_WEBHOOK_URL environment variable.
     """
-    import os
-
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
-        raise SystemExit(1)
-
+    webhook_url = get_webhook_url()
     daemon = AlerterDaemon(webhook_url=webhook_url)
     if daemon.send_test_alert():
         click.echo("Test alert sent successfully!")
@@ -586,13 +574,7 @@ def alerter_send(ctx: click.Context, message: str, ping: bool) -> None:
 
     Requires DISCORD_WEBHOOK_URL environment variable.
     """
-    import os
-
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
-        raise SystemExit(1)
-
+    webhook_url = get_webhook_url()
     client = DiscordClient(webhook_url)
     if client.send(message, ping=ping):
         click.echo("Message sent!")
@@ -602,6 +584,17 @@ def alerter_send(ctx: click.Context, message: str, ping: bool) -> None:
 
 
 # --- Utility Functions ---
+
+
+def get_webhook_url() -> str:
+    """Get Discord webhook URL from environment or exit with error."""
+    import os
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
+        raise SystemExit(1)
+    return webhook_url
 
 
 def parse_duration(s: str) -> timedelta:

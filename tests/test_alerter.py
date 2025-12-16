@@ -1,9 +1,6 @@
 """Tests for the alerter module."""
 
-import pytest
-
 from cortex_utils.alerter import (
-    Classification,
     RateLimiter,
     Severity,
     classify,

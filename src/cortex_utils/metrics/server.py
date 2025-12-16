@@ -1,14 +1,14 @@
 """Metrics server for exposing Prometheus endpoints."""
 
-import logging
 import threading
 from collections.abc import Callable
 from typing import Any
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
+import structlog
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 # Module-level state for idempotent server startup
 _server_lock = threading.Lock()

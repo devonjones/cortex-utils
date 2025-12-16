@@ -12,6 +12,7 @@ dependencies = [
     "pyyaml>=6.0",
     "docker>=7.0.0",
     "prometheus-client>=0.20.0",
+    "schedule>=1.2.0",
 ]
 
 [project.optional-dependencies]

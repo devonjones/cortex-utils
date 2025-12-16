@@ -280,8 +280,7 @@ class AlerterDaemon:
 
         # Keep main thread alive
         try:
-            while not self._stop_event.is_set():
-                time.sleep(1)
+            self._stop_event.wait()
         except KeyboardInterrupt:
             log.info("Received shutdown signal")
             self.stop()
