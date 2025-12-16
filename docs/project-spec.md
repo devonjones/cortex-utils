@@ -589,18 +589,18 @@ Examples:
 ## Implementation Phases
 
 ### Phase 1: Core Queue Management
-- [ ] Project setup (pyproject.toml, structure)
-- [ ] Partition manager (create, drop, maintain)
-- [ ] Dead letter table and management
-- [ ] Queue stats CLI
-- [ ] Migration script
+- [x] Project setup (pyproject.toml, structure)
+- [x] Partition manager (create, drop, maintain)
+- [x] Dead letter table and management
+- [x] Queue stats CLI
+- [x] Migration script
 
 ### Phase 2: Alerter Integration
-- [ ] Move alerter design from docs/alerter-spec.md
-- [ ] Implement Discord webhook client
-- [ ] Error pattern classifier
-- [ ] Rate limiter / deduplication
-- [ ] Daily summary
+- [x] Move alerter design from docs/alerter-spec.md
+- [x] Implement Discord webhook client
+- [x] Error pattern classifier
+- [x] Rate limiter / deduplication
+- [x] Daily summary (scheduled at 6 AM)
 
 ### Phase 3: Log Analysis
 - [ ] Docker log tailer
