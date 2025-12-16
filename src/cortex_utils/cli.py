@@ -14,6 +14,7 @@ import click
 import psycopg2
 import structlog
 
+from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
 from cortex_utils.config import Config
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.migrate import drop_old_queue_table, migrate_to_partitioned
@@ -498,6 +499,106 @@ def drop_old_queue(ctx: click.Context, dry_run: bool, execute: bool) -> None:
             click.echo("queue_old table does not exist.")
     finally:
         conn.close()
+
+
+# --- Alerter Commands ---
+
+
+@main.group()
+def alerter() -> None:
+    """Discord alerter for monitoring Cortex services."""
+    pass
+
+
+@alerter.command("run")
+@click.option(
+    "--containers",
+    "-c",
+    multiple=True,
+    help="Containers to monitor (default: all cortex-* containers)",
+)
+@click.option("--no-ping", is_flag=True, help="Don't @here on critical alerts")
+@click.option("--summary-hour", default=0, type=int, help="Hour (0-23) to send daily summary")
+@click.pass_context
+def alerter_run(
+    ctx: click.Context,
+    containers: tuple[str, ...],
+    no_ping: bool,
+    summary_hour: int,
+) -> None:
+    """Run the alerter daemon.
+
+    Tails Docker logs from cortex containers and sends alerts to Discord.
+    Requires DISCORD_WEBHOOK_URL environment variable.
+    """
+    import os
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
+        raise SystemExit(1)
+
+    container_list = list(containers) if containers else None
+
+    click.echo("Starting alerter daemon...")
+    click.echo(f"  Discord webhook: {webhook_url[:50]}...")
+    click.echo(f"  Containers: {container_list or 'all cortex-* containers'}")
+    click.echo(f"  Ping on critical: {not no_ping}")
+    click.echo(f"  Daily summary at: {summary_hour:02d}:00")
+    click.echo("")
+
+    run_alerter(
+        webhook_url=webhook_url,
+        containers=container_list,
+        ping_critical=not no_ping,
+        summary_hour=summary_hour,
+    )
+
+
+@alerter.command("test")
+@click.pass_context
+def alerter_test(ctx: click.Context) -> None:
+    """Send a test alert to verify Discord webhook.
+
+    Requires DISCORD_WEBHOOK_URL environment variable.
+    """
+    import os
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
+        raise SystemExit(1)
+
+    daemon = AlerterDaemon(webhook_url=webhook_url)
+    if daemon.send_test_alert():
+        click.echo("Test alert sent successfully!")
+    else:
+        click.echo("Failed to send test alert")
+        raise SystemExit(1)
+
+
+@alerter.command("send")
+@click.argument("message")
+@click.option("--ping", is_flag=True, help="Include @here ping")
+@click.pass_context
+def alerter_send(ctx: click.Context, message: str, ping: bool) -> None:
+    """Send a custom message to Discord.
+
+    Requires DISCORD_WEBHOOK_URL environment variable.
+    """
+    import os
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        click.echo("Error: DISCORD_WEBHOOK_URL environment variable not set")
+        raise SystemExit(1)
+
+    client = DiscordClient(webhook_url)
+    if client.send(message, ping=ping):
+        click.echo("Message sent!")
+    else:
+        click.echo("Failed to send message")
+        raise SystemExit(1)
 
 
 # --- Utility Functions ---

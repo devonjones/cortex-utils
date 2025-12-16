@@ -10,6 +10,10 @@ from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
 logger = logging.getLogger(__name__)
 
+# Module-level state for idempotent server startup
+_server_lock = threading.Lock()
+_server_thread: threading.Thread | None = None
+
 
 class _QuietHandler(WSGIRequestHandler):
     """WSGI handler that doesn't log every request."""
@@ -45,6 +49,9 @@ def _metrics_app(environ: dict[str, Any], start_response: StartResponse) -> list
 def start_metrics_server(port: int = 8000, host: str = "0.0.0.0") -> threading.Thread:
     """Start a background thread serving Prometheus metrics.
 
+    This function is idempotent. If called multiple times, it returns
+    the existing running thread.
+
     Args:
         port: Port to listen on (default 8000)
         host: Host to bind to (default 0.0.0.0)
@@ -52,12 +59,22 @@ def start_metrics_server(port: int = 8000, host: str = "0.0.0.0") -> threading.T
     Returns:
         The daemon thread running the server
     """
-    server = make_server(host, port, _metrics_app, handler_class=_QuietHandler)
+    global _server_thread
+    with _server_lock:
+        if _server_thread is not None and _server_thread.is_alive():
+            logger.debug("Metrics server already running")
+            return _server_thread
 
-    def serve_forever() -> None:
-        logger.info(f"Metrics server listening on {host}:{port}")
-        server.serve_forever()
+        server = make_server(host, port, _metrics_app, handler_class=_QuietHandler)
 
-    thread = threading.Thread(target=serve_forever, daemon=True)
-    thread.start()
-    return thread
+        def serve_forever() -> None:
+            try:
+                logger.info(f"Metrics server listening on {host}:{port}")
+                server.serve_forever()
+            except Exception:
+                logger.exception("Metrics server failed unexpectedly")
+
+        thread = threading.Thread(target=serve_forever, daemon=True)
+        thread.start()
+        _server_thread = thread
+        return thread
