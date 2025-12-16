@@ -25,8 +25,7 @@ class Classification:
     description: str  # Longer description
 
 
-# Pattern definitions: (regex, severity, cooldown_minutes, title, description_template)
-# Description template can use {match} for the matched text and {container} for container name
+# Pattern definitions: (regex, severity, cooldown_minutes, title, description)
 PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
     # === CRITICAL (data loss risk, auth failures) ===
     (
