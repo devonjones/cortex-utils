@@ -25,6 +25,10 @@ Usage:
 
 from cortex_utils.metrics.cortex import (
     DEAD_LETTERS,
+    EMAILS_CLASSIFIED,
+    EMAILS_LABELED,
+    EMAILS_PARSED,
+    EMAILS_SYNCED,
     ERRORS,
     LLM_REQUESTS,
     PROCESSING_DURATION,
@@ -43,4 +47,8 @@ __all__ = [
     "ERRORS",
     "LLM_REQUESTS",
     "SERVICE_INFO",
+    "EMAILS_SYNCED",
+    "EMAILS_PARSED",
+    "EMAILS_CLASSIFIED",
+    "EMAILS_LABELED",
 ]
