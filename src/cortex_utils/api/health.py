@@ -3,7 +3,10 @@
 from collections.abc import Callable
 from typing import Any
 
+import structlog
 from flask import Blueprint, current_app, jsonify
+
+logger = structlog.get_logger()
 
 health_bp = Blueprint("health", __name__)
 
@@ -22,8 +25,9 @@ def health_check() -> tuple[Any, int]:
             checks[name] = healthy
             if not healthy:
                 all_healthy = False
-        except Exception:
-            checks[check.__name__] = False
+        except Exception as e:
+            logger.exception(f"Health check {check.__name__} failed")
+            checks[check.__name__] = {"healthy": False, "error": str(e)}
             all_healthy = False
 
     status = "ok" if all_healthy else "degraded"

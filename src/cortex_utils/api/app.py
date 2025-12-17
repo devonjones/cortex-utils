@@ -51,7 +51,8 @@ def run_app(app: Flask, host: str = "0.0.0.0", port: int = 8080, debug: bool = F
     """Run Flask application with development server.
 
     For production, use gunicorn instead:
-        gunicorn -w 4 -b 0.0.0.0:8080 'gateway.app:create_app()'
+        gunicorn -w 4 -b 0.0.0.0:8080 'myservice:app'
+        # Where app is created with: app = create_app("myservice")
 
     Args:
         app: Flask application

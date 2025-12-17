@@ -15,6 +15,9 @@ def _get_or_create_metric(
         return metric_class(name, description, labelnames)
     except ValueError:
         # Already registered - fetch from registry
+        # NOTE: _names_to_collectors is private API, but prometheus_client doesn't provide
+        # a public way to retrieve registered metrics by name. This is safe because it's
+        # wrapped in error handling and only used to handle development server reloads.
         for collector in REGISTRY._names_to_collectors.values():
             if hasattr(collector, "_name") and collector._name == name:
                 return collector
@@ -38,7 +41,26 @@ HTTP_REQUEST_DURATION = _get_or_create_metric(
 
 
 class MetricsMiddleware:
-    """WSGI middleware for recording HTTP request metrics."""
+    """WSGI middleware for recording HTTP request metrics.
+
+    Records Prometheus metrics for HTTP requests:
+    - http_requests_total: Counter with method, endpoint, status labels
+    - http_request_duration_seconds: Histogram with method, endpoint labels
+
+    Path normalization is applied to prevent metric cardinality explosion:
+    - Numeric IDs are replaced with {id}
+    - UUIDs are replaced with {id}
+    - Gmail message IDs (16-20 char hex) are replaced with {id}
+
+    Usage:
+        from flask import Flask
+        from cortex_utils.api.middleware import MetricsMiddleware
+
+        app = Flask(__name__)
+        app.wsgi_app = MetricsMiddleware(app.wsgi_app, "my-service")
+
+    Note: The /metrics endpoint is skipped to avoid recursion.
+    """
 
     def __init__(self, app: Callable[..., Iterable[bytes]], service_name: str):
         self.app = app
