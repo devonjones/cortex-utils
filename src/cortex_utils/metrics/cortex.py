@@ -51,3 +51,26 @@ LLM_REQUESTS = Counter(
     "Total LLM API requests",
     ["model", "status"],  # status: success, error, timeout
 )
+
+# Email pipeline stage counters - for cross-stage rate comparison
+EMAILS_SYNCED = Counter(
+    "cortex_emails_synced_total",
+    "Total emails synced from Gmail",
+    ["type"],  # new, updated
+)
+
+EMAILS_PARSED = Counter(
+    "cortex_emails_parsed_total",
+    "Total emails parsed by parse worker",
+)
+
+EMAILS_CLASSIFIED = Counter(
+    "cortex_emails_classified_total",
+    "Total emails classified by triage worker",
+    ["method"],  # rule, llm
+)
+
+EMAILS_LABELED = Counter(
+    "cortex_emails_labeled_total",
+    "Total emails labeled in Gmail by labeling worker",
+)
