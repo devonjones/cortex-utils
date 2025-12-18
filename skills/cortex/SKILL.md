@@ -120,6 +120,7 @@ cortex triage stats
 
 # Re-run triage on emails
 cortex triage rerun [-i GMAIL_ID]... [-l LABEL] [-d DAYS] [-f] [-p PRIORITY]
+# -f: force rerun even if pending
 # Example: cortex triage rerun -l Cortex/Uncategorized -d 30
 
 # List recent classifications
