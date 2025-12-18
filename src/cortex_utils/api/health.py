@@ -1,10 +1,13 @@
 """Health check blueprint for Flask applications."""
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from flask import Blueprint, current_app, jsonify
+
+if TYPE_CHECKING:
+    from flask import Flask
 
 logger = structlog.get_logger()
 
@@ -38,7 +41,7 @@ def health_check() -> tuple[Any, int]:
     )
 
 
-def register_health_check(app: Any, check: Callable[[], tuple[str, bool]]) -> None:
+def register_health_check(app: "Flask", check: Callable[[], tuple[str, bool]]) -> None:
     """Register a health check function.
 
     Args:
@@ -46,5 +49,5 @@ def register_health_check(app: Any, check: Callable[[], tuple[str, bool]]) -> No
         check: Function returning (name, is_healthy) tuple
     """
     if not hasattr(app, "health_checks"):
-        app.health_checks = []
-    app.health_checks.append(check)
+        app.health_checks = []  # type: ignore[attr-defined]
+    app.health_checks.append(check)  # type: ignore[attr-defined]

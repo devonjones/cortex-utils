@@ -1,6 +1,7 @@
 """WSGI middleware for Prometheus HTTP metrics."""
 
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -124,10 +125,12 @@ class MetricsMiddleware:
         return "/".join(normalized)
 
     def _is_uuid(self, s: str) -> bool:
-        """Check if string looks like a UUID."""
-        if len(s) == 36 and s.count("-") == 4:
-            return all(c in "0123456789abcdef-" for c in s.lower())
-        return False
+        """Check if string is a valid UUID."""
+        try:
+            uuid.UUID(s)
+            return True
+        except ValueError:
+            return False
 
     def _is_gmail_id(self, s: str) -> bool:
         """Check if string looks like a Gmail message ID (hex string)."""
