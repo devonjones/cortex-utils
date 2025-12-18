@@ -29,7 +29,7 @@ cd ~/Projects/cortex/gateway && uv pip install -e .
 Set the gateway URL via environment variable or CLI flag:
 
 ```bash
-export CORTEX_GATEWAY_URL=http://10.5.2.21:8097  # Default
+export CORTEX_GATEWAY_URL=http://localhost:8097  # Example
 cortex --url http://custom-host:8097 <command>
 ```
 
