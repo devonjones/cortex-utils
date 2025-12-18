@@ -14,6 +14,8 @@ Command-line interface for managing the Cortex email automation pipeline.
 
 ## Prerequisites
 
+**Note**: This skill documentation lives in the `cortex-utils` repository but describes the `cortex` CLI tool provided by the separate `cortex-gateway` project. The gateway provides a unified REST API for Cortex services, and the CLI is the command-line interface to that API.
+
 The `cortex` CLI is installed from the cortex-gateway package:
 
 ```bash
