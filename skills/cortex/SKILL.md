@@ -121,9 +121,13 @@ cortex backfill cancel <queue_name>
 cortex triage stats
 
 # Re-run triage on emails
-cortex triage rerun [-i GMAIL_ID]... [-l LABEL] [-d DAYS] [-f] [-p PRIORITY]
+cortex triage rerun [-i GMAIL_ID]... [-l LABEL] [-s SENDER]... [-d DAYS] [-f] [-p PRIORITY]
 # -f: force rerun even if pending
-# Example: cortex triage rerun -l Cortex/Uncategorized -d 30
+# -s: filter by sender email (supports glob with *)
+# Examples:
+#   cortex triage rerun -l Cortex/Uncategorized -d 30
+#   cortex triage rerun -s "service@lumibricks.com" -d 7
+#   cortex triage rerun -s "*@substack.com" -d 14
 
 # List recent classifications
 cortex triage list [-n LIMIT] [-l LABEL]
@@ -173,6 +177,12 @@ cortex emails by-label Label_117 -n 50
 ```bash
 # Re-run triage on Uncategorized emails from last 7 days
 cortex triage rerun -l Cortex/Uncategorized -d 7
+
+# Re-run triage for specific sender
+cortex triage rerun -s "service@paypal.com" -d 7
+
+# Re-run triage for all senders from a domain (glob pattern)
+cortex triage rerun -s "*@substack.com" -d 14
 
 # Backfill specific emails to triage queue
 cortex backfill trigger -q triage -l Label_123 -d 30
