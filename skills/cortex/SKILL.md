@@ -123,7 +123,7 @@ cortex triage stats
 # Re-run triage on emails
 cortex triage rerun [-i GMAIL_ID]... [-l LABEL] [-s SENDER]... [-d DAYS] [-f] [-p PRIORITY]
 # -f: force rerun even if pending
-# -s: filter by sender email (supports glob with *)
+# -s, --sender: filter by sender email (supports glob with *)
 # Examples:
 #   cortex triage rerun -l Cortex/Uncategorized -d 30
 #   cortex triage rerun -s "service@paypal.com" -d 7
