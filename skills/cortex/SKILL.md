@@ -126,8 +126,9 @@ cortex triage rerun [-i GMAIL_ID]... [-l LABEL] [-s SENDER]... [-d DAYS] [-f] [-
 # -s: filter by sender email (supports glob with *)
 # Examples:
 #   cortex triage rerun -l Cortex/Uncategorized -d 30
-#   cortex triage rerun -s "service@lumibricks.com" -d 7
+#   cortex triage rerun -s "service@paypal.com" -d 7
 #   cortex triage rerun -s "*@substack.com" -d 14
+#   cortex triage rerun -s "service@paypal.com" -s "alerts@github.com" -d 7
 
 # List recent classifications
 cortex triage list [-n LIMIT] [-l LABEL]
