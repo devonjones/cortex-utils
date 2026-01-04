@@ -10,7 +10,9 @@ from typing import Any
 import psycopg2
 import yaml
 
+from cortex_utils.triage_config.importer import ConfigLoadError, load_rules_from_string
 from cortex_utils.triage_config.linked_list import traverse_chain
+from cortex_utils.triage_config.models import RulesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -170,3 +172,26 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
 
     finally:
         cursor.close()
+
+
+def load_config_from_db(
+    conn: psycopg2.extensions.connection, version: int | None = None
+) -> RulesConfig:
+    """Load triage config from database and convert to RulesConfig.
+
+    Args:
+        conn: Database connection
+        version: Config version to load (default: active version)
+
+    Returns:
+        RulesConfig object
+
+    Raises:
+        ConfigLoadError: If config cannot be loaded
+    """
+    try:
+        # Export DB to YAML, then parse with existing loader
+        yaml_content = export_config_to_yaml(conn, version)
+        return load_rules_from_string(yaml_content)
+    except Exception as e:
+        raise ConfigLoadError(f"Failed to load config from database: {e}") from e
