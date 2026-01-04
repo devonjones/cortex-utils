@@ -15,9 +15,7 @@ from cortex_utils.triage_config.linked_list import traverse_chain
 logger = logging.getLogger(__name__)
 
 
-def export_config_to_yaml(
-    conn: psycopg2.extensions.connection, version: int | None = None
-) -> str:
+def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | None = None) -> str:
     """Export triage config from database to YAML string.
 
     Args:
@@ -35,9 +33,7 @@ def export_config_to_yaml(
     try:
         # Get config version
         if version is None:
-            cursor.execute(
-                "SELECT version FROM triage_config_versions WHERE is_active = TRUE"
-            )
+            cursor.execute("SELECT version FROM triage_config_versions WHERE is_active = TRUE")
         else:
             cursor.execute(
                 "SELECT version FROM triage_config_versions WHERE version = %s",
