@@ -18,9 +18,7 @@ class LinkedListError(Exception):
     pass
 
 
-def traverse_chain(
-    cursor: psycopg2.extensions.cursor, chain_id: int
-) -> list[dict[str, Any]]:
+def traverse_chain(cursor: psycopg2.extensions.cursor, chain_id: int) -> list[dict[str, Any]]:
     """Traverse linked list to get rules in order.
 
     Args:
@@ -233,9 +231,7 @@ def insert_rule_after(
             )
 
         conn.commit()
-        logger.info(
-            f"Inserted rule {new_rule_id} into chain {chain_id} after {after_rule_id}"
-        )
+        logger.info(f"Inserted rule {new_rule_id} into chain {chain_id} after {after_rule_id}")
         return new_rule_id
 
     except Exception as e:
