@@ -591,8 +591,7 @@ class Rule(BaseModel):
 
         if outcomes_defined > 1:
             raise ValueError(
-                "Rule can only have one of 'action', 'jump', "
-                "'return_to_parent', or 'llm' defined."
+                "Rule can only have one of 'action', 'jump', 'return_to_parent', or 'llm' defined."
             )
 
         if self.llm and not self.routes:

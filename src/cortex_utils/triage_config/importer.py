@@ -193,13 +193,13 @@ def validate_rules(config: RulesConfig) -> list[str]:
         for i, rule in enumerate(rules):
             if rule.jump and rule.jump not in config.chains:
                 errors.append(
-                    f"Chain '{chain_name}' rule {i}: " f"jump target '{rule.jump}' does not exist"
+                    f"Chain '{chain_name}' rule {i}: jump target '{rule.jump}' does not exist"
                 )
 
             # Validate intent references
             intent = rule.match.subject_intent
             if isinstance(intent, str) and intent not in config.intents:
-                errors.append(f"Chain '{chain_name}' rule {i}: " f"unknown intent '{intent}'")
+                errors.append(f"Chain '{chain_name}' rule {i}: unknown intent '{intent}'")
 
             # Validate regex patterns in match conditions
             if rule.match.subject_regex:
@@ -213,8 +213,7 @@ def validate_rules(config: RulesConfig) -> list[str]:
                         re.compile(pattern)
                     except re.error as e:
                         errors.append(
-                            f"Chain '{chain_name}' rule {i}: "
-                            f"invalid subject_regex '{pattern}': {e}"
+                            f"Chain '{chain_name}' rule {i}: invalid subject_regex '{pattern}': {e}"
                         )
 
             # Validate variables
@@ -323,7 +322,7 @@ def import_yaml_to_db(
         if existing:
             version_num: int = existing[0]
             logger.info(
-                f"Config already exists as version {version_num} " f"(hash: {config_hash[:8]}...)"
+                f"Config already exists as version {version_num} (hash: {config_hash[:8]}...)"
             )
             return version_num
 
