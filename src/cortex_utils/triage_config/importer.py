@@ -446,26 +446,37 @@ def import_yaml_to_db(
 
                 prev_rule_id = rule_id
 
-        # 6. Insert email mappings
+        # 6. UPSERT email mappings to global table (not versioned)
+        # Note: Re-enqueue logic handled by API endpoints, not here
         for email, action_config in config.priority_email_mappings.items():
             cursor.execute(
                 """
                 INSERT INTO triage_email_mappings (
-                    config_version,
                     mapping_type,
                     email_address,
                     label,
                     archive,
-                    mark_read
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    mark_read,
+                    created_by,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT ON CONSTRAINT unique_email_mapping
+                DO UPDATE SET
+                    label = EXCLUDED.label,
+                    archive = EXCLUDED.archive,
+                    mark_read = EXCLUDED.mark_read,
+                    updated_by = EXCLUDED.created_by,
+                    updated_at = NOW(),
+                    deleted_at = NULL
                 """,
                 (
-                    new_version,
                     "priority",
                     email.lower(),
                     action_config.label,
                     action_config.archive,
                     action_config.mark_read,
+                    created_by,
                 ),
             )
 
@@ -473,21 +484,31 @@ def import_yaml_to_db(
             cursor.execute(
                 """
                 INSERT INTO triage_email_mappings (
-                    config_version,
                     mapping_type,
                     email_address,
                     label,
                     archive,
-                    mark_read
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    mark_read,
+                    created_by,
+                    created_at,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT ON CONSTRAINT unique_email_mapping
+                DO UPDATE SET
+                    label = EXCLUDED.label,
+                    archive = EXCLUDED.archive,
+                    mark_read = EXCLUDED.mark_read,
+                    updated_by = EXCLUDED.created_by,
+                    updated_at = NOW(),
+                    deleted_at = NULL
                 """,
                 (
-                    new_version,
                     "fallback",
                     email.lower(),
                     action_config.label,
                     action_config.archive,
                     action_config.mark_read,
+                    created_by,
                 ),
             )
 
