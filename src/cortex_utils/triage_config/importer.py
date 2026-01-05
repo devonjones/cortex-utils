@@ -448,28 +448,30 @@ def import_yaml_to_db(
 
         # 6. UPSERT email mappings to global table (not versioned)
         # Note: Re-enqueue logic handled by API endpoints, not here
+        upsert_sql = """
+            INSERT INTO triage_email_mappings (
+                mapping_type,
+                email_address,
+                label,
+                archive,
+                mark_read,
+                created_by,
+                created_at,
+                updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT ON CONSTRAINT unique_email_mapping
+            DO UPDATE SET
+                label = EXCLUDED.label,
+                archive = EXCLUDED.archive,
+                mark_read = EXCLUDED.mark_read,
+                updated_by = EXCLUDED.created_by,
+                updated_at = NOW(),
+                deleted_at = NULL
+        """
+
         for email, action_config in config.priority_email_mappings.items():
             cursor.execute(
-                """
-                INSERT INTO triage_email_mappings (
-                    mapping_type,
-                    email_address,
-                    label,
-                    archive,
-                    mark_read,
-                    created_by,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-                ON CONFLICT ON CONSTRAINT unique_email_mapping
-                DO UPDATE SET
-                    label = EXCLUDED.label,
-                    archive = EXCLUDED.archive,
-                    mark_read = EXCLUDED.mark_read,
-                    updated_by = EXCLUDED.created_by,
-                    updated_at = NOW(),
-                    deleted_at = NULL
-                """,
+                upsert_sql,
                 (
                     "priority",
                     email.lower(),
@@ -482,26 +484,7 @@ def import_yaml_to_db(
 
         for email, action_config in config.fallback_email_mappings.items():
             cursor.execute(
-                """
-                INSERT INTO triage_email_mappings (
-                    mapping_type,
-                    email_address,
-                    label,
-                    archive,
-                    mark_read,
-                    created_by,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-                ON CONFLICT ON CONSTRAINT unique_email_mapping
-                DO UPDATE SET
-                    label = EXCLUDED.label,
-                    archive = EXCLUDED.archive,
-                    mark_read = EXCLUDED.mark_read,
-                    updated_by = EXCLUDED.created_by,
-                    updated_at = NOW(),
-                    deleted_at = NULL
-                """,
+                upsert_sql,
                 (
                     "fallback",
                     email.lower(),
