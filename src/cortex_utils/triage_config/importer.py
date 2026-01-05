@@ -446,48 +446,52 @@ def import_yaml_to_db(
 
                 prev_rule_id = rule_id
 
-        # 6. Insert email mappings
+        # 6. UPSERT email mappings to global table (not versioned)
+        # Note: Re-enqueue logic handled by API endpoints, not here
+        upsert_sql = """
+            INSERT INTO triage_email_mappings (
+                mapping_type,
+                email_address,
+                label,
+                archive,
+                mark_read,
+                created_by,
+                created_at,
+                updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT ON CONSTRAINT unique_email_mapping
+            DO UPDATE SET
+                label = EXCLUDED.label,
+                archive = EXCLUDED.archive,
+                mark_read = EXCLUDED.mark_read,
+                updated_by = EXCLUDED.created_by,
+                updated_at = NOW(),
+                deleted_at = NULL
+        """
+
         for email, action_config in config.priority_email_mappings.items():
             cursor.execute(
-                """
-                INSERT INTO triage_email_mappings (
-                    config_version,
-                    mapping_type,
-                    email_address,
-                    label,
-                    archive,
-                    mark_read
-                ) VALUES (%s, %s, %s, %s, %s, %s)
-                """,
+                upsert_sql,
                 (
-                    new_version,
                     "priority",
                     email.lower(),
                     action_config.label,
                     action_config.archive,
                     action_config.mark_read,
+                    created_by,
                 ),
             )
 
         for email, action_config in config.fallback_email_mappings.items():
             cursor.execute(
-                """
-                INSERT INTO triage_email_mappings (
-                    config_version,
-                    mapping_type,
-                    email_address,
-                    label,
-                    archive,
-                    mark_read
-                ) VALUES (%s, %s, %s, %s, %s, %s)
-                """,
+                upsert_sql,
                 (
-                    new_version,
                     "fallback",
                     email.lower(),
                     action_config.label,
                     action_config.archive,
                     action_config.mark_read,
+                    created_by,
                 ),
             )
 

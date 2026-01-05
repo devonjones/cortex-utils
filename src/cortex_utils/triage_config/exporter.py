@@ -117,21 +117,21 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
 
             chains[chain_name] = chain_rules
 
-        # Fetch email mappings
+        # Fetch email mappings from global table (not versioned)
         cursor.execute(
             """
             SELECT email_address, label, archive, mark_read
             FROM triage_email_mappings
-            WHERE config_version = %s AND mapping_type = 'priority'
+            WHERE mapping_type = 'priority'
+            AND deleted_at IS NULL
             ORDER BY email_address
-            """,
-            (version_num,),
+            """
         )
         priority_mappings = {
             email: {
                 "label": label,
-                "archive": archive or False,
-                "mark_read": mark_read or False,
+                "archive": archive if archive is not None else False,
+                "mark_read": mark_read if mark_read is not None else False,
             }
             for email, label, archive, mark_read in cursor.fetchall()
         }
@@ -140,16 +140,16 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
             """
             SELECT email_address, label, archive, mark_read
             FROM triage_email_mappings
-            WHERE config_version = %s AND mapping_type = 'fallback'
+            WHERE mapping_type = 'fallback'
+            AND deleted_at IS NULL
             ORDER BY email_address
-            """,
-            (version_num,),
+            """
         )
         fallback_mappings = {
             email: {
                 "label": label,
-                "archive": archive or False,
-                "mark_read": mark_read or False,
+                "archive": archive if archive is not None else False,
+                "mark_read": mark_read if mark_read is not None else False,
             }
             for email, label, archive, mark_read in cursor.fetchall()
         }
