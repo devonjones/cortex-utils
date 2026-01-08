@@ -135,16 +135,12 @@ def insert_rule_after(
         New rule ID
 
     Uses pessimistic locking (SELECT FOR UPDATE) to prevent concurrent modifications.
+    Only locks the specific rules being modified (prev/next), not the entire chain,
+    allowing concurrent edits to different parts of the same chain.
     """
     cursor = conn.cursor()
 
     try:
-        # Lock entire chain to prevent concurrent modifications
-        cursor.execute(
-            "SELECT * FROM triage_rules WHERE chain_id = %s FOR UPDATE",
-            (chain_id,),
-        )
-
         # Get config_version from chain
         cursor.execute(
             "SELECT config_version FROM triage_chains WHERE id = %s",
@@ -156,17 +152,18 @@ def insert_rule_after(
         config_version = row[0]
 
         if after_rule_id is None:
-            # Insert at head: find current head, update its prev pointer
+            # Insert at head: lock current head only
             cursor.execute(
                 """SELECT id FROM triage_rules
-                   WHERE chain_id = %s AND prev_rule_id IS NULL""",
+                   WHERE chain_id = %s AND prev_rule_id IS NULL
+                   FOR UPDATE""",
                 (chain_id,),
             )
             current_head = cursor.fetchone()
             next_rule_id = current_head[0] if current_head else None
             prev_rule_id = None
         else:
-            # Insert after specified rule
+            # Insert after specified rule: first read without lock
             cursor.execute(
                 "SELECT next_rule_id FROM triage_rules WHERE id = %s",
                 (after_rule_id,),
@@ -176,6 +173,30 @@ def insert_rule_after(
                 raise LinkedListError(f"Rule {after_rule_id} not found")
             next_rule_id = row[0]
             prev_rule_id = after_rule_id
+
+            # Lock both prev and next rules, then verify state hasn't changed
+            # Sort IDs to ensure consistent lock order across transactions
+            ids_to_lock = sorted(
+                [rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None]
+            )
+            if ids_to_lock:
+                cursor.execute(
+                    "SELECT id, next_rule_id FROM triage_rules WHERE id = ANY(%s) FOR UPDATE",
+                    (ids_to_lock,),
+                )
+                locked_rows = {row[0]: row[1] for row in cursor.fetchall()}
+
+                # Verify all expected rules were locked (none deleted concurrently)
+                if len(locked_rows) != len(ids_to_lock):
+                    raise LinkedListError(
+                        "Concurrent modification detected (rule deleted), please retry"
+                    )
+
+                # Verify prev_rule's next pointer hasn't changed
+                if prev_rule_id in locked_rows and locked_rows[prev_rule_id] != next_rule_id:
+                    raise LinkedListError(
+                        "Concurrent modification detected (list modified), please retry"
+                    )
 
         # Insert new rule
         cursor.execute(
@@ -251,14 +272,17 @@ def delete_rule(conn: psycopg2.extensions.connection, rule_id: int) -> None:
     Deletes the rule and reconnects the linked list by updating:
     - prev_rule.next_rule_id = this_rule.next_rule_id
     - next_rule.prev_rule_id = this_rule.prev_rule_id
+
+    Only locks the specific rule being deleted and its adjacent rules,
+    not the entire chain, allowing concurrent edits to other parts of the chain.
     """
     cursor = conn.cursor()
 
     try:
-        # Get rule details
+        # Get rule details and lock the rule being deleted
         cursor.execute(
             """SELECT chain_id, prev_rule_id, next_rule_id
-               FROM triage_rules WHERE id = %s""",
+               FROM triage_rules WHERE id = %s FOR UPDATE""",
             (rule_id,),
         )
         row = cursor.fetchone()
@@ -267,11 +291,16 @@ def delete_rule(conn: psycopg2.extensions.connection, rule_id: int) -> None:
 
         chain_id, prev_rule_id, next_rule_id = row
 
-        # Lock chain
-        cursor.execute(
-            "SELECT * FROM triage_rules WHERE chain_id = %s FOR UPDATE",
-            (chain_id,),
+        # Lock adjacent rules in single query to prevent deadlocks
+        # Sort IDs to ensure consistent lock order across transactions
+        ids_to_lock = sorted(
+            [rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None]
         )
+        if ids_to_lock:
+            cursor.execute(
+                "SELECT id FROM triage_rules WHERE id = ANY(%s) FOR UPDATE",
+                (ids_to_lock,),
+            )
 
         # Update prev → next pointer
         if prev_rule_id:
