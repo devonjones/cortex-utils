@@ -163,9 +163,9 @@ def insert_rule_after(
             next_rule_id = current_head[0] if current_head else None
             prev_rule_id = None
         else:
-            # Insert after specified rule: lock prev and next rules only
+            # Insert after specified rule: get next_rule_id first
             cursor.execute(
-                "SELECT next_rule_id FROM triage_rules WHERE id = %s FOR UPDATE",
+                "SELECT next_rule_id FROM triage_rules WHERE id = %s",
                 (after_rule_id,),
             )
             row = cursor.fetchone()
@@ -174,11 +174,14 @@ def insert_rule_after(
             next_rule_id = row[0]
             prev_rule_id = after_rule_id
 
-            # Also lock the next rule if it exists
-            if next_rule_id:
+            # Lock both prev and next rules in single query to prevent deadlocks
+            ids_to_lock = [
+                rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None
+            ]
+            if ids_to_lock:
                 cursor.execute(
-                    "SELECT id FROM triage_rules WHERE id = %s FOR UPDATE",
-                    (next_rule_id,),
+                    "SELECT id FROM triage_rules WHERE id = ANY(%s) FOR UPDATE",
+                    (ids_to_lock,),
                 )
 
         # Insert new rule
@@ -274,17 +277,12 @@ def delete_rule(conn: psycopg2.extensions.connection, rule_id: int) -> None:
 
         chain_id, prev_rule_id, next_rule_id = row
 
-        # Lock adjacent rules only (not entire chain)
-        if prev_rule_id:
+        # Lock adjacent rules in single query to prevent deadlocks
+        ids_to_lock = [rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None]
+        if ids_to_lock:
             cursor.execute(
-                "SELECT id FROM triage_rules WHERE id = %s FOR UPDATE",
-                (prev_rule_id,),
-            )
-
-        if next_rule_id:
-            cursor.execute(
-                "SELECT id FROM triage_rules WHERE id = %s FOR UPDATE",
-                (next_rule_id,),
+                "SELECT id FROM triage_rules WHERE id = ANY(%s) FOR UPDATE",
+                (ids_to_lock,),
             )
 
         # Update prev → next pointer
