@@ -175,9 +175,10 @@ def insert_rule_after(
             prev_rule_id = after_rule_id
 
             # Lock both prev and next rules, then verify state hasn't changed
-            ids_to_lock = [
-                rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None
-            ]
+            # Sort IDs to ensure consistent lock order across transactions
+            ids_to_lock = sorted(
+                [rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None]
+            )
             if ids_to_lock:
                 cursor.execute(
                     "SELECT id, next_rule_id FROM triage_rules WHERE id = ANY(%s) FOR UPDATE",
@@ -291,7 +292,10 @@ def delete_rule(conn: psycopg2.extensions.connection, rule_id: int) -> None:
         chain_id, prev_rule_id, next_rule_id = row
 
         # Lock adjacent rules in single query to prevent deadlocks
-        ids_to_lock = [rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None]
+        # Sort IDs to ensure consistent lock order across transactions
+        ids_to_lock = sorted(
+            [rule_id for rule_id in (prev_rule_id, next_rule_id) if rule_id is not None]
+        )
         if ids_to_lock:
             cursor.execute(
                 "SELECT id FROM triage_rules WHERE id = ANY(%s) FOR UPDATE",
