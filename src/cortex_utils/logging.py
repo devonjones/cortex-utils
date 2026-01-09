@@ -49,9 +49,7 @@ def configure_logging(service_name: str, level: str = "INFO") -> None:
 
     # Choose renderer based on environment
     renderer: structlog.types.Processor = (
-        structlog.dev.ConsoleRenderer()
-        if is_tty
-        else structlog.processors.JSONRenderer()
+        structlog.dev.ConsoleRenderer() if is_tty else structlog.processors.JSONRenderer()
     )
 
     # Create formatter that processes logs from stdlib logging
