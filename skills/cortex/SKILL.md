@@ -212,6 +212,55 @@ cortex sync backfill -d 30
 cortex sync jobs
 ```
 
+## Config Management
+
+Triage rules configuration is managed via the Gateway REST API (not CLI).
+
+### Update Config Workflow
+
+1. **Edit the rules YAML** at `~/cortex-config/rules.yaml` on Hades (or locally first)
+
+2. **Upload via API**:
+```bash
+curl -X PUT http://10.5.2.21:8097/config \
+  -H "Content-Type: text/plain" \
+  -H "X-Created-By: your-name@context" \
+  -H "X-Notes: Description of changes" \
+  --data-binary @/path/to/rules.yaml
+```
+
+3. **Reload triage worker**:
+```bash
+ssh devon@10.5.2.21 "docker kill -s SIGHUP cortex-triage-worker"
+```
+
+4. **Verify reload**:
+```bash
+ssh devon@10.5.2.21 "docker logs cortex-triage-worker 2>&1 | grep -E 'reload|version' | tail -3"
+```
+
+### Config API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/config` | GET | Download active config as YAML |
+| `/config` | PUT/POST | Upload new config version |
+| `/config/validate` | POST | Validate YAML without saving |
+| `/config/versions` | GET | List all config versions |
+| `/config/versions/<n>` | GET | Download specific version |
+| `/config/rollback/<n>` | POST | Rollback to version N |
+| `/config/diff/<v1>/<v2>` | GET | Compare two versions |
+
+### Validate Before Upload
+
+```bash
+curl -X POST http://10.5.2.21:8097/config/validate \
+  -H "Content-Type: text/plain" \
+  --data-binary @/path/to/rules.yaml
+```
+
+Returns `{"valid": true, "stats": {...}}` or `{"valid": false, "errors": [...]}`.
+
 ## Output Formats
 
 By default, commands output formatted tables. Use `-j` for JSON:
