@@ -96,9 +96,7 @@ class LLMClient:
             # An empty choices list will raise an IndexError, which is caught.
             content = result["choices"][0]["message"]["content"]
             if not isinstance(content, str):
-                raise TypeError(
-                    f"LLM content is not a string, but {type(content).__name__}"
-                )
+                raise TypeError(f"LLM content is not a string, but {type(content).__name__}")
             return content
         except (KeyError, IndexError, TypeError) as e:
             raise LLMError(f"LLM returned unexpected response format: {e}") from e
@@ -165,9 +163,7 @@ class LLMClient:
             # Safe float conversion for confidence
             raw_confidence = data.get("confidence")
             try:
-                confidence = (
-                    float(raw_confidence) if raw_confidence is not None else 0.5
-                )
+                confidence = float(raw_confidence) if raw_confidence is not None else 0.5
             except (ValueError, TypeError):
                 logger.warning(f"Invalid confidence value from LLM: {raw_confidence}")
                 confidence = 0.5
@@ -224,9 +220,7 @@ class LLMClient:
         )
 
         try:
-            result = self._post_completion(
-                model=model, prompt=formatted_prompt, max_tokens=10
-            )
+            result = self._post_completion(model=model, prompt=formatted_prompt, max_tokens=10)
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
             return answer == "yes"
@@ -234,9 +228,7 @@ class LLMClient:
             logger.error(f"LLM email intent check network error: {e}")
             raise LLMError(f"LLM network error: {e}") from e
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"LLM email intent check HTTP error {e.response.status_code}: {e}"
-            )
+            logger.error(f"LLM email intent check HTTP error {e.response.status_code}: {e}")
             raise LLMError(f"LLM HTTP {e.response.status_code}") from e
         except LLMError:
             raise  # Re-raise LLMError as-is
@@ -281,9 +273,7 @@ class LLMClient:
         )
 
         try:
-            result = self._post_completion(
-                model=model, prompt=formatted_prompt, max_tokens=50
-            )
+            result = self._post_completion(model=model, prompt=formatted_prompt, max_tokens=50)
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
 
@@ -298,8 +288,7 @@ class LLMClient:
                 if cat.lower() in answer:
                     return cat
             logger.warning(
-                f"LLM returned unknown category '{answer}', "
-                f"expected one of {categories}"
+                f"LLM returned unknown category '{answer}', expected one of {categories}"
             )
             return None  # Not an error - LLM responded but no category matched
         except httpx.RequestError as e:
@@ -355,9 +344,7 @@ class LLMClient:
             return None
 
         try:
-            result = self._post_completion(
-                model=model, prompt=formatted, max_tokens=100
-            )
+            result = self._post_completion(model=model, prompt=formatted, max_tokens=100)
             value: str = self._get_content_from_response(result).strip()
 
             # Reject obviously invalid responses
@@ -424,9 +411,7 @@ class LLMClient:
             # Safe float conversion for confidence
             raw_confidence = data.get("confidence")
             try:
-                confidence = (
-                    float(raw_confidence) if raw_confidence is not None else 0.5
-                )
+                confidence = float(raw_confidence) if raw_confidence is not None else 0.5
             except (ValueError, TypeError):
                 logger.warning(f"Invalid confidence value from LLM: {raw_confidence}")
                 confidence = 0.5
