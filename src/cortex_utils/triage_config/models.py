@@ -404,6 +404,22 @@ class Action(BaseModel):
     - label: Gets prefixed with label_prefix (e.g., "Todo" -> "Cortex/Todo")
     - add_label: Applied as-is, no prefix (e.g., "Work/Projects")
     - remove_label: Removed as-is, no prefix
+
+    Action flags use CRDT merge semantics when multiple chains evaluate:
+
+    Conservative (false wins over true — keep visible unless unanimous):
+    - archive: Remove from inbox. Only archives if all chains agree.
+    - mark_read: Mark as read. Only marks read if all chains agree.
+
+    Aggressive (true wins over false — surface if anyone thinks so):
+    - star: Star the email.
+    - important: Mark as important.
+
+    Vetoes (override merge result in the opposite direction):
+    - not_archive: Force archive regardless of other chains.
+    - not_unread: Force mark-read regardless of other chains.
+    - not_star: Force no star regardless of other chains.
+    - not_important: Force not important regardless of other chains.
     """
 
     label: str | None = None  # Auto-prefixed with label_prefix
@@ -412,6 +428,11 @@ class Action(BaseModel):
     archive: bool | None = None
     mark_read: bool | None = None
     star: bool | None = None
+    important: bool | None = None
+    not_archive: bool | None = None  # Veto: force archive
+    not_unread: bool | None = None  # Veto: force mark read
+    not_star: bool | None = None  # Veto: force no star
+    not_important: bool | None = None  # Veto: force not important
 
 
 class EmailMappingAction(BaseModel):
@@ -600,8 +621,36 @@ class Rule(BaseModel):
         return self
 
 
+class ChainConfig(BaseModel):
+    """Configuration for a rule chain.
+
+    auto_run chains evaluate independently for every email (parallel chains).
+    Non-auto_run chains are only reached via 'jump' from another chain.
+
+    The 'main' chain defaults to auto_run=True if not explicitly set.
+    """
+
+    auto_run: bool = False
+    rules: list[Rule] = Field(default_factory=list)
+
+
 class RulesConfig(BaseModel):
-    """Top-level rules configuration."""
+    """Top-level rules configuration.
+
+    Chains can be specified in two formats for backward compatibility:
+
+    New format (with auto_run):
+        chains:
+          main:
+            auto_run: true
+            rules:
+              - match: ...
+
+    Legacy format (list of rules, auto_run defaults false, except main=true):
+        chains:
+          main:
+            - match: ...
+    """
 
     version: int = 1
     label_prefix: str = "Cortex"
@@ -611,10 +660,45 @@ class RulesConfig(BaseModel):
     body_extraction_prompts: dict[str, BodyExtractionPrompt] = Field(
         default_factory=_default_body_extraction_prompts
     )
-    chains: dict[str, list[Rule]] = Field(default_factory=dict)
+    chains: dict[str, ChainConfig] = Field(default_factory=dict)
     # Email mappings for O(1) hash-based lookup by sender address (normalized lowercase)
     priority_email_mappings: dict[str, EmailMappingAction] = Field(default_factory=dict)
     fallback_email_mappings: dict[str, EmailMappingAction] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_chains(cls, data: Any) -> Any:
+        """Convert legacy chain format (list of rules) to ChainConfig objects."""
+        if isinstance(data, dict) and "chains" in data:
+            chains = data["chains"]
+            if isinstance(chains, dict):
+                normalized = {}
+                for name, value in chains.items():
+                    if isinstance(value, list):
+                        # Legacy format: list of rules
+                        # main defaults to auto_run=True
+                        normalized[name] = {
+                            "auto_run": name == "main",
+                            "rules": value,
+                        }
+                    elif isinstance(value, dict):
+                        # New format: check if it has 'rules' key
+                        if "rules" in value:
+                            # Explicit new format
+                            if "auto_run" not in value:
+                                value["auto_run"] = name == "main"
+                            normalized[name] = value
+                        else:
+                            # Could be a single rule dict mistakenly not in a list
+                            # Treat as legacy single-rule chain
+                            normalized[name] = {
+                                "auto_run": name == "main",
+                                "rules": [value],
+                            }
+                    else:
+                        normalized[name] = value
+                data["chains"] = normalized
+        return data
 
 
 class PatternInfo(BaseModel):

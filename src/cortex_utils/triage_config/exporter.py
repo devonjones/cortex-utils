@@ -77,12 +77,12 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
         ) = result
 
         # Build chains dict by traversing linked lists
-        chains: dict[str, list[dict[str, Any]]] = {}
+        chains: dict[str, dict[str, Any]] = {}
 
-        # Get all chains for this version
+        # Get all chains for this version (including auto_run flag)
         cursor.execute(
             """
-            SELECT id, chain_name
+            SELECT id, chain_name, COALESCE(auto_run, chain_name = 'main') as auto_run
             FROM triage_chains
             WHERE config_version = %s
             ORDER BY display_order, chain_name
@@ -90,7 +90,7 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
             (version_num,),
         )
 
-        for chain_id, chain_name in cursor.fetchall():
+        for chain_id, chain_name, auto_run in cursor.fetchall():
             # Traverse rules in order
             rules_data = traverse_chain(cursor, chain_id)
 
@@ -115,7 +115,10 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
 
                 chain_rules.append(rule_dict)
 
-            chains[chain_name] = chain_rules
+            chains[chain_name] = {
+                "auto_run": bool(auto_run),
+                "rules": chain_rules,
+            }
 
         # Fetch email mappings from global table (not versioned)
         cursor.execute(

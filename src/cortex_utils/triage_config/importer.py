@@ -189,8 +189,8 @@ def validate_rules(config: RulesConfig) -> list[str]:
 
     # Validate jump targets and intent references
     # Note: Rule model_validator handles action/jump/llm exclusivity and llm+routes
-    for chain_name, rules in config.chains.items():
-        for i, rule in enumerate(rules):
+    for chain_name, chain_config in config.chains.items():
+        for i, rule in enumerate(chain_config.rules):
             if rule.jump and rule.jump not in config.chains:
                 errors.append(
                     f"Chain '{chain_name}' rule {i}: jump target '{rule.jump}' does not exist"
@@ -375,21 +375,21 @@ def import_yaml_to_db(
         new_version: int = result[0]
 
         # 5. Insert chains and rules with linked list
-        for chain_name, rules in config.chains.items():
+        for chain_name, chain_config in config.chains.items():
             cursor.execute(
                 """
-                INSERT INTO triage_chains (config_version, chain_name)
-                VALUES (%s, %s)
+                INSERT INTO triage_chains (config_version, chain_name, auto_run)
+                VALUES (%s, %s, %s)
                 RETURNING id
                 """,
-                (new_version, chain_name),
+                (new_version, chain_name, chain_config.auto_run),
             )
             chain_result = cursor.fetchone()
             assert chain_result is not None
             chain_id: int = chain_result[0]
 
             prev_rule_id = None
-            for rule in rules:
+            for rule in chain_config.rules:
                 # Extract rule fields
                 match_condition = rule.match.model_dump() if rule.match else {}
                 action = rule.action.model_dump() if rule.action else None
