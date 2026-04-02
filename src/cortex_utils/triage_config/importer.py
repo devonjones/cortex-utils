@@ -351,11 +351,12 @@ def import_yaml_to_db(
                 is_active,
                 config_hash,
                 label_prefix,
+                default_label,
                 intents,
                 email_categories,
                 prompts,
                 body_extraction_prompts
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING version
             """,
             (
@@ -364,6 +365,7 @@ def import_yaml_to_db(
                 True,  # Auto-deactivates old version via trigger
                 config_hash,
                 config.label_prefix,
+                config.default_label,
                 json.dumps(intents_dict),
                 json.dumps(email_categories_dict),
                 json.dumps(prompts_dict),

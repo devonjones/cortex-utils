@@ -654,6 +654,7 @@ class RulesConfig(BaseModel):
 
     version: int = 1
     label_prefix: str = "Cortex"
+    default_label: str = "Uncategorized"  # Applied when no chains produce a label
     intents: dict[str, IntentConfig] = Field(default_factory=dict)
     email_categories: dict[str, EmailCategoryConfig] = Field(default_factory=dict)
     prompts: dict[str, ClassificationPrompt] = Field(default_factory=_default_prompts)

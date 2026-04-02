@@ -56,6 +56,7 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
             """
             SELECT
                 label_prefix,
+                default_label,
                 intents,
                 email_categories,
                 prompts,
@@ -70,6 +71,7 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
 
         (
             label_prefix,
+            default_label,
             intents_json,
             email_categories_json,
             prompts_json,
@@ -161,6 +163,7 @@ def export_config_to_yaml(conn: psycopg2.extensions.connection, version: int | N
         config_dict = {
             "version": version_num,
             "label_prefix": label_prefix,
+            "default_label": default_label or "Uncategorized",
             "intents": intents_json,
             "email_categories": email_categories_json,
             "prompts": prompts_json,
