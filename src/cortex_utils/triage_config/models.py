@@ -415,11 +415,11 @@ class Action(BaseModel):
     - star: Star the email.
     - important: Mark as important.
 
-    Vetoes (override merge result in the opposite direction):
-    - not_archive: Force archive regardless of other chains.
-    - not_unread: Force mark-read regardless of other chains.
-    - not_star: Force no star regardless of other chains.
-    - not_important: Force not important regardless of other chains.
+    Vetoes (override merge result regardless of other chains):
+    - force_archive: Force archive regardless of other chains.
+    - force_mark_read: Force mark-read regardless of other chains.
+    - force_no_star: Force no star regardless of other chains.
+    - force_no_important: Force not important regardless of other chains.
     """
 
     label: str | None = None  # Auto-prefixed with label_prefix
@@ -429,10 +429,10 @@ class Action(BaseModel):
     mark_read: bool | None = None
     star: bool | None = None
     important: bool | None = None
-    not_archive: bool | None = None  # Veto: force archive
-    not_unread: bool | None = None  # Veto: force mark read
-    not_star: bool | None = None  # Veto: force no star
-    not_important: bool | None = None  # Veto: force not important
+    force_archive: bool | None = None
+    force_mark_read: bool | None = None
+    force_no_star: bool | None = None
+    force_no_important: bool | None = None
 
 
 class EmailMappingAction(BaseModel):
