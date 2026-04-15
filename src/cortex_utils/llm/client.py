@@ -154,6 +154,38 @@ class LLMClient:
         )
         response.raise_for_status()
         result: dict[str, Any] = response.json()
+
+        # Some models (qwen3.5, qwen3) return empty content on the chat
+        # completions API. Fall back to native Ollama /api/generate endpoint.
+        content = self._get_content_from_response(result)
+        if not content.strip():
+            logger.debug(
+                f"Empty response from chat completions, falling back to native API"
+            )
+            native_payload: dict[str, Any] = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            if "max_tokens" in payload:
+                native_payload["options"] = {"num_predict": payload["max_tokens"]}
+            if "temperature" in payload:
+                native_payload.setdefault("options", {})["temperature"] = payload["temperature"]
+            native_response = self.client.post(
+                f"{self.base_url}/api/generate",
+                json=native_payload,
+            )
+            native_response.raise_for_status()
+            native_result = native_response.json()
+            # Wrap in chat completions format for consistent handling
+            result = {
+                "choices": [{
+                    "message": {
+                        "content": native_result.get("response", ""),
+                    }
+                }]
+            }
+
         return result
 
     def _get_content_from_response(self, result: dict[str, Any]) -> str:
