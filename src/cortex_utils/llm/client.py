@@ -59,8 +59,8 @@ def extract_reply_hierarchy(body: str | None, from_addr: str) -> str:
     Returns a formatted string like:
         Reply chain:
         1. sender@example.com (this email)
-        2. bob@company.com (quoted reply)
-        3. sender@example.com (earlier message)
+        2. bob@company.com (quoted)
+        3. alice@company.com (quoted)
 
     Or "No reply chain detected" if no patterns found.
     """
@@ -71,18 +71,21 @@ def extract_reply_hierarchy(body: str | None, from_addr: str) -> str:
     seen_emails: set[str] = set()
     participants: list[str] = []  # email addresses
 
+    all_matches = []
     for pattern in _REPLY_PATTERNS:
-        for match in pattern.finditer(body):
-            groups = match.groups()
-            # Patterns with 2 groups: (name, email). With 1 group: (email,)
-            email = groups[-1].strip()
-            # Clean up mailto: artifacts
-            if "<" in email:
-                email = email.split("<")[0]
-            email_lower = email.lower()
-            if email_lower not in seen_emails:
-                seen_emails.add(email_lower)
-                participants.append(email)
+        all_matches.extend(pattern.finditer(body))
+
+    for match in sorted(all_matches, key=lambda m: m.start()):
+        groups = match.groups()
+        # Patterns with 2 groups: (name, email). With 1 group: (email,)
+        email = groups[-1].strip()
+        # Clean up mailto: artifacts
+        if "<" in email:
+            email = email.split("<")[0].strip()
+        email_lower = email.lower()
+        if email_lower not in seen_emails:
+            seen_emails.add(email_lower)
+            participants.append(email)
 
     if not participants:
         return "No reply chain detected"
@@ -92,6 +95,7 @@ def extract_reply_hierarchy(body: str | None, from_addr: str) -> str:
         lines.append(f"{i}. {email} (quoted)")
 
     return "Reply chain:\n" + "\n".join(lines)
+
 
 # Invalid LLM extraction responses to reject
 INVALID_LLM_EXTRACTION_VALUES = {
