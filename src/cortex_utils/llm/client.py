@@ -167,10 +167,9 @@ class LLMClient:
                 "prompt": prompt,
                 "stream": False,
             }
-            if "max_tokens" in payload:
-                native_payload["options"] = {"num_predict": payload["max_tokens"]}
-            if "temperature" in payload:
-                native_payload.setdefault("options", {})["temperature"] = payload["temperature"]
+            # Don't pass num_predict — thinking models (qwen3.5) consume
+            # the token budget on thinking tokens, leaving nothing for
+            # the visible answer. Let the model decide when to stop.
             native_response = self.client.post(
                 f"{self.base_url}/api/generate",
                 json=native_payload,
