@@ -301,8 +301,12 @@ class LLMClient:
         formatted_prompt = prompt.format(**format_args)
 
         try:
+            # Don't use temperature=0 here — some models (qwen3.5) return
+            # empty responses with temperature=0 on the chat completions API.
+            # check_email_intent is used for Stage 2 verification which may
+            # use larger models that have this issue.
             result = self._post_completion(
-                model=model, prompt=formatted_prompt, max_tokens=10, temperature=0
+                model=model, prompt=formatted_prompt, max_tokens=10
             )
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
