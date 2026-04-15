@@ -120,7 +120,7 @@ class LLMClient:
         prompt: str,
         max_tokens: int,
         response_format: dict[str, str] | None = None,
-        temperature: float | None = None,
+        temperature: float | None = 0,
     ) -> dict[str, Any]:
         """Helper to post to completions endpoint and return the result.
 
@@ -129,7 +129,7 @@ class LLMClient:
             prompt: The prompt content to send.
             max_tokens: Maximum tokens for the response.
             response_format: Optional response format (e.g., {"type": "json_object"}).
-            temperature: Sampling temperature (0 = deterministic). None = model default.
+            temperature: Sampling temperature (0 = deterministic). Defaults to 0.
 
         Returns:
             The JSON response from the API.
@@ -301,7 +301,9 @@ class LLMClient:
         formatted_prompt = prompt.format(**format_args)
 
         try:
-            result = self._post_completion(model=model, prompt=formatted_prompt, max_tokens=10, temperature=0)
+            result = self._post_completion(
+                model=model, prompt=formatted_prompt, max_tokens=10, temperature=0
+            )
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
             return answer == "yes"
