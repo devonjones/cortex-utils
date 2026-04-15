@@ -6,6 +6,7 @@ Supports LiteLLM proxy, Ollama with /v1 endpoints, and any OpenAI-compatible API
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -23,6 +24,74 @@ class LLMError(Exception):
 
 # Max characters of email body to include in LLM prompts
 LLM_BODY_PREVIEW_LENGTH = 1000
+
+# Patterns for extracting reply chain from email bodies
+_REPLY_PATTERNS = [
+    # "On Mon, Jan 15, 2025 at 6:28 PM, Person Name <email@example.com> wrote:"
+    re.compile(
+        r"On\s+.{10,60}\s+(.+?)\s*<([^>]+)>\s*wrote:",
+        re.IGNORECASE,
+    ),
+    # Same pattern but name on next line (long titles/orgs)
+    re.compile(
+        r"<([^>]+@[^>]+)>\s*wrote:",
+        re.IGNORECASE,
+    ),
+    # "From: Person Name <email@example.com>"
+    re.compile(
+        r"^From:\s*(.+?)\s*<([^>]+)>",
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    # "[person] <email> schrieb am" (German Outlook)
+    re.compile(
+        r"(.+?)\s*<([^>]+)>\s*schrieb\s+am",
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_reply_hierarchy(body: str | None, from_addr: str) -> str:
+    """Extract reply chain participants from email body.
+
+    Parses "On [date], Person <email> wrote:" and "From: Person <email>"
+    patterns to build a structured view of who participated in the thread.
+
+    Returns a formatted string like:
+        Reply chain:
+        1. sender@example.com (this email)
+        2. bob@company.com (quoted reply)
+        3. sender@example.com (earlier message)
+
+    Or "No reply chain detected" if no patterns found.
+    """
+    if not body:
+        return "No reply chain detected"
+
+    # Collect unique email addresses in order of appearance
+    seen_emails: set[str] = set()
+    participants: list[str] = []  # email addresses
+
+    for pattern in _REPLY_PATTERNS:
+        for match in pattern.finditer(body):
+            groups = match.groups()
+            # Patterns with 2 groups: (name, email). With 1 group: (email,)
+            email = groups[-1].strip()
+            # Clean up mailto: artifacts
+            if "<" in email:
+                email = email.split("<")[0]
+            email_lower = email.lower()
+            if email_lower not in seen_emails:
+                seen_emails.add(email_lower)
+                participants.append(email)
+
+    if not participants:
+        return "No reply chain detected"
+
+    lines = [f"1. {from_addr} (this email)"]
+    for i, email in enumerate(participants, 2):
+        lines.append(f"{i}. {email} (quoted)")
+
+    return "Reply chain:\n" + "\n".join(lines)
 
 # Invalid LLM extraction responses to reject
 INVALID_LLM_EXTRACTION_VALUES = {
@@ -213,11 +282,15 @@ class LLMClient:
         """
         # Format the prompt with email content
         body_preview = (body or "")[:LLM_BODY_PREVIEW_LENGTH]
-        formatted_prompt = prompt.format(
-            from_addr=from_addr,
-            subject=subject,
-            body_preview=body_preview,
-        )
+        format_args: dict[str, str] = {
+            "from_addr": from_addr,
+            "subject": subject,
+            "body_preview": body_preview,
+        }
+        # Only compute reply_hierarchy if the prompt uses it
+        if "{reply_hierarchy}" in prompt:
+            format_args["reply_hierarchy"] = extract_reply_hierarchy(body, from_addr)
+        formatted_prompt = prompt.format(**format_args)
 
         try:
             result = self._post_completion(model=model, prompt=formatted_prompt, max_tokens=10)
