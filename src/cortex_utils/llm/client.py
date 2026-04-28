@@ -112,7 +112,7 @@ class LLMClient:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.Client(timeout=60.0)
+        self.client = httpx.Client(timeout=120.0)
 
     def _post_completion(
         self,
