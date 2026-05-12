@@ -63,7 +63,7 @@ def ready_predicate(column: str = "next_attempt_at") -> str:
 
     Splice into the `claimable` CTE of a consumer's claim query, e.g.:
 
-        AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+        AND (next_attempt_at IS NULL OR next_attempt_at <= statement_timestamp())
 
     ``column`` must be a trusted SQL identifier (alphanumeric/underscore only).
     """
@@ -71,7 +71,7 @@ def ready_predicate(column: str = "next_attempt_at") -> str:
 
     if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", column):
         raise ValueError(f"Invalid column name: {column!r}")
-    return f"({column} IS NULL OR {column} <= NOW())"
+    return f"({column} IS NULL OR {column} <= statement_timestamp())"
 
 
 def fail_or_retry(
@@ -139,7 +139,7 @@ def fail_or_retry(
             SET status = 'pending',
                 attempts = %s,
                 last_error = %s,
-                next_attempt_at = NOW() + (INTERVAL '1 second' * %s),
+                next_attempt_at = clock_timestamp() + (INTERVAL '1 second' * %s),
                 claimed_at = NULL
             WHERE id = %s
             """,

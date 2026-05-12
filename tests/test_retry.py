@@ -47,11 +47,13 @@ def test_backoff_returns_at_least_one_second() -> None:
 
 
 def test_ready_predicate_default() -> None:
-    assert ready_predicate() == "(next_attempt_at IS NULL OR next_attempt_at <= NOW())"
+    assert (
+        ready_predicate() == "(next_attempt_at IS NULL OR next_attempt_at <= statement_timestamp())"
+    )
 
 
 def test_ready_predicate_custom_column() -> None:
-    assert ready_predicate("retry_at") == "(retry_at IS NULL OR retry_at <= NOW())"
+    assert ready_predicate("retry_at") == "(retry_at IS NULL OR retry_at <= statement_timestamp())"
 
 
 def test_defaults() -> None:
