@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+import pytest
+
 from cortex_utils.queue.retry import (
     DEFAULT_BASE_SECONDS,
     DEFAULT_CAP_SECONDS,
     compute_backoff_delay,
+    fail_or_retry,
     ready_predicate,
 )
 
@@ -52,3 +57,57 @@ def test_ready_predicate_custom_column() -> None:
 def test_defaults() -> None:
     assert DEFAULT_BASE_SECONDS == 30
     assert DEFAULT_CAP_SECONDS == 900
+
+
+def test_ready_predicate_rejects_invalid_column() -> None:
+    with pytest.raises(ValueError, match="Invalid column name"):
+        ready_predicate("col; DROP TABLE queue")
+
+
+# --- fail_or_retry tests ---
+
+
+def _mock_conn(fetchone_return):
+    """Build a mock psycopg2 connection with a cursor context manager."""
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.fetchone.return_value = fetchone_return
+    conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return conn, cur
+
+
+def test_fail_or_retry_retries_when_under_max() -> None:
+    conn, cur = _mock_conn((1,))
+    result = fail_or_retry(conn, job_id=42, error="boom", max_attempts=5, jitter_ratio=0.0)
+    assert result == "retrying"
+    # Should have issued SELECT FOR UPDATE then UPDATE with status='pending'
+    calls = cur.execute.call_args_list
+    assert "FOR UPDATE" in calls[0][0][0]
+    assert "pending" in calls[1][0][0]
+    conn.commit.assert_called()
+
+
+def test_fail_or_retry_fails_when_at_max() -> None:
+    conn, cur = _mock_conn((4,))
+    result = fail_or_retry(conn, job_id=42, error="boom", max_attempts=5, jitter_ratio=0.0)
+    assert result == "failed"
+    calls = cur.execute.call_args_list
+    assert "failed" in calls[1][0][0]
+    conn.commit.assert_called()
+
+
+def test_fail_or_retry_missing_job() -> None:
+    conn, cur = _mock_conn(None)
+    result = fail_or_retry(conn, job_id=999, error="boom", max_attempts=5)
+    assert result == "failed"
+    conn.commit.assert_called()
+
+
+def test_fail_or_retry_truncates_error() -> None:
+    conn, cur = _mock_conn((0,))
+    long_error = "x" * 2000
+    fail_or_retry(conn, job_id=1, error=long_error, max_attempts=5, error_max_chars=100)
+    # The UPDATE call should have the truncated error
+    update_args = cur.execute.call_args_list[1][0][1]
+    assert len(update_args[1]) == 100

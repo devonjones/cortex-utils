@@ -159,9 +159,7 @@ class LLMClient:
         # completions API. Fall back to native Ollama /api/generate endpoint.
         content = self._get_content_from_response(result)
         if not content.strip():
-            logger.debug(
-                f"Empty response from chat completions, falling back to native API"
-            )
+            logger.debug("Empty response from chat completions, falling back to native API")
             native_payload: dict[str, Any] = {
                 "model": model,
                 "prompt": prompt,
@@ -178,11 +176,13 @@ class LLMClient:
             native_result = native_response.json()
             # Wrap in chat completions format for consistent handling
             result = {
-                "choices": [{
-                    "message": {
-                        "content": native_result.get("response", ""),
+                "choices": [
+                    {
+                        "message": {
+                            "content": native_result.get("response", ""),
+                        }
                     }
-                }]
+                ]
             }
 
         return result
@@ -336,9 +336,7 @@ class LLMClient:
             # empty responses with temperature=0 on the chat completions API.
             # check_email_intent is used for Stage 2 verification which may
             # use larger models that have this issue.
-            result = self._post_completion(
-                model=model, prompt=formatted_prompt, max_tokens=10
-            )
+            result = self._post_completion(model=model, prompt=formatted_prompt, max_tokens=10)
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
             return answer == "yes"

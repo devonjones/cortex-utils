@@ -64,7 +64,13 @@ def ready_predicate(column: str = "next_attempt_at") -> str:
     Splice into the `claimable` CTE of a consumer's claim query, e.g.:
 
         AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+
+    ``column`` must be a trusted SQL identifier (alphanumeric/underscore only).
     """
+    import re
+
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", column):
+        raise ValueError(f"Invalid column name: {column!r}")
     return f"({column} IS NULL OR {column} <= NOW())"
 
 
@@ -83,14 +89,14 @@ def fail_or_retry(
     Returns "retrying" if the job was re-queued for a future attempt,
     or "failed" if it has now exhausted its retries.
 
-    The caller owns the transaction; this issues a single UPDATE and
-    commits.
+    This function commits the transaction internally after each UPDATE.
+    Do not wrap calls in a larger transaction that depends on atomicity.
     """
     truncated_error = error[:error_max_chars]
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT attempts FROM queue WHERE id = %s",
+            "SELECT attempts FROM queue WHERE id = %s FOR UPDATE",
             (job_id,),
         )
         row = cur.fetchone()
