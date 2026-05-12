@@ -17,6 +17,7 @@ import structlog
 
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
 from cortex_utils.config import Config
+from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.migrate import drop_old_queue_table, migrate_to_partitioned
 from cortex_utils.queue.partitions import PartitionManager
@@ -472,6 +473,38 @@ def migrate_queue(ctx: click.Context, days_ahead: int, dry_run: bool, execute: b
             click.echo("")
             click.echo("Verify the migration, then drop the old table with:")
             click.echo("  cortex-utils drop-old-queue --execute")
+    finally:
+        conn.close()
+
+
+@main.command("migrate-retry")
+@click.option("--dry-run", is_flag=True, help="Show what would be done")
+@click.option("--execute", is_flag=True, help="Actually run the migration")
+@click.pass_context
+def migrate_retry(ctx: click.Context, dry_run: bool, execute: bool) -> None:
+    """Add next_attempt_at column for exponential-backoff retries.
+
+    Idempotent; safe to re-run.
+    """
+    if not dry_run and not execute:
+        click.echo("Must specify either --dry-run or --execute")
+        return
+
+    config = ctx.obj["config"]
+    conn = get_connection(config)
+
+    try:
+        result = add_retry_columns(conn, dry_run=dry_run)
+        if result["status"] == "already_applied":
+            click.echo("queue.next_attempt_at already exists. Nothing to do.")
+        elif result["status"] == "dry_run":
+            click.echo("DRY RUN - Would add queue.next_attempt_at column")
+            click.echo("  + idx_queue_ready_priority index")
+            click.echo("Run with --execute to apply.")
+        elif result["status"] == "applied":
+            click.echo("Migration applied.")
+            click.echo("  Added queue.next_attempt_at")
+            click.echo("  Added idx_queue_ready_priority")
     finally:
         conn.close()
 
