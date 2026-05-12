@@ -38,12 +38,11 @@ def add_retry_columns(
 ) -> dict[str, Any]:
     """Add `next_attempt_at` column and supporting index.
 
-    The new index, `idx_queue_ready_priority`, replaces the lookup
-    `idx_queue_pending_priority` does today but folds `next_attempt_at`
-    in so delayed jobs do not blow up the scan. The old index stays in
-    place for now; drop it in a follow-up after consumers cut over.
+    The new index, `idx_queue_ready`, covers claim queries that filter
+    on `next_attempt_at` (the retry predicate).  The old `idx_queue_pending`
+    stays in place for now; drop it in a follow-up after consumers cut over.
     """
-    if has_next_attempt_at_column(conn):
+    if dry_run and has_next_attempt_at_column(conn):
         log.info("queue.next_attempt_at already exists; nothing to do")
         return {"status": "already_applied"}
 
@@ -60,11 +59,11 @@ def add_retry_columns(
         )
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_queue_ready_priority
-            ON queue (queue_name, status, next_attempt_at, priority DESC, created_at)
+            CREATE INDEX IF NOT EXISTS idx_queue_ready
+            ON queue (queue_name, created_at, next_attempt_at)
             WHERE status = 'pending'
             """
         )
     conn.commit()
-    log.info("Added queue.next_attempt_at column and idx_queue_ready_priority")
+    log.info("Added queue.next_attempt_at column and idx_queue_ready")
     return {"status": "applied"}

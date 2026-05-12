@@ -499,12 +499,12 @@ def migrate_retry(ctx: click.Context, dry_run: bool, execute: bool) -> None:
             click.echo("queue.next_attempt_at already exists. Nothing to do.")
         elif result["status"] == "dry_run":
             click.echo("DRY RUN - Would add queue.next_attempt_at column")
-            click.echo("  + idx_queue_ready_priority index")
+            click.echo("  + idx_queue_ready index")
             click.echo("Run with --execute to apply.")
         elif result["status"] == "applied":
             click.echo("Migration applied.")
             click.echo("  Added queue.next_attempt_at")
-            click.echo("  Added idx_queue_ready_priority")
+            click.echo("  Added idx_queue_ready")
     finally:
         conn.close()
 
