@@ -89,8 +89,8 @@ def fail_or_retry(
     Returns "retrying" if the job was re-queued for a future attempt,
     or "failed" if it has now exhausted its retries.
 
-    This function commits the transaction internally after each UPDATE.
-    Do not wrap calls in a larger transaction that depends on atomicity.
+    The caller owns the transaction and is responsible for committing
+    or rolling back.
     """
     truncated_error = error[:error_max_chars]
 
@@ -102,9 +102,8 @@ def fail_or_retry(
         row = cur.fetchone()
         if row is None:
             log.warning("fail_or_retry: job not found", job_id=job_id)
-            conn.commit()
             return "failed"
-        current_attempts = row[0]
+        current_attempts = row[0] or 0
 
         next_attempts = current_attempts + 1
         if next_attempts >= max_attempts:
@@ -120,7 +119,6 @@ def fail_or_retry(
                 """,
                 (next_attempts, truncated_error, job_id),
             )
-            conn.commit()
             log.info(
                 "Job exhausted retries",
                 job_id=job_id,
@@ -147,7 +145,6 @@ def fail_or_retry(
             """,
             (next_attempts, truncated_error, delay_seconds, job_id),
         )
-        conn.commit()
         log.info(
             "Job scheduled for retry",
             job_id=job_id,

@@ -85,7 +85,7 @@ def test_fail_or_retry_retries_when_under_max() -> None:
     calls = cur.execute.call_args_list
     assert "FOR UPDATE" in calls[0][0][0]
     assert "pending" in calls[1][0][0]
-    conn.commit.assert_called()
+    conn.commit.assert_not_called()
 
 
 def test_fail_or_retry_fails_when_at_max() -> None:
@@ -94,14 +94,23 @@ def test_fail_or_retry_fails_when_at_max() -> None:
     assert result == "failed"
     calls = cur.execute.call_args_list
     assert "failed" in calls[1][0][0]
-    conn.commit.assert_called()
+    conn.commit.assert_not_called()
 
 
 def test_fail_or_retry_missing_job() -> None:
     conn, cur = _mock_conn(None)
     result = fail_or_retry(conn, job_id=999, error="boom", max_attempts=5)
     assert result == "failed"
-    conn.commit.assert_called()
+    conn.commit.assert_not_called()
+
+
+def test_fail_or_retry_null_attempts() -> None:
+    conn, cur = _mock_conn((None,))
+    result = fail_or_retry(conn, job_id=1, error="boom", max_attempts=5, jitter_ratio=0.0)
+    assert result == "retrying"
+    # attempts should be treated as 0, so next_attempts=1 < 5 -> retry
+    update_args = cur.execute.call_args_list[1][0][1]
+    assert update_args[0] == 1  # next_attempts
 
 
 def test_fail_or_retry_truncates_error() -> None:
