@@ -1,12 +1,4 @@
-"""Schema migration: add `next_attempt_at` column to the queue table.
-
-Idempotent: re-running is safe.
-
-After running this, consumers should be upgraded to call
-`cortex_utils.queue.retry.fail_or_retry` and to include
-`ready_predicate()` in their claim CTE so delayed retries are
-honored.
-"""
+"""Schema migration: add `next_attempt_at` column to the queue table."""
 
 from __future__ import annotations
 
@@ -19,13 +11,14 @@ log = structlog.get_logger()
 
 
 def has_next_attempt_at_column(conn: psycopg2.extensions.connection) -> bool:
-    """Check whether the column already exists."""
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT 1
-            FROM information_schema.columns
-            WHERE table_name = 'queue' AND column_name = 'next_attempt_at'
+            FROM pg_attribute
+            WHERE attrelid = 'public.queue'::regclass
+              AND attname = 'next_attempt_at'
+              AND NOT attisdropped
             LIMIT 1
             """
         )
@@ -36,13 +29,8 @@ def add_retry_columns(
     conn: psycopg2.extensions.connection,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Add `next_attempt_at` column and supporting index.
-
-    The new index, `idx_queue_ready`, covers claim queries that filter
-    on `next_attempt_at` (the retry predicate).  The old `idx_queue_pending`
-    stays in place for now; drop it in a follow-up after consumers cut over.
-    """
-    if dry_run and has_next_attempt_at_column(conn):
+    """Add `next_attempt_at` column and supporting index. Idempotent."""
+    if has_next_attempt_at_column(conn):
         log.info("queue.next_attempt_at already exists; nothing to do")
         return {"status": "already_applied"}
 

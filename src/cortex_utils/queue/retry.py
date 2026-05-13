@@ -1,26 +1,9 @@
-"""Exponential-backoff retry support for the shared queue.
-
-Failed jobs used to transition straight to status='failed' and stay there
-until a human reset them. This module lets consumers re-queue a failure
-with a delay (`next_attempt_at`) up to `max_attempts`, after which the
-job moves to 'failed' for good.
-
-Consumers wire this in two places:
-
-1. `_fail_job(...)`: call `fail_or_retry(...)` instead of issuing the
-   UPDATE that sets status='failed' directly.
-
-2. The claim CTE: add `AND ready_predicate()` to the `claimable` SELECT
-   so delayed jobs are not picked up until their backoff has elapsed.
-
-The schema migration for the `next_attempt_at` column lives in
-`add_retry_columns.py` and is exposed via the `cortex-utils migrate-retry`
-CLI command.
-"""
+"""Exponential-backoff retry helpers for the shared queue."""
 
 from __future__ import annotations
 
 import random
+import re
 from typing import Literal
 
 import psycopg2
@@ -41,12 +24,9 @@ def compute_backoff_delay(
 ) -> int:
     """Compute seconds to wait before the next retry.
 
-    Doubles each attempt up to `cap_seconds`, then applies symmetric
-    jitter of +/- `jitter_ratio` to avoid thundering herds when many
-    jobs fail at once (e.g. an LLM outage).
-
-    `attempts` is the number of attempts already made (so the first
-    retry is `attempts=1`).
+    `attempts` is the number of attempts already made; the first retry
+    is `attempts=1`. Jitter exists so simultaneous failures (e.g. an
+    LLM outage stranding hundreds of jobs) don't all retry in lockstep.
     """
     if attempts < 1:
         attempts = 1
@@ -58,18 +38,16 @@ def compute_backoff_delay(
     return max(1, int(jittered))
 
 
+_COLUMN_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
 def ready_predicate(column: str = "next_attempt_at") -> str:
     """SQL predicate that matches jobs ready to be claimed.
 
-    Splice into the `claimable` CTE of a consumer's claim query, e.g.:
-
-        AND (next_attempt_at IS NULL OR next_attempt_at <= statement_timestamp())
-
-    ``column`` must be a trusted SQL identifier (alphanumeric/underscore only).
+    Splice into the `claimable` CTE of a consumer's claim query.
+    `column` must be a SQL identifier (alphanumeric/underscore only).
     """
-    import re
-
-    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", column):
+    if not _COLUMN_NAME_RE.match(column):
         raise ValueError(f"Invalid column name: {column!r}")
     return f"({column} IS NULL OR {column} <= statement_timestamp())"
 
@@ -77,7 +55,7 @@ def ready_predicate(column: str = "next_attempt_at") -> str:
 def fail_or_retry(
     conn: psycopg2.extensions.connection,
     job_id: int,
-    error: str,
+    error: object,
     max_attempts: int,
     base_seconds: int = DEFAULT_BASE_SECONDS,
     cap_seconds: int = DEFAULT_CAP_SECONDS,
@@ -87,23 +65,32 @@ def fail_or_retry(
     """Increment attempts and either schedule a retry or mark failed.
 
     Returns "retrying" if the job was re-queued for a future attempt,
-    or "failed" if it has now exhausted its retries.
+    or "failed" if it has now exhausted its retries (or the row was
+    already in a terminal state, or the row was not found).
 
     The caller owns the transaction and is responsible for committing
     or rolling back.
     """
-    truncated_error = error[:error_max_chars]
+    truncated_error = str(error)[:error_max_chars]
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT attempts FROM queue WHERE id = %s FOR UPDATE",
+            "SELECT attempts, status FROM queue WHERE id = %s FOR UPDATE",
             (job_id,),
         )
         row = cur.fetchone()
         if row is None:
-            log.warning("fail_or_retry: job not found", job_id=job_id)
+            log.error("fail_or_retry: job not found", job_id=job_id)
             return "failed"
-        current_attempts = row[0] or 0
+        current_attempts, status = row
+        if status in ("completed", "failed"):
+            log.warning(
+                "fail_or_retry: job already in terminal state",
+                job_id=job_id,
+                status=status,
+            )
+            return "failed"
+        current_attempts = current_attempts or 0
 
         next_attempts = current_attempts + 1
         if next_attempts >= max_attempts:
@@ -133,6 +120,7 @@ def fail_or_retry(
             cap_seconds=cap_seconds,
             jitter_ratio=jitter_ratio,
         )
+        # Release the claim so the row becomes eligible at next_attempt_at.
         cur.execute(
             """
             UPDATE queue

@@ -80,10 +80,9 @@ def _mock_conn(fetchone_return):
 
 
 def test_fail_or_retry_retries_when_under_max() -> None:
-    conn, cur = _mock_conn((1,))
+    conn, cur = _mock_conn((1, "processing"))
     result = fail_or_retry(conn, job_id=42, error="boom", max_attempts=5, jitter_ratio=0.0)
     assert result == "retrying"
-    # Should have issued SELECT FOR UPDATE then UPDATE with status='pending'
     calls = cur.execute.call_args_list
     assert "FOR UPDATE" in calls[0][0][0]
     assert "pending" in calls[1][0][0]
@@ -91,7 +90,7 @@ def test_fail_or_retry_retries_when_under_max() -> None:
 
 
 def test_fail_or_retry_fails_when_at_max() -> None:
-    conn, cur = _mock_conn((4,))
+    conn, cur = _mock_conn((4, "processing"))
     result = fail_or_retry(conn, job_id=42, error="boom", max_attempts=5, jitter_ratio=0.0)
     assert result == "failed"
     calls = cur.execute.call_args_list
@@ -103,22 +102,42 @@ def test_fail_or_retry_missing_job() -> None:
     conn, cur = _mock_conn(None)
     result = fail_or_retry(conn, job_id=999, error="boom", max_attempts=5)
     assert result == "failed"
+    assert cur.execute.call_count == 1
     conn.commit.assert_not_called()
 
 
 def test_fail_or_retry_null_attempts() -> None:
-    conn, cur = _mock_conn((None,))
+    conn, cur = _mock_conn((None, "processing"))
     result = fail_or_retry(conn, job_id=1, error="boom", max_attempts=5, jitter_ratio=0.0)
     assert result == "retrying"
-    # attempts should be treated as 0, so next_attempts=1 < 5 -> retry
     update_args = cur.execute.call_args_list[1][0][1]
-    assert update_args[0] == 1  # next_attempts
+    assert update_args[0] == 1
 
 
 def test_fail_or_retry_truncates_error() -> None:
-    conn, cur = _mock_conn((0,))
+    conn, cur = _mock_conn((0, "processing"))
     long_error = "x" * 2000
     fail_or_retry(conn, job_id=1, error=long_error, max_attempts=5, error_max_chars=100)
-    # The UPDATE call should have the truncated error
     update_args = cur.execute.call_args_list[1][0][1]
     assert len(update_args[1]) == 100
+
+
+def test_fail_or_retry_coerces_non_string_error() -> None:
+    conn, cur = _mock_conn((0, "processing"))
+    fail_or_retry(conn, job_id=1, error=ValueError("oops"), max_attempts=5)
+    update_args = cur.execute.call_args_list[1][0][1]
+    assert update_args[1] == "oops"
+
+
+def test_fail_or_retry_skips_already_terminal_failed() -> None:
+    conn, cur = _mock_conn((3, "failed"))
+    result = fail_or_retry(conn, job_id=1, error="boom", max_attempts=5)
+    assert result == "failed"
+    assert cur.execute.call_count == 1
+
+
+def test_fail_or_retry_skips_already_terminal_completed() -> None:
+    conn, cur = _mock_conn((1, "completed"))
+    result = fail_or_retry(conn, job_id=1, error="boom", max_attempts=5)
+    assert result == "failed"
+    assert cur.execute.call_count == 1
