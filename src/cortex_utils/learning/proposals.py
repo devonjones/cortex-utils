@@ -77,36 +77,55 @@ def propose_from_opportunities(
     """
     run = ProposalRun()
     with conn.cursor() as cur:
+        # FOR UPDATE locks the pending rows so a concurrent proposer can't
+        # process the same opportunities.
         cur.execute(
             "SELECT id, sender, label, direction "
-            "FROM learning_opportunities WHERE status = 'pending' ORDER BY id"
+            "FROM learning_opportunities WHERE status = 'pending' "
+            "ORDER BY id FOR UPDATE"
         )
         opportunities = cur.fetchall()
 
+    if not opportunities:
+        return run
+
+    # Group by (sender, label, direction) so each triple is upserted once with
+    # its rolled-up count, rather than one round-trip per opportunity.
+    grouped: dict[tuple[str, str, str], int] = {}
+    opportunity_ids: list[int] = []
     for opp_id, sender, label, direction in opportunities:
-        outcome = _upsert_proposal(conn, sender, label, direction, source)
-        _mark_processed(conn, opp_id)
+        opportunity_ids.append(opp_id)
+        if not sender:
+            run.skipped += 1  # cannot map a null sender
+            continue
+        key = (sender, label, direction)
+        grouped[key] = grouped.get(key, 0) + 1
+
+    for (sender, label, direction), count in grouped.items():
+        outcome = _upsert_proposal(conn, sender, label, direction, source, count)
         setattr(run, outcome, getattr(run, outcome) + 1)
+
+    _mark_processed(conn, opportunity_ids)
     return run
 
 
 def _upsert_proposal(
     conn: psycopg2.extensions.connection,
-    sender: str | None,
+    sender: str,
     label: str,
     direction: str,
     source: str,
+    count: int,
 ) -> str:
     """Create or bump a proposal for a triple; return created|updated|skipped."""
-    if not sender:
-        return "skipped"  # cannot map a null sender
-
     with conn.cursor() as cur:
+        # FOR UPDATE guards the read-then-write against a concurrent
+        # approve/reject racing between the SELECT and the UPDATE.
         cur.execute(
             "SELECT id, status FROM rule_proposals "
             "WHERE sender = %s AND label = %s AND direction = %s "
             "  AND status IN %s "
-            "ORDER BY id DESC LIMIT 1",
+            "ORDER BY id DESC LIMIT 1 FOR UPDATE",
             (sender, label, direction, _ACTIVE_STATUSES),
         )
         existing = cur.fetchone()
@@ -117,22 +136,26 @@ def _upsert_proposal(
                 return "skipped"  # already approved or rejected -> don't re-propose
             cur.execute(
                 "UPDATE rule_proposals "
-                "SET opportunity_count = opportunity_count + 1, updated_at = NOW() "
+                "SET opportunity_count = opportunity_count + %s, updated_at = NOW() "
                 "WHERE id = %s",
-                (proposal_id,),
+                (count, proposal_id),
             )
             return "updated"
 
         cur.execute(
-            "INSERT INTO rule_proposals (sender, label, direction, source) VALUES (%s, %s, %s, %s)",
-            (sender, label, direction, source),
+            "INSERT INTO rule_proposals "
+            "(sender, label, direction, source, opportunity_count) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (sender, label, direction, source, count),
         )
         return "created"
 
 
-def _mark_processed(conn: psycopg2.extensions.connection, opportunity_id: int) -> None:
+def _mark_processed(conn: psycopg2.extensions.connection, opportunity_ids: list[int]) -> None:
+    if not opportunity_ids:
+        return
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE learning_opportunities SET status = 'processed' WHERE id = %s",
-            (opportunity_id,),
+            "UPDATE learning_opportunities SET status = 'processed' WHERE id = ANY(%s)",
+            (opportunity_ids,),
         )

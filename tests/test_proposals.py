@@ -54,8 +54,25 @@ def test_dedups_into_existing_pending() -> None:
     )
     run = propose_from_opportunities(conn)
     assert (run.created, run.updated, run.skipped) == (0, 1, 0)
-    assert executed(cur, "opportunity_count = opportunity_count + 1") == 1
+    assert executed(cur, "opportunity_count = opportunity_count + %s") == 1
     assert executed(cur, "INSERT INTO rule_proposals") == 0
+
+
+def test_groups_same_triple_into_one_proposal() -> None:
+    # Three opportunities for the same triple -> one proposal, count 3.
+    conn, cur = make_conn(
+        fetchall=[
+            (1, "bob@example.com", "Cortex/Foo", "add"),
+            (2, "bob@example.com", "Cortex/Foo", "add"),
+            (3, "bob@example.com", "Cortex/Foo", "add"),
+        ],
+        fetchone_seq=[None],  # a single upsert for the group
+    )
+    run = propose_from_opportunities(conn)
+    assert (run.created, run.updated, run.skipped) == (1, 0, 0)
+    inserts = [c for c in cur.execute.call_args_list if "INSERT INTO rule_proposals" in c.args[0]]
+    assert len(inserts) == 1
+    assert inserts[0].args[1][-1] == 3  # opportunity_count reflects the group size
 
 
 def test_skips_when_already_rejected() -> None:
