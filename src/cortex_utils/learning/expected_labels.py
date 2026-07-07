@@ -9,6 +9,7 @@ and neither service may import the other.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import psycopg2
@@ -16,13 +17,22 @@ import psycopg2
 DEFAULT_LABEL_PREFIX = "Cortex"
 
 
-def expected_cortex_labels(conn: psycopg2.extensions.connection, gmail_id: str) -> set[str] | None:
+def expected_cortex_labels(
+    conn: psycopg2.extensions.connection,
+    gmail_id: str,
+    *,
+    prefix: str | None = None,
+) -> set[str] | None:
     """Return the managed-prefix labels triage assigned to ``gmail_id``.
 
     Returns ``None`` when the email has no classification yet (not triaged) —
     callers treat that as noise, not a teaching signal. Returns a set of full
     label names (e.g. ``{"Cortex/Work"}``, possibly empty) when a
     classification exists.
+
+    Pass ``prefix`` to skip the per-call active-config lookup — useful when a
+    bulk caller (e.g. gmail-sync draining a history batch) reads the prefix
+    once and reuses it. When omitted, the active prefix is read per call.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -34,8 +44,25 @@ def expected_cortex_labels(conn: psycopg2.extensions.connection, gmail_id: str) 
     if row is None:
         return None
 
-    action = row[0] or {}
-    return managed_labels(action, active_label_prefix(conn))
+    action = _as_dict(row[0])
+    if prefix is None:
+        prefix = active_label_prefix(conn)
+    return managed_labels(action, prefix)
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Coerce an ``action_taken`` column value to a dict.
+
+    JSONB normally deserializes to a dict, but a shared library cannot assume
+    the caller's connection registered the JSON adapter — so a raw JSON string
+    is parsed defensively, and anything unusable becomes an empty dict.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
 
 
 def active_label_prefix(conn: psycopg2.extensions.connection) -> str:

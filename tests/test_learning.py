@@ -108,6 +108,24 @@ def test_expected_labels_empty_set_when_action_null() -> None:
     assert expected_cortex_labels(conn, "gmail-1") == set()
 
 
+def test_expected_labels_explicit_prefix_skips_config_query() -> None:
+    # Only the classification is fetched; no active-config lookup.
+    conn, cur = make_conn([({"add_label": ["Cortex/Work", "Personal/N"]},)])
+    assert expected_cortex_labels(conn, "gmail-1", prefix="Cortex") == {"Cortex/Work"}
+    assert cur.fetchone.call_count == 1
+
+
+def test_expected_labels_parses_json_string_action() -> None:
+    # action_taken arrives as a raw JSON string (adapter not registered).
+    conn, _ = make_conn([('{"add_label": ["Cortex/Work"]}',)])
+    assert expected_cortex_labels(conn, "gmail-1", prefix="Cortex") == {"Cortex/Work"}
+
+
+def test_expected_labels_unparseable_action_is_empty() -> None:
+    conn, _ = make_conn([("not json",)])
+    assert expected_cortex_labels(conn, "gmail-1", prefix="Cortex") == set()
+
+
 # --- record_learning_opportunity -------------------------------------------
 
 
