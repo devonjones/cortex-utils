@@ -35,6 +35,19 @@ class ProposalRun:
     skipped: int = 0
 
 
+@dataclass
+class RuleProposal:
+    """A pending candidate rule, as read for presentation/confirmation."""
+
+    id: int
+    sender: str
+    label: str
+    direction: str
+    status: str
+    source: str
+    opportunity_count: int
+
+
 def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
     """Create the ``rule_proposals`` table and indexes. Idempotent.
 
@@ -67,6 +80,12 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_rule_proposals_lookup "
             "ON rule_proposals (sender, label, direction)"
+        )
+        # Partial index for listing pending proposals in order as the table
+        # accumulates decided rows.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rule_proposals_pending_order "
+            "ON rule_proposals (created_at, id) WHERE status = 'pending'"
         )
 
 
@@ -178,3 +197,63 @@ def _mark_processed(conn: psycopg2.extensions.connection, opportunity_ids: list[
             "UPDATE learning_opportunities SET status = 'processed' WHERE id = ANY(%s)",
             (opportunity_ids,),
         )
+
+
+# Statuses a decision can transition a pending proposal into.
+_DECISION_STATUSES = (APPROVED, REJECTED, SUPERSEDED)
+
+
+def list_pending_proposals(
+    conn: psycopg2.extensions.connection,
+) -> list[RuleProposal]:
+    """Return pending proposals, oldest first, for presentation/confirmation."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, sender, label, direction, status, source, opportunity_count "
+            "FROM rule_proposals WHERE status = 'pending' "
+            "ORDER BY created_at, id"
+        )
+        rows = cur.fetchall()
+    return [
+        RuleProposal(
+            id=id_,
+            sender=sender,
+            label=label,
+            direction=direction,
+            status=status,
+            source=source,
+            opportunity_count=opportunity_count,
+        )
+        for id_, sender, label, direction, status, source, opportunity_count in rows
+    ]
+
+
+def set_proposal_status(
+    conn: psycopg2.extensions.connection, proposal_id: int, status: str
+) -> bool:
+    """Transition a *pending* proposal to a decision status.
+
+    Only pending proposals move (guards against double-deciding a proposal when
+    two reactions race). Returns ``True`` if the row transitioned, ``False`` if
+    it was already decided or missing. Does not commit — caller owns the
+    transaction.
+    """
+    if status not in _DECISION_STATUSES:
+        raise ValueError(f"invalid decision status: {status!r}")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rule_proposals SET status = %s, updated_at = NOW() "
+            "WHERE id = %s AND status = 'pending' RETURNING id",
+            (status, proposal_id),
+        )
+        return cur.fetchone() is not None
+
+
+def approve_proposal(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:
+    """Mark a pending proposal approved (awaiting commit in uo9b.4)."""
+    return set_proposal_status(conn, proposal_id, APPROVED)
+
+
+def reject_proposal(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:
+    """Mark a pending proposal rejected so it isn't re-surfaced."""
+    return set_proposal_status(conn, proposal_id, REJECTED)

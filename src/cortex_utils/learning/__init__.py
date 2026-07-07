@@ -24,8 +24,13 @@ from cortex_utils.learning.proposals import (
     SOURCE_TEACH,
     SUPERSEDED,
     ProposalRun,
+    RuleProposal,
+    approve_proposal,
     ensure_proposals_schema,
+    list_pending_proposals,
     propose_from_opportunities,
+    reject_proposal,
+    set_proposal_status,
 )
 
 __all__ = [
@@ -44,6 +49,11 @@ __all__ = [
     "SUPERSEDED",
     "SOURCE_TEACH",
     "ProposalRun",
+    "RuleProposal",
     "ensure_proposals_schema",
     "propose_from_opportunities",
+    "list_pending_proposals",
+    "set_proposal_status",
+    "approve_proposal",
+    "reject_proposal",
 ]
