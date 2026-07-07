@@ -19,7 +19,12 @@ DIRECTIONS = (ADD, REMOVE)
 
 
 def ensure_learning_schema(conn: psycopg2.extensions.connection) -> None:
-    """Create the ``learning_opportunities`` table and index. Idempotent."""
+    """Create the ``learning_opportunities`` table and index. Idempotent.
+
+    Does not commit — leaves transaction management to the caller so schema
+    setup composes with the caller's other DDL (e.g. gmail-sync's startup
+    schema block).
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -41,7 +46,6 @@ def ensure_learning_schema(conn: psycopg2.extensions.connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_learning_opportunities_pending "
             "ON learning_opportunities (status, detected_at)"
         )
-    conn.commit()
 
 
 def record_learning_opportunity(

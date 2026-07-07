@@ -50,7 +50,11 @@ def active_label_prefix(conn: psycopg2.extensions.connection) -> str:
             "SELECT label_prefix FROM triage_config_versions WHERE is_active = TRUE LIMIT 1"
         )
         row = cur.fetchone()
-    return row[0] if row else DEFAULT_LABEL_PREFIX
+    # Preserve an empty prefix ("" = manage all); fall back only when the
+    # row is absent or the column is NULL.
+    if row and row[0] is not None:
+        return row[0]
+    return DEFAULT_LABEL_PREFIX
 
 
 def managed_labels(action: dict[str, Any], prefix: str) -> set[str]:

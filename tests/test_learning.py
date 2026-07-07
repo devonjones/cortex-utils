@@ -138,8 +138,9 @@ def test_record_does_not_commit() -> None:
     conn.commit.assert_not_called()
 
 
-def test_ensure_schema_commits() -> None:
+def test_ensure_schema_does_not_commit() -> None:
+    # Leaves transaction management to the caller.
     conn, cur = make_conn([])
     ensure_learning_schema(conn)
     assert cur.execute.call_count == 2  # CREATE TABLE + CREATE INDEX
-    conn.commit.assert_called_once()
+    conn.commit.assert_not_called()
