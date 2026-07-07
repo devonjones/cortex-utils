@@ -46,6 +46,7 @@ class RuleProposal:
     status: str
     source: str
     opportunity_count: int
+    discord_message_id: str | None = None
 
 
 def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
@@ -65,10 +66,18 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
                     CHECK (status IN ('pending', 'approved', 'rejected', 'superseded')),
                 source TEXT NOT NULL DEFAULT 'teach',
                 opportunity_count INTEGER NOT NULL DEFAULT 1,
+                discord_message_id TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
+        )
+        # Migration for tables created before discord_message_id existed.
+        cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS discord_message_id TEXT")
+        # Index the message lookup, and enforce one proposal per Discord message.
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_proposals_discord_message "
+            "ON rule_proposals (discord_message_id) WHERE discord_message_id IS NOT NULL"
         )
         # At most one open (pending) proposal per (sender, label, direction).
         cur.execute(
@@ -203,29 +212,73 @@ def _mark_processed(conn: psycopg2.extensions.connection, opportunity_ids: list[
 _DECISION_STATUSES = (APPROVED, REJECTED, SUPERSEDED)
 
 
+_PROPOSAL_COLUMNS = (
+    "id, sender, label, direction, status, source, opportunity_count, discord_message_id"
+)
+
+
+def _row_to_proposal(row: tuple) -> RuleProposal:
+    return RuleProposal(
+        id=row[0],
+        sender=row[1],
+        label=row[2],
+        direction=row[3],
+        status=row[4],
+        source=row[5],
+        opportunity_count=row[6],
+        discord_message_id=row[7],
+    )
+
+
 def list_pending_proposals(
     conn: psycopg2.extensions.connection,
 ) -> list[RuleProposal]:
     """Return pending proposals, oldest first, for presentation/confirmation."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, sender, label, direction, status, source, opportunity_count "
-            "FROM rule_proposals WHERE status = 'pending' "
+            f"SELECT {_PROPOSAL_COLUMNS} FROM rule_proposals "
+            "WHERE status = 'pending' ORDER BY created_at, id"
+        )
+        rows = cur.fetchall()
+    return [_row_to_proposal(row) for row in rows]
+
+
+def unposted_pending_proposals(
+    conn: psycopg2.extensions.connection,
+) -> list[RuleProposal]:
+    """Pending proposals not yet presented in Discord (no message linked)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_PROPOSAL_COLUMNS} FROM rule_proposals "
+            "WHERE status = 'pending' AND discord_message_id IS NULL "
             "ORDER BY created_at, id"
         )
         rows = cur.fetchall()
-    return [
-        RuleProposal(
-            id=id_,
-            sender=sender,
-            label=label,
-            direction=direction,
-            status=status,
-            source=source,
-            opportunity_count=opportunity_count,
+    return [_row_to_proposal(row) for row in rows]
+
+
+def get_proposal_by_message_id(
+    conn: psycopg2.extensions.connection, discord_message_id: str
+) -> RuleProposal | None:
+    """Look up the proposal a Discord message presents, for reaction handling."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_PROPOSAL_COLUMNS} FROM rule_proposals WHERE discord_message_id = %s",
+            (discord_message_id,),
         )
-        for id_, sender, label, direction, status, source, opportunity_count in rows
-    ]
+        row = cur.fetchone()
+    return _row_to_proposal(row) if row is not None else None
+
+
+def mark_proposal_posted(
+    conn: psycopg2.extensions.connection, proposal_id: int, discord_message_id: str
+) -> None:
+    """Link a proposal to the Discord message presenting it. No commit."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rule_proposals SET discord_message_id = %s, updated_at = NOW() WHERE id = %s",
+            (discord_message_id, proposal_id),
+        )
 
 
 def set_proposal_status(
