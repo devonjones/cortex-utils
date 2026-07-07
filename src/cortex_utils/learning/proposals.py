@@ -74,6 +74,11 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
         )
         # Migration for tables created before discord_message_id existed.
         cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS discord_message_id TEXT")
+        # Index the message lookup, and enforce one proposal per Discord message.
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_proposals_discord_message "
+            "ON rule_proposals (discord_message_id) WHERE discord_message_id IS NOT NULL"
+        )
         # At most one open (pending) proposal per (sender, label, direction).
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_proposal_pending "
