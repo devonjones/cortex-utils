@@ -40,7 +40,7 @@ def test_ensure_schema_creates_table_and_index_no_commit() -> None:
 def test_creates_new_proposal() -> None:
     conn, cur = make_conn(
         fetchall=[(1, "bob@example.com", "Cortex/Foo", "add")],
-        fetchone_seq=[None],  # no existing proposal
+        fetchone_seq=[None, (True,)],  # no existing proposal, then INSERT..RETURNING
     )
     run = propose_from_opportunities(conn)
     assert (run.created, run.updated, run.skipped) == (1, 0, 0)
@@ -67,7 +67,7 @@ def test_groups_same_triple_into_one_proposal() -> None:
             (2, "bob@example.com", "Cortex/Foo", "add"),
             (3, "bob@example.com", "Cortex/Foo", "add"),
         ],
-        fetchone_seq=[None],  # a single upsert for the group
+        fetchone_seq=[None, (True,)],  # a single upsert for the group (INSERT..RETURNING)
     )
     run = propose_from_opportunities(conn)
     assert (run.created, run.updated, run.skipped) == (1, 0, 0)
@@ -122,7 +122,7 @@ def test_multiple_opportunities_mixed_outcomes() -> None:
             (11, "b@x.com", "Cortex/B", "add"),  # existing pending -> updated
             (12, None, "Cortex/C", "add"),  # null sender -> skipped
         ],
-        fetchone_seq=[None, (77, "pending")],  # a: none, b: pending (c: no fetchone)
+        fetchone_seq=[None, (True,), (77, "pending")],  # a: none+insert, b: pending (c: skipped)
     )
     run = propose_from_opportunities(conn)
     assert (run.created, run.updated, run.skipped) == (1, 1, 1)

@@ -153,6 +153,8 @@ def _upsert_proposal(
 
         # ON CONFLICT handles a concurrent run inserting the same pending triple
         # between our SELECT (which found nothing to lock) and this INSERT.
+        # RETURNING (xmax = 0) is true for a genuine insert, false when the
+        # conflict path merged into a row inserted concurrently.
         cur.execute(
             "INSERT INTO rule_proposals "
             "(sender, label, direction, source, opportunity_count) "
@@ -160,10 +162,12 @@ def _upsert_proposal(
             "ON CONFLICT (sender, label, direction) WHERE status = 'pending' "
             "DO UPDATE SET "
             "opportunity_count = rule_proposals.opportunity_count "
-            "+ EXCLUDED.opportunity_count, updated_at = NOW()",
+            "+ EXCLUDED.opportunity_count, updated_at = NOW() "
+            "RETURNING (xmax = 0)",
             (sender, label, direction, source, count),
         )
-        return "created"
+        inserted = cur.fetchone()[0]
+        return "created" if inserted else "updated"
 
 
 def _mark_processed(conn: psycopg2.extensions.connection, opportunity_ids: list[int]) -> None:
