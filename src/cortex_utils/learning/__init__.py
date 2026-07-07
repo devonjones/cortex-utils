@@ -27,10 +27,13 @@ from cortex_utils.learning.proposals import (
     RuleProposal,
     approve_proposal,
     ensure_proposals_schema,
+    get_proposal_by_message_id,
     list_pending_proposals,
+    mark_proposal_posted,
     propose_from_opportunities,
     reject_proposal,
     set_proposal_status,
+    unposted_pending_proposals,
 )
 
 __all__ = [
@@ -53,6 +56,9 @@ __all__ = [
     "ensure_proposals_schema",
     "propose_from_opportunities",
     "list_pending_proposals",
+    "unposted_pending_proposals",
+    "get_proposal_by_message_id",
+    "mark_proposal_posted",
     "set_proposal_status",
     "approve_proposal",
     "reject_proposal",

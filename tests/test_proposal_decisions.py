@@ -11,9 +11,12 @@ from cortex_utils.learning import (
     REJECTED,
     RuleProposal,
     approve_proposal,
+    get_proposal_by_message_id,
     list_pending_proposals,
+    mark_proposal_posted,
     reject_proposal,
     set_proposal_status,
+    unposted_pending_proposals,
 )
 
 
@@ -34,20 +37,53 @@ def make_conn(
 def test_list_pending_proposals_maps_rows() -> None:
     conn, _ = make_conn(
         fetchall=[
-            (1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3),
-            (2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1),
+            (1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3, None),
+            (2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1, "msg-9"),
         ]
     )
     proposals = list_pending_proposals(conn)
     assert proposals == [
-        RuleProposal(1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3),
-        RuleProposal(2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1),
+        RuleProposal(1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3, None),
+        RuleProposal(2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1, "msg-9"),
     ]
 
 
 def test_list_pending_proposals_empty() -> None:
     conn, _ = make_conn(fetchall=[])
     assert list_pending_proposals(conn) == []
+
+
+def test_unposted_pending_proposals_maps_rows() -> None:
+    conn, cur = make_conn(
+        fetchall=[(3, "cy@x.com", "Cortex/Baz", "add", "pending", "teach", 1, None)]
+    )
+    proposals = unposted_pending_proposals(conn)
+    assert proposals == [
+        RuleProposal(3, "cy@x.com", "Cortex/Baz", "add", "pending", "teach", 1, None)
+    ]
+    assert "discord_message_id IS NULL" in cur.execute.call_args_list[0].args[0]
+
+
+def test_get_proposal_by_message_id_found() -> None:
+    conn, _ = make_conn(
+        fetchone=(5, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 2, "msg-1")
+    )
+    proposal = get_proposal_by_message_id(conn, "msg-1")
+    assert proposal is not None
+    assert proposal.id == 5 and proposal.discord_message_id == "msg-1"
+
+
+def test_get_proposal_by_message_id_missing() -> None:
+    conn, _ = make_conn(fetchone=None)
+    assert get_proposal_by_message_id(conn, "nope") is None
+
+
+def test_mark_proposal_posted_updates() -> None:
+    conn, cur = make_conn()
+    mark_proposal_posted(conn, 7, "msg-42")
+    sql, params = cur.execute.call_args_list[0].args
+    assert "SET discord_message_id" in sql
+    assert params == ("msg-42", 7)
 
 
 def test_set_status_transitions_pending() -> None:
