@@ -72,6 +72,12 @@ def test_active_label_prefix_default_when_no_active_config() -> None:
     assert active_label_prefix(conn) == "Cortex"
 
 
+def test_active_label_prefix_default_when_prefix_is_null() -> None:
+    # Active config row exists but label_prefix is NULL -> fall back.
+    conn, _ = make_conn([(None,)])
+    assert active_label_prefix(conn) == "Cortex"
+
+
 def test_active_label_prefix_preserves_empty_manage_all() -> None:
     conn, _ = make_conn([("",)])
     assert active_label_prefix(conn) == ""
