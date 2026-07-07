@@ -216,15 +216,15 @@ def list_pending_proposals(
         rows = cur.fetchall()
     return [
         RuleProposal(
-            id=row[0],
-            sender=row[1],
-            label=row[2],
-            direction=row[3],
-            status=row[4],
-            source=row[5],
-            opportunity_count=row[6],
+            id=id_,
+            sender=sender,
+            label=label,
+            direction=direction,
+            status=status,
+            source=source,
+            opportunity_count=opportunity_count,
         )
-        for row in rows
+        for id_, sender, label, direction, status, source, opportunity_count in rows
     ]
 
 
