@@ -151,10 +151,16 @@ def _upsert_proposal(
             )
             return "updated"
 
+        # ON CONFLICT handles a concurrent run inserting the same pending triple
+        # between our SELECT (which found nothing to lock) and this INSERT.
         cur.execute(
             "INSERT INTO rule_proposals "
             "(sender, label, direction, source, opportunity_count) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (sender, label, direction) WHERE status = 'pending' "
+            "DO UPDATE SET "
+            "opportunity_count = rule_proposals.opportunity_count "
+            "+ EXCLUDED.opportunity_count, updated_at = NOW()",
             (sender, label, direction, source, count),
         )
         return "created"
