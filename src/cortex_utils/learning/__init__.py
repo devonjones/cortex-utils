@@ -17,6 +17,16 @@ from cortex_utils.learning.opportunities import (
     ensure_learning_schema,
     record_learning_opportunity,
 )
+from cortex_utils.learning.proposals import (
+    APPROVED,
+    PENDING,
+    REJECTED,
+    SOURCE_TEACH,
+    SUPERSEDED,
+    ProposalRun,
+    ensure_proposals_schema,
+    propose_from_opportunities,
+)
 
 __all__ = [
     "DEFAULT_LABEL_PREFIX",
@@ -28,4 +38,12 @@ __all__ = [
     "DIRECTIONS",
     "ensure_learning_schema",
     "record_learning_opportunity",
+    "PENDING",
+    "APPROVED",
+    "REJECTED",
+    "SUPERSEDED",
+    "SOURCE_TEACH",
+    "ProposalRun",
+    "ensure_proposals_schema",
+    "propose_from_opportunities",
 ]
