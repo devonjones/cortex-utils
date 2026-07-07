@@ -48,7 +48,8 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
                 sender TEXT NOT NULL,
                 label TEXT NOT NULL,
                 direction TEXT NOT NULL CHECK (direction IN ('add', 'remove')),
-                status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'approved', 'rejected', 'superseded')),
                 source TEXT NOT NULL DEFAULT 'teach',
                 opportunity_count INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -60,6 +61,12 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_proposal_pending "
             "ON rule_proposals (sender, label, direction) WHERE status = 'pending'"
+        )
+        # Non-partial index so lookups of decided (approved/rejected) proposals
+        # for a triple don't fall back to a sequential scan.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rule_proposals_lookup "
+            "ON rule_proposals (sender, label, direction)"
         )
 
 
@@ -102,7 +109,8 @@ def propose_from_opportunities(
         key = (sender, label, direction)
         grouped[key] = grouped.get(key, 0) + 1
 
-    for (sender, label, direction), count in grouped.items():
+    # Sorted for a deterministic rule_proposals lock order across concurrent runs.
+    for (sender, label, direction), count in sorted(grouped.items()):
         outcome = _upsert_proposal(conn, sender, label, direction, source, count)
         setattr(run, outcome, getattr(run, outcome) + 1)
 

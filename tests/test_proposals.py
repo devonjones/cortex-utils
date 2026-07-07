@@ -33,6 +33,7 @@ def test_ensure_schema_creates_table_and_index_no_commit() -> None:
     ensure_proposals_schema(conn)
     assert executed(cur, "CREATE TABLE IF NOT EXISTS rule_proposals") == 1
     assert executed(cur, "CREATE UNIQUE INDEX") == 1
+    assert executed(cur, "CREATE INDEX IF NOT EXISTS idx_rule_proposals_lookup") == 1
     conn.commit.assert_not_called()
 
 
