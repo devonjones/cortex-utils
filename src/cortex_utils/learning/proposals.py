@@ -77,12 +77,13 @@ def propose_from_opportunities(
     """
     run = ProposalRun()
     with conn.cursor() as cur:
-        # FOR UPDATE locks the pending rows so a concurrent proposer can't
-        # process the same opportunities.
+        # FOR UPDATE SKIP LOCKED lets a concurrent proposer skip rows this run
+        # already holds rather than block; ORDER BY id keeps a consistent lock
+        # order. (Same claim idiom the triage worker uses on the queue table.)
         cur.execute(
             "SELECT id, sender, label, direction "
             "FROM learning_opportunities WHERE status = 'pending' "
-            "ORDER BY id FOR UPDATE"
+            "ORDER BY id FOR UPDATE SKIP LOCKED"
         )
         opportunities = cur.fetchall()
 
