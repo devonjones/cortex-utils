@@ -81,6 +81,12 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_rule_proposals_lookup "
             "ON rule_proposals (sender, label, direction)"
         )
+        # Partial index for listing pending proposals in order as the table
+        # accumulates decided rows.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rule_proposals_pending_order "
+            "ON rule_proposals (created_at, id) WHERE status = 'pending'"
+        )
 
 
 def propose_from_opportunities(
@@ -208,7 +214,18 @@ def list_pending_proposals(
             "ORDER BY created_at, id"
         )
         rows = cur.fetchall()
-    return [RuleProposal(*row) for row in rows]
+    return [
+        RuleProposal(
+            id=row[0],
+            sender=row[1],
+            label=row[2],
+            direction=row[3],
+            status=row[4],
+            source=row[5],
+            opportunity_count=row[6],
+        )
+        for row in rows
+    ]
 
 
 def set_proposal_status(
