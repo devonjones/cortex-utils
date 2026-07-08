@@ -4,6 +4,14 @@ Teach-by-labeling: detect when a manual Gmail label change diverges from what
 triage classified, and record it as a learning opportunity to propose a rule.
 """
 
+from cortex_utils.learning.apply import (
+    APPLY_QUEUE,
+    ApplyJob,
+    claim_proposal_apply_jobs,
+    complete_apply_job,
+    enqueue_proposal_apply,
+    taught_mail_archived,
+)
 from cortex_utils.learning.expected_labels import (
     DEFAULT_LABEL_PREFIX,
     active_label_prefix,
@@ -18,7 +26,10 @@ from cortex_utils.learning.opportunities import (
     record_learning_opportunity,
 )
 from cortex_utils.learning.proposals import (
+    APPLIED,
     APPROVED,
+    DEFERRED,
+    FAILED,
     PENDING,
     REJECTED,
     SOURCE_TEACH,
@@ -27,8 +38,12 @@ from cortex_utils.learning.proposals import (
     RuleProposal,
     approve_proposal,
     ensure_proposals_schema,
+    get_proposal_by_id,
     get_proposal_by_message_id,
     list_pending_proposals,
+    mark_proposal_applied,
+    mark_proposal_deferred,
+    mark_proposal_failed,
     mark_proposal_posted,
     propose_from_opportunities,
     reject_proposal,
@@ -50,6 +65,9 @@ __all__ = [
     "APPROVED",
     "REJECTED",
     "SUPERSEDED",
+    "APPLIED",
+    "DEFERRED",
+    "FAILED",
     "SOURCE_TEACH",
     "ProposalRun",
     "RuleProposal",
@@ -58,8 +76,18 @@ __all__ = [
     "list_pending_proposals",
     "unposted_pending_proposals",
     "get_proposal_by_message_id",
+    "get_proposal_by_id",
     "mark_proposal_posted",
     "set_proposal_status",
     "approve_proposal",
     "reject_proposal",
+    "mark_proposal_applied",
+    "mark_proposal_deferred",
+    "mark_proposal_failed",
+    "APPLY_QUEUE",
+    "ApplyJob",
+    "enqueue_proposal_apply",
+    "claim_proposal_apply_jobs",
+    "complete_apply_job",
+    "taught_mail_archived",
 ]
