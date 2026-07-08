@@ -20,10 +20,18 @@ PENDING = "pending"
 APPROVED = "approved"
 REJECTED = "rejected"
 SUPERSEDED = "superseded"
+# Terminal apply outcomes (uo9b.4): an approved proposal is either committed as
+# a mapping (applied), recorded for manual handling (deferred), or gave up after
+# exhausting apply retries (failed).
+APPLIED = "applied"
+DEFERRED = "deferred"
+FAILED = "failed"
 
-# Statuses that mean "already decided or awaiting a decision" — a proposal in
-# any of these blocks a fresh one for the same (sender, label, direction).
-_ACTIVE_STATUSES = (PENDING, APPROVED, REJECTED)
+# Statuses that mean "already handled or awaiting a decision" — a proposal in
+# any of these blocks a fresh one for the same (sender, label, direction) so we
+# don't re-nag. FAILED (apply gave up) and SUPERSEDED are deliberately excluded
+# so a later opportunity can re-propose and try again.
+_ACTIVE_STATUSES = (PENDING, APPROVED, REJECTED, APPLIED, DEFERRED)
 
 
 @dataclass
@@ -63,10 +71,15 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
                 label TEXT NOT NULL,
                 direction TEXT NOT NULL CHECK (direction IN ('add', 'remove')),
                 status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'approved', 'rejected', 'superseded')),
+                    CHECK (status IN (
+                        'pending', 'approved', 'rejected', 'superseded',
+                        'applied', 'deferred', 'failed'
+                    )),
                 source TEXT NOT NULL DEFAULT 'teach',
                 opportunity_count INTEGER NOT NULL DEFAULT 1,
                 discord_message_id TEXT,
+                applied_at TIMESTAMPTZ,
+                apply_error TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -74,6 +87,17 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
         )
         # Migration for tables created before discord_message_id existed.
         cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS discord_message_id TEXT")
+        # Migration for the uo9b.4 apply columns and the widened status set.
+        cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS apply_error TEXT")
+        cur.execute(
+            "ALTER TABLE rule_proposals DROP CONSTRAINT IF EXISTS rule_proposals_status_check"
+        )
+        cur.execute(
+            "ALTER TABLE rule_proposals ADD CONSTRAINT rule_proposals_status_check "
+            "CHECK (status IN ('pending', 'approved', 'rejected', 'superseded', "
+            "'applied', 'deferred', 'failed'))"
+        )
         # Index the message lookup, and enforce one proposal per Discord message.
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_proposals_discord_message "
@@ -303,10 +327,66 @@ def set_proposal_status(
 
 
 def approve_proposal(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:
-    """Mark a pending proposal approved (awaiting commit in uo9b.4)."""
+    """Mark a pending proposal approved (its apply job runs it in uo9b.4)."""
     return set_proposal_status(conn, proposal_id, APPROVED)
 
 
 def reject_proposal(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:
     """Mark a pending proposal rejected so it isn't re-surfaced."""
     return set_proposal_status(conn, proposal_id, REJECTED)
+
+
+def get_proposal_by_id(
+    conn: psycopg2.extensions.connection, proposal_id: int
+) -> RuleProposal | None:
+    """Load a proposal by id, for an apply job resolving its queue payload."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_PROPOSAL_COLUMNS} FROM rule_proposals WHERE id = %s",
+            (proposal_id,),
+        )
+        row = cur.fetchone()
+    return _row_to_proposal(row) if row is not None else None
+
+
+def _finish_apply(
+    conn: psycopg2.extensions.connection,
+    proposal_id: int,
+    status: str,
+    apply_error: str | None,
+) -> bool:
+    """Transition an *approved* proposal to a terminal apply outcome.
+
+    Only approved proposals move, so a duplicate apply job (e.g. a retry after a
+    committed mapping but a lost job-completion) can't re-run the outcome.
+    Returns ``True`` if the row transitioned. Does not commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rule_proposals "
+            "SET status = %s, apply_error = %s, "
+            "    applied_at = CASE WHEN %s = 'applied' THEN NOW() ELSE applied_at END, "
+            "    updated_at = NOW() "
+            "WHERE id = %s AND status = 'approved' RETURNING id",
+            (status, apply_error, status, proposal_id),
+        )
+        return cur.fetchone() is not None
+
+
+def mark_proposal_applied(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:
+    """Mark an approved proposal committed as a mapping."""
+    return _finish_apply(conn, proposal_id, APPLIED, None)
+
+
+def mark_proposal_deferred(
+    conn: psycopg2.extensions.connection, proposal_id: int, reason: str
+) -> bool:
+    """Record an approved proposal for manual handling (no auto-apply)."""
+    return _finish_apply(conn, proposal_id, DEFERRED, reason)
+
+
+def mark_proposal_failed(
+    conn: psycopg2.extensions.connection, proposal_id: int, error: str
+) -> bool:
+    """Mark an approved proposal as having exhausted its apply retries."""
+    return _finish_apply(conn, proposal_id, FAILED, error)
