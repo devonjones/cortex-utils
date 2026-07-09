@@ -97,9 +97,16 @@ def test_active_default_label_default_when_no_active_config() -> None:
     assert active_default_label(conn) == "Uncategorized"
 
 
-def test_active_default_label_default_when_column_empty() -> None:
-    # Active config row exists but default_label is NULL/empty -> fall back.
+def test_active_default_label_default_when_column_null() -> None:
+    # Active config row exists but default_label is NULL -> fall back.
     conn, _ = make_conn([(None,)])
+    assert active_default_label(conn) == "Uncategorized"
+
+
+def test_active_default_label_default_when_column_empty_string() -> None:
+    # Unlike active_label_prefix (which preserves ""), an empty default_label
+    # falls back to the default — there's no "empty = valid" semantic here.
+    conn, _ = make_conn([("",)])
     assert active_default_label(conn) == "Uncategorized"
 
 

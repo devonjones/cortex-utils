@@ -91,9 +91,11 @@ def active_default_label(conn: psycopg2.extensions.connection) -> str:
     """Default label (bare, unprefixed) from the active triage config.
 
     This is what triage assigns when nothing else matches (e.g.
-    ``"Uncategorized"``). Defaults to ``DEFAULT_DEFAULT_LABEL`` when no active
-    config exists. Callers prefix it (``{prefix}/{default}``) to get the full
-    label name.
+    ``"Uncategorized"``). Falls back to ``DEFAULT_DEFAULT_LABEL`` when there's no
+    active config, or its ``default_label`` is unset (NULL/empty) — unlike
+    :func:`active_label_prefix`, an empty value isn't preserved because there's
+    no "empty = valid" semantic for a default label. Callers prefix it
+    (``{prefix}/{default}``) to get the full label name.
     """
     with conn.cursor() as cur:
         cur.execute(
