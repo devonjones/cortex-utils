@@ -13,7 +13,9 @@ from cortex_utils.learning.apply import (
     taught_mail_archived,
 )
 from cortex_utils.learning.expected_labels import (
+    DEFAULT_DEFAULT_LABEL,
     DEFAULT_LABEL_PREFIX,
+    active_default_label,
     active_label_prefix,
     expected_cortex_labels,
     managed_labels,
@@ -53,7 +55,9 @@ from cortex_utils.learning.proposals import (
 
 __all__ = [
     "DEFAULT_LABEL_PREFIX",
+    "DEFAULT_DEFAULT_LABEL",
     "active_label_prefix",
+    "active_default_label",
     "expected_cortex_labels",
     "managed_labels",
     "ADD",

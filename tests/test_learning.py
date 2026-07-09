@@ -9,6 +9,7 @@ import pytest
 from cortex_utils.learning import (
     ADD,
     REMOVE,
+    active_default_label,
     active_label_prefix,
     ensure_learning_schema,
     expected_cortex_labels,
@@ -81,6 +82,32 @@ def test_active_label_prefix_default_when_prefix_is_null() -> None:
 def test_active_label_prefix_preserves_empty_manage_all() -> None:
     conn, _ = make_conn([("",)])
     assert active_label_prefix(conn) == ""
+
+
+# --- active_default_label --------------------------------------------------
+
+
+def test_active_default_label_from_config() -> None:
+    conn, _ = make_conn([("Unsorted",)])
+    assert active_default_label(conn) == "Unsorted"
+
+
+def test_active_default_label_default_when_no_active_config() -> None:
+    conn, _ = make_conn([None])
+    assert active_default_label(conn) == "Uncategorized"
+
+
+def test_active_default_label_default_when_column_null() -> None:
+    # Active config row exists but default_label is NULL -> fall back.
+    conn, _ = make_conn([(None,)])
+    assert active_default_label(conn) == "Uncategorized"
+
+
+def test_active_default_label_default_when_column_empty_string() -> None:
+    # Unlike active_label_prefix (which preserves ""), an empty default_label
+    # falls back to the default — there's no "empty = valid" semantic here.
+    conn, _ = make_conn([("",)])
+    assert active_default_label(conn) == "Uncategorized"
 
 
 # --- expected_cortex_labels ------------------------------------------------
