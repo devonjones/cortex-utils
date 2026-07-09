@@ -55,6 +55,9 @@ class RuleProposal:
     source: str
     opportunity_count: int
     discord_message_id: str | None = None
+    # Set when the proposal is approved with archive (the 📦 reaction): the
+    # committed mapping gets archive=true so the sender's mail is auto-archived.
+    archive: bool = False
 
 
 def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
@@ -78,6 +81,7 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
                 source TEXT NOT NULL DEFAULT 'teach',
                 opportunity_count INTEGER NOT NULL DEFAULT 1,
                 discord_message_id TEXT,
+                archive BOOLEAN NOT NULL DEFAULT FALSE,
                 applied_at TIMESTAMPTZ,
                 apply_error TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -90,6 +94,10 @@ def ensure_proposals_schema(conn: psycopg2.extensions.connection) -> None:
         # Migration for the uo9b.4 apply columns and the widened status set.
         cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ")
         cur.execute("ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS apply_error TEXT")
+        cur.execute(
+            "ALTER TABLE rule_proposals ADD COLUMN IF NOT EXISTS "
+            "archive BOOLEAN NOT NULL DEFAULT FALSE"
+        )
         cur.execute(
             "ALTER TABLE rule_proposals DROP CONSTRAINT IF EXISTS rule_proposals_status_check"
         )
@@ -237,7 +245,7 @@ _DECISION_STATUSES = (APPROVED, REJECTED, SUPERSEDED)
 
 
 _PROPOSAL_COLUMNS = (
-    "id, sender, label, direction, status, source, opportunity_count, discord_message_id"
+    "id, sender, label, direction, status, source, opportunity_count, discord_message_id, archive"
 )
 
 
@@ -251,6 +259,7 @@ def _row_to_proposal(row: tuple) -> RuleProposal:
         source=row[5],
         opportunity_count=row[6],
         discord_message_id=row[7],
+        archive=row[8],
     )
 
 
@@ -326,9 +335,28 @@ def set_proposal_status(
         return cur.fetchone() is not None
 
 
-def approve_proposal(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:
-    """Mark a pending proposal approved (its apply job runs it in uo9b.4)."""
-    return set_proposal_status(conn, proposal_id, APPROVED)
+def approve_proposal(
+    conn: psycopg2.extensions.connection, proposal_id: int, *, archive: bool = False
+) -> bool:
+    """Mark a pending proposal approved (its apply job runs it in uo9b.4).
+
+    ``archive=True`` (the 📦 reaction) also stamps the proposal so the committed
+    mapping archives the sender's mail. Archive is only meaningful for an
+    add-direction proposal (there's no mapping to archive on a "stop labeling"
+    remove), so it's coerced to false for non-add proposals — the invariant
+    holds even if a caller passes ``archive=True`` on a remove. Only a pending
+    proposal transitions, so a duplicate reaction can't re-decide it. Does not
+    commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE rule_proposals "
+            "SET status = %s, archive = (%s AND direction = 'add'), "
+            "    updated_at = NOW() "
+            "WHERE id = %s AND status = 'pending' RETURNING id",
+            (APPROVED, archive, proposal_id),
+        )
+        return cur.fetchone() is not None
 
 
 def reject_proposal(conn: psycopg2.extensions.connection, proposal_id: int) -> bool:

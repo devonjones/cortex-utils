@@ -37,14 +37,14 @@ def make_conn(
 def test_list_pending_proposals_maps_rows() -> None:
     conn, _ = make_conn(
         fetchall=[
-            (1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3, None),
-            (2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1, "msg-9"),
+            (1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3, None, False),
+            (2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1, "msg-9", True),
         ]
     )
     proposals = list_pending_proposals(conn)
     assert proposals == [
         RuleProposal(1, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 3, None),
-        RuleProposal(2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1, "msg-9"),
+        RuleProposal(2, "amy@x.com", "Cortex/Bar", "remove", "pending", "teach", 1, "msg-9", True),
     ]
 
 
@@ -55,7 +55,7 @@ def test_list_pending_proposals_empty() -> None:
 
 def test_unposted_pending_proposals_maps_rows() -> None:
     conn, cur = make_conn(
-        fetchall=[(3, "cy@x.com", "Cortex/Baz", "add", "pending", "teach", 1, None)]
+        fetchall=[(3, "cy@x.com", "Cortex/Baz", "add", "pending", "teach", 1, None, False)]
     )
     proposals = unposted_pending_proposals(conn)
     assert proposals == [
@@ -66,7 +66,7 @@ def test_unposted_pending_proposals_maps_rows() -> None:
 
 def test_get_proposal_by_message_id_found() -> None:
     conn, _ = make_conn(
-        fetchone=(5, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 2, "msg-1")
+        fetchone=(5, "bob@x.com", "Cortex/Foo", "add", "pending", "teach", 2, "msg-1", False)
     )
     proposal = get_proposal_by_message_id(conn, "msg-1")
     assert proposal is not None
@@ -110,3 +110,25 @@ def test_approve_and_reject_wrappers() -> None:
     assert reject_proposal(conn, 7) is True
     statuses = [c.args[1][0] for c in cur.execute.call_args_list]
     assert APPROVED in statuses and REJECTED in statuses
+
+
+def test_approve_with_archive_sets_flag() -> None:
+    conn, cur = make_conn(fetchone=(7,))
+    assert approve_proposal(conn, 7, archive=True) is True
+    sql, params = cur.execute.call_args_list[0].args
+    # archive is coerced to false unless the proposal is add-direction.
+    assert "archive = (%s AND direction = 'add')" in sql
+    assert params == (APPROVED, True, 7)
+
+
+def test_approve_defaults_archive_false() -> None:
+    conn, cur = make_conn(fetchone=(7,))
+    approve_proposal(conn, 7)
+    assert cur.execute.call_args_list[0].args[1] == (APPROVED, False, 7)
+
+
+def test_approve_noop_when_not_pending() -> None:
+    # The guarded UPDATE matched no pending row (already decided / duplicate
+    # reaction) -> approve_proposal returns False and stamps nothing.
+    conn, _ = make_conn(fetchone=None)
+    assert approve_proposal(conn, 7, archive=True) is False
