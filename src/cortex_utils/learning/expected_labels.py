@@ -15,6 +15,9 @@ from typing import Any
 import psycopg2
 
 DEFAULT_LABEL_PREFIX = "Cortex"
+# The label triage assigns when nothing else matches. Mirrors RulesConfig's
+# default. Used to recognise (and ignore) removals of the default label.
+DEFAULT_DEFAULT_LABEL = "Uncategorized"
 
 
 def expected_cortex_labels(
@@ -82,6 +85,24 @@ def active_label_prefix(conn: psycopg2.extensions.connection) -> str:
     if row and row[0] is not None:
         return row[0]
     return DEFAULT_LABEL_PREFIX
+
+
+def active_default_label(conn: psycopg2.extensions.connection) -> str:
+    """Default label (bare, unprefixed) from the active triage config.
+
+    This is what triage assigns when nothing else matches (e.g.
+    ``"Uncategorized"``). Defaults to ``DEFAULT_DEFAULT_LABEL`` when no active
+    config exists. Callers prefix it (``{prefix}/{default}``) to get the full
+    label name.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT default_label FROM triage_config_versions WHERE is_active = TRUE LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row and row[0]:
+        return row[0]
+    return DEFAULT_DEFAULT_LABEL
 
 
 def managed_labels(action: dict[str, Any], prefix: str) -> set[str]:
