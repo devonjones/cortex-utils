@@ -341,12 +341,18 @@ def approve_proposal(
     """Mark a pending proposal approved (its apply job runs it in uo9b.4).
 
     ``archive=True`` (the 📦 reaction) also stamps the proposal so the committed
-    mapping archives the sender's mail. Only a pending proposal transitions, so
-    a duplicate reaction can't re-decide it. Does not commit.
+    mapping archives the sender's mail. Archive is only meaningful for an
+    add-direction proposal (there's no mapping to archive on a "stop labeling"
+    remove), so it's coerced to false for non-add proposals — the invariant
+    holds even if a caller passes ``archive=True`` on a remove. Only a pending
+    proposal transitions, so a duplicate reaction can't re-decide it. Does not
+    commit.
     """
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE rule_proposals SET status = %s, archive = %s, updated_at = NOW() "
+            "UPDATE rule_proposals "
+            "SET status = %s, archive = (%s AND direction = 'add'), "
+            "    updated_at = NOW() "
             "WHERE id = %s AND status = 'pending' RETURNING id",
             (APPROVED, archive, proposal_id),
         )

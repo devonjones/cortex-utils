@@ -116,7 +116,8 @@ def test_approve_with_archive_sets_flag() -> None:
     conn, cur = make_conn(fetchone=(7,))
     assert approve_proposal(conn, 7, archive=True) is True
     sql, params = cur.execute.call_args_list[0].args
-    assert "archive = %s" in sql
+    # archive is coerced to false unless the proposal is add-direction.
+    assert "archive = (%s AND direction = 'add')" in sql
     assert params == (APPROVED, True, 7)
 
 
@@ -124,3 +125,10 @@ def test_approve_defaults_archive_false() -> None:
     conn, cur = make_conn(fetchone=(7,))
     approve_proposal(conn, 7)
     assert cur.execute.call_args_list[0].args[1] == (APPROVED, False, 7)
+
+
+def test_approve_noop_when_not_pending() -> None:
+    # The guarded UPDATE matched no pending row (already decided / duplicate
+    # reaction) -> approve_proposal returns False and stamps nothing.
+    conn, _ = make_conn(fetchone=None)
+    assert approve_proposal(conn, 7, archive=True) is False
