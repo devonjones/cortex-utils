@@ -22,11 +22,15 @@ import structlog
 log = structlog.get_logger()
 
 
-class QueueTableNotFoundError(RuntimeError):
+class PartitionError(RuntimeError):
+    """Base for partition-management failures, so callers can catch the category."""
+
+
+class QueueTableNotFoundError(PartitionError):
     """No queue table is visible on the connection's search_path."""
 
 
-class PartitionNotAttachedError(RuntimeError):
+class PartitionNotAttachedError(PartitionError):
     """A relation of the partition's name exists but is not a partition of queue."""
 
 
@@ -47,7 +51,12 @@ class PartitionManager:
         """
         cur.execute("SELECT to_regclass('queue');")
         if cur.fetchone()[0] is None:
-            log.error("No queue table on search_path", hint="check the job's PGOPTIONS")
+            cur.execute("SHOW search_path;")
+            log.error(
+                "No queue table on search_path",
+                search_path=cur.fetchone()[0],
+                hint="check the job's PGOPTIONS",
+            )
             raise QueueTableNotFoundError(
                 "no 'queue' table on search_path; check the job's PGOPTIONS "
                 "(each maintenance job manages the queue in its own schema)"
@@ -122,6 +131,7 @@ class PartitionManager:
         # the CREATE is silently absorbed and the day ends up with no partition,
         # which is the failure this module exists to prevent.
         if not self.partition_exists(partition_date):
+            log.error("Partition name is shadowed", partition=partition_name)
             raise PartitionNotAttachedError(
                 f"{partition_name} exists but is not a partition of queue; "
                 "a same-named relation is shadowing it (check for leftovers from "
@@ -283,14 +293,32 @@ class PartitionManager:
         """Create partitions for the next N days.
 
         Returns count of partitions created.
+
+        One unusable date does not abandon the others. Raising straight out of the
+        loop would let a shadowed relation on today suppress tomorrow's partition
+        too, turning a guard against missing partitions into a cause of them --
+        every remaining date is attempted, then the first failure is re-raised so
+        the run still fails loudly.
         """
         created = 0
         today = date.today()
+        failures: list[PartitionNotAttachedError] = []
 
         for i in range(days_ahead + 1):  # Include today
             partition_date = today + timedelta(days=i)
-            if self.create_partition(partition_date, dry_run=dry_run):
-                created += 1
+            try:
+                if self.create_partition(partition_date, dry_run=dry_run):
+                    created += 1
+            except PartitionNotAttachedError as exc:
+                log.error(
+                    "Could not create partition",
+                    partition_date=str(partition_date),
+                    error=str(exc),
+                )
+                failures.append(exc)
+
+        if failures:
+            raise failures[0]
 
         return created
 

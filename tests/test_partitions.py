@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cortex_utils.queue.partitions import (
+    PartitionError,
     PartitionManager,
     PartitionNotAttachedError,
     QueueTableNotFoundError,
@@ -32,7 +33,8 @@ PARENT_MISSING: Row = (None,)
 
 
 def _manager_capturing_sql(
-    fetchone: Row | list[Row | None] | None = PARENT_OK,
+    rows: list[Row | None] | None = None,
+    parent: Row = PARENT_OK,
     fetchall: list[Row] | None = None,
 ) -> tuple[PartitionManager, list[str]]:
     """PartitionManager whose executed SQL is captured instead of run.
@@ -40,18 +42,32 @@ def _manager_capturing_sql(
     Bound parameters are appended to the statement so name assertions can see
     them wherever the query passes the partition name as %s.
 
-    Every lookup issues the _require_parent probe before its own query, so pass a
-    list for `fetchone` to answer those calls in order; a bare tuple answers all
-    of them. Defaults to PARENT_OK because a resolvable parent is the precondition
-    for reaching any of the behaviour under test.
+    `parent` answers the _require_parent probe wherever it occurs; `rows` answers
+    the real lookups in order. Keeping them apart means a test pins only the
+    ordering that carries meaning (was the partition there before the CREATE, is
+    it there after) and not how many times the guard happens to probe -- memoising
+    that probe is an obvious refactor and must not fail these tests.
     """
     executed: list[str] = []
+    pending = list(rows) if rows else []
+    answered_meta: list[Row] = []
+
+    def _execute(sql: str, *args: object) -> None:
+        executed.append(sql + repr(args))
+        stripped = sql.strip()
+        if stripped.startswith("SELECT to_regclass"):
+            answered_meta.append(parent)
+        elif stripped.startswith("SHOW search_path"):
+            answered_meta.append(("public",))
+
+    def _fetchone() -> Row | None:
+        if answered_meta:
+            return answered_meta.pop(0)
+        return pending.pop(0) if pending else None
+
     cur = MagicMock()
-    cur.execute.side_effect = lambda sql, *a: executed.append(sql + repr(a))
-    if isinstance(fetchone, list):
-        cur.fetchone.side_effect = fetchone
-    else:
-        cur.fetchone.return_value = fetchone
+    cur.execute.side_effect = _execute
+    cur.fetchone.side_effect = _fetchone
     cur.fetchall.return_value = fetchall if fetchall is not None else []
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -87,18 +103,18 @@ def test_every_lookup_raises_when_queue_not_on_search_path() -> None:
         lambda m: m.list_partitions(),
         lambda m: m.is_table_partitioned(),
     ):
-        manager, _ = _manager_capturing_sql(fetchone=PARENT_MISSING)
+        manager, _ = _manager_capturing_sql(parent=PARENT_MISSING)
         with pytest.raises(QueueTableNotFoundError):
             call(manager)
 
 
 def test_partition_exists_returns_false_when_no_row() -> None:
-    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, None])
+    manager, _ = _manager_capturing_sql(rows=[None])
     assert manager.partition_exists(date(2026, 8, 10)) is False
 
 
 def test_partition_exists_returns_true_when_row_found() -> None:
-    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, (1,)])
+    manager, _ = _manager_capturing_sql(rows=[(1,)])
     assert manager.partition_exists(date(2026, 8, 10)) is True
 
 
@@ -110,20 +126,20 @@ def test_list_partitions_maps_rows_to_dicts() -> None:
 
 
 def test_is_table_partitioned_true_when_parent_is_partitioned() -> None:
-    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, ("r",)])
+    manager, _ = _manager_capturing_sql(rows=[("r",)])
     assert manager.is_table_partitioned() is True
 
 
 def test_is_table_partitioned_false_when_parent_is_plain_table() -> None:
     """Queue resolves but has no partition strategy -- the migrate-queue case."""
-    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, None])
+    manager, _ = _manager_capturing_sql(rows=[None])
     assert manager.is_table_partitioned() is False
 
 
 def test_partition_name_matches_created_partition() -> None:
     """create_partition and partition_exists must agree on the name."""
-    # exists? no -> create -> post-check says attached.
-    manager, executed = _manager_capturing_sql(fetchone=[PARENT_OK, None, PARENT_OK, (1,)])
+    # not there before the CREATE, there after.
+    manager, executed = _manager_capturing_sql(rows=[None, (1,)])
     manager.create_partition(date(2026, 8, 6))
     created = [s for s in executed if "CREATE TABLE" in s]
     assert len(created) == 1
@@ -134,7 +150,7 @@ def test_partition_name_matches_created_partition() -> None:
 
 def test_create_partition_tolerates_concurrent_creation() -> None:
     """The other maintenance job may create the partition between check and CREATE."""
-    manager, executed = _manager_capturing_sql(fetchone=[PARENT_OK, None, PARENT_OK, (1,)])
+    manager, executed = _manager_capturing_sql(rows=[None, (1,)])
     manager.create_partition(date(2026, 8, 6))
     assert "IF NOT EXISTS" in [s for s in executed if "CREATE TABLE" in s][0]
 
@@ -146,7 +162,27 @@ def test_create_partition_raises_when_name_is_shadowed() -> None:
     migration leaves a shadow that would absorb the CREATE and leave the day
     uncovered -- silently, which is the failure this module exists to prevent.
     """
-    # exists? no -> create -> post-check still says not attached.
-    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, None, PARENT_OK, None])
+    # not there before the CREATE, still not there after.
+    manager, _ = _manager_capturing_sql(rows=[None, None])
     with pytest.raises(PartitionNotAttachedError):
         manager.create_partition(date(2026, 8, 6))
+
+
+def test_create_future_partitions_continues_past_an_unusable_date() -> None:
+    """One shadowed date must not starve the dates after it.
+
+    Raising straight out of the loop would let a shadow on today suppress
+    tomorrow's partition too -- the guard causing the very gap it exists to catch.
+    """
+    # day 0: absent, then still absent after CREATE (shadowed).
+    # day 1: absent, then present after CREATE (fine).
+    manager, executed = _manager_capturing_sql(rows=[None, None, None, (1,)])
+    with pytest.raises(PartitionNotAttachedError):
+        manager.create_future_partitions(days_ahead=1)
+    assert len([s for s in executed if "CREATE TABLE" in s]) == 2
+
+
+def test_partition_errors_share_a_base() -> None:
+    """Callers should be able to catch the category without an explicit tuple."""
+    assert issubclass(QueueTableNotFoundError, PartitionError)
+    assert issubclass(PartitionNotAttachedError, PartitionError)
