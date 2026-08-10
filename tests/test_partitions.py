@@ -32,6 +32,12 @@ PARENT_OK: Row = ("queue",)
 PARENT_MISSING: Row = (None,)
 
 
+def _is_meta(sql: str) -> bool:
+    """True for the guard's own probe statements, which carry no lookup logic."""
+    stripped = sql.strip()
+    return stripped.startswith("SELECT to_regclass") or stripped.startswith("SHOW search_path")
+
+
 def _manager_capturing_sql(
     rows: list[Row | None] | None = None,
     parent: Row = PARENT_OK,
@@ -54,10 +60,9 @@ def _manager_capturing_sql(
 
     def _execute(sql: str, *args: object) -> None:
         executed.append(sql + repr(args))
-        stripped = sql.strip()
-        if stripped.startswith("SELECT to_regclass"):
+        if sql.strip().startswith("SELECT to_regclass"):
             answered_meta.append(parent)
-        elif stripped.startswith("SHOW search_path"):
+        elif sql.strip().startswith("SHOW search_path"):
             answered_meta.append(("public",))
 
     def _fetchone() -> Row | None:
@@ -75,7 +80,14 @@ def _manager_capturing_sql(
 
 
 def test_lookups_bind_parent_by_search_path_not_bare_name() -> None:
-    """Every catalog lookup must resolve the parent via to_regclass('queue')."""
+    """Every catalog lookup must resolve the parent via to_regclass('queue').
+
+    Asserted over every non-probe statement, not just the last one. The probe
+    only happens to run first; reorder it and executed[-1] becomes the probe's own
+    SQL, which satisfies both assertions on its own -- letting all three lookups
+    revert to the outage form with the suite still green. This is the test that
+    stands between that bug and a repeat, so it must not depend on statement order.
+    """
     for call in (
         lambda m: m.partition_exists(date(2026, 8, 10)),
         lambda m: m.list_partitions(),
@@ -83,11 +95,12 @@ def test_lookups_bind_parent_by_search_path_not_bare_name() -> None:
     ):
         manager, executed = _manager_capturing_sql()
         call(manager)
-        assert executed, "expected a catalog query"
-        sql = executed[-1]
-        assert "to_regclass('queue')" in sql, f"parent not bound by search_path: {sql}"
-        # The exact shape that caused the outage: any schema's queue would match.
-        assert "relname = 'queue'" not in sql, f"matches queue in any schema: {sql}"
+        lookups = [sql for sql in executed if not _is_meta(sql)]
+        assert lookups, "expected a catalog query"
+        for sql in lookups:
+            assert "to_regclass('queue')" in sql, f"parent not bound by search_path: {sql}"
+            # The exact shape that caused the outage: any schema's queue would match.
+            assert "relname = 'queue'" not in sql, f"matches queue in any schema: {sql}"
 
 
 def test_every_lookup_raises_when_queue_not_on_search_path() -> None:
@@ -146,6 +159,11 @@ def test_partition_name_matches_created_partition() -> None:
     # Bounds are the single day, half-open.
     assert "queue_2026_08_06" in created[0]
     assert "FROM ('2026-08-06') TO ('2026-08-07')" in created[0]
+    # The post-check must re-ask about the partition just created. Counting calls
+    # is not enough: partition_exists(next_date) is an easy off-by-one, since
+    # next_date is in scope two lines above the check.
+    lookups = [sql for sql in executed if not _is_meta(sql)]
+    assert "queue_2026_08_06" in lookups[-1], f"post-check asked the wrong thing: {lookups[-1]}"
 
 
 def test_create_partition_tolerates_concurrent_creation() -> None:
@@ -186,3 +204,18 @@ def test_partition_errors_share_a_base() -> None:
     """Callers should be able to catch the category without an explicit tuple."""
     assert issubclass(QueueTableNotFoundError, PartitionError)
     assert issubclass(PartitionNotAttachedError, PartitionError)
+
+
+def test_create_future_partitions_raises_the_first_failure() -> None:
+    """With several unusable dates the raised error is the first, not the last."""
+    # both days: absent, then still absent after CREATE.
+    manager, _ = _manager_capturing_sql(rows=[None, None, None, None])
+    with pytest.raises(PartitionNotAttachedError) as excinfo:
+        manager.create_future_partitions(days_ahead=1)
+    today = date.today()
+    assert f"queue_{today.strftime('%Y_%m_%d')}" in str(excinfo.value)
+
+
+def test_create_future_partitions_returns_count_when_all_succeed() -> None:
+    manager, _ = _manager_capturing_sql(rows=[None, (1,), None, (1,)])
+    assert manager.create_future_partitions(days_ahead=1) == 2

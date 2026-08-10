@@ -299,6 +299,10 @@ class PartitionManager:
         too, turning a guard against missing partitions into a cause of them --
         every remaining date is attempted, then the first failure is re-raised so
         the run still fails loudly.
+
+        The caller's retention pass is skipped when this raises. Exposure is bounded
+        by the days_ahead window rather than by run count: dates already created stay
+        created, and a later run re-creates only what is still missing.
         """
         created = 0
         today = date.today()
@@ -310,14 +314,18 @@ class PartitionManager:
                 if self.create_partition(partition_date, dry_run=dry_run):
                     created += 1
             except PartitionNotAttachedError as exc:
-                log.error(
-                    "Could not create partition",
-                    partition_date=str(partition_date),
-                    error=str(exc),
-                )
+                # create_partition already logged this one by name; logging again
+                # here would double-count the failure for anything watching error
+                # rates, so only the run-level summary below is emitted.
                 failures.append(exc)
 
         if failures:
+            log.error(
+                "Partition creation incomplete",
+                created=created,
+                failed=len(failures),
+                days_ahead=days_ahead,
+            )
             raise failures[0]
 
         return created
