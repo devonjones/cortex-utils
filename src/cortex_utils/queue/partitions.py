@@ -4,6 +4,13 @@ Manages daily partitions for the queue table:
 - Create future partitions
 - Drop old partitions (after archiving failed jobs)
 - Migrate from non-partitioned to partitioned table
+
+Which queue table is managed is decided by search_path (set PGOPTIONS to point a
+job at a different schema). Catalog lookups must therefore resolve the parent via
+to_regclass('queue') rather than matching pg_class.relname = 'queue', which would
+match a same-named table in *any* schema. Getting this wrong once caused a 4.8-day
+silent ingestion outage: a second queue table's partitions made partition_exists()
+report True, so the real partitions were never created.
 """
 
 from datetime import date, datetime, timedelta
@@ -32,8 +39,7 @@ class PartitionManager:
                     pg_relation_size(c.oid) as size_bytes
                 FROM pg_class c
                 JOIN pg_inherits i ON c.oid = i.inhrelid
-                JOIN pg_class p ON i.inhparent = p.oid
-                WHERE p.relname = 'queue'
+                WHERE i.inhparent = to_regclass('queue')
                 ORDER BY c.relname;
             """
             )
@@ -49,8 +55,7 @@ class PartitionManager:
                 """
                 SELECT 1 FROM pg_class c
                 JOIN pg_inherits i ON c.oid = i.inhrelid
-                JOIN pg_class p ON i.inhparent = p.oid
-                WHERE p.relname = 'queue' AND c.relname = %s;
+                WHERE i.inhparent = to_regclass('queue') AND c.relname = %s;
             """,
                 (partition_name,),
             )
@@ -349,9 +354,8 @@ class PartitionManager:
             cur.execute(
                 """
                 SELECT pt.partstrat
-                FROM pg_class c
-                JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
-                WHERE c.relname = 'queue';
+                FROM pg_partitioned_table pt
+                WHERE pt.partrelid = to_regclass('queue');
             """
             )
             row = cur.fetchone()
