@@ -161,7 +161,7 @@ def test_partition_name_matches_created_partition() -> None:
     assert "FROM ('2026-08-06') TO ('2026-08-07')" in created[0]
     # The post-check must re-ask about the partition just created. Counting calls
     # is not enough: partition_exists(next_date) is an easy off-by-one, since
-    # next_date is in scope two lines above the check.
+    # next_date is in scope at that point and differs by exactly one day.
     lookups = [sql for sql in executed if not _is_meta(sql)]
     assert "queue_2026_08_06" in lookups[-1], f"post-check asked the wrong thing: {lookups[-1]}"
 
@@ -219,3 +219,23 @@ def test_create_future_partitions_raises_the_first_failure() -> None:
 def test_create_future_partitions_returns_count_when_all_succeed() -> None:
     manager, _ = _manager_capturing_sql(rows=[None, (1,), None, (1,)])
     assert manager.create_future_partitions(days_ahead=1) == 2
+
+
+def test_dry_run_executes_no_ddl() -> None:
+    """dry_run must inspect only -- a dry run that creates tables is worse than none."""
+    manager, executed = _manager_capturing_sql(rows=[None])
+    assert manager.create_partition(date(2026, 8, 6), dry_run=True) is True
+    assert not [sql for sql in executed if "CREATE TABLE" in sql]
+
+
+def test_create_future_partitions_forwards_dry_run() -> None:
+    manager, executed = _manager_capturing_sql(rows=[None, None])
+    manager.create_future_partitions(days_ahead=1, dry_run=True)
+    assert not [sql for sql in executed if "CREATE TABLE" in sql]
+
+
+def test_create_future_partitions_does_not_count_existing_partitions() -> None:
+    """An already-present date is skipped, not counted as created."""
+    # day 0 already there; day 1 absent, then present after its CREATE.
+    manager, _ = _manager_capturing_sql(rows=[(1,), None, (1,)])
+    assert manager.create_future_partitions(days_ahead=1) == 1
