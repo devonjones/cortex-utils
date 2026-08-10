@@ -22,6 +22,10 @@ import structlog
 log = structlog.get_logger()
 
 
+class QueueTableNotFoundError(RuntimeError):
+    """No queue table is visible on the connection's search_path."""
+
+
 class PartitionManager:
     """Manages queue table partitions."""
 
@@ -73,8 +77,11 @@ class PartitionManager:
             log.debug("Partition already exists", partition=partition_name)
             return False
 
+        # IF NOT EXISTS closes the window between the check above and this CREATE.
+        # Two maintenance jobs share this database, so a duplicate here would abort
+        # the transaction and take the rest of maintain() down with it.
         sql = f"""
-            CREATE TABLE {partition_name} PARTITION OF queue
+            CREATE TABLE IF NOT EXISTS {partition_name} PARTITION OF queue
             FOR VALUES FROM ('{partition_date}') TO ('{next_date}');
         """
 
@@ -349,8 +356,22 @@ class PartitionManager:
         return result
 
     def is_table_partitioned(self) -> bool:
-        """Check if the queue table is partitioned."""
+        """Check if the queue table is partitioned.
+
+        Raises QueueTableNotFoundError when search_path resolves no queue table at all.
+        That is a misconfigured job, not an unpartitioned table, and the two must
+        not share an answer: callers treat False as "run migrate-queue first" and
+        return cleanly, which would turn a broken search_path into a green no-op --
+        the same silent shape as the outage in the module docstring.
+        """
         with self.conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('queue');")
+            if cur.fetchone()[0] is None:
+                raise QueueTableNotFoundError(
+                    "no 'queue' table on search_path; check the job's PGOPTIONS "
+                    "(each maintenance job manages the queue in its own schema)"
+                )
+
             cur.execute(
                 """
                 SELECT pt.partstrat
