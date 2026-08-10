@@ -26,15 +26,37 @@ class QueueTableNotFoundError(RuntimeError):
     """No queue table is visible on the connection's search_path."""
 
 
+class PartitionNotAttachedError(RuntimeError):
+    """A relation of the partition's name exists but is not a partition of queue."""
+
+
 class PartitionManager:
     """Manages queue table partitions."""
 
     def __init__(self, conn: psycopg2.extensions.connection):
         self.conn = conn
 
+    def _require_parent(self, cur: psycopg2.extensions.cursor) -> None:
+        """Fail loudly when search_path resolves no queue table.
+
+        to_regclass() yields NULL rather than raising, so every lookup here would
+        report an ordinary empty result for a job pointed at the wrong schema --
+        indistinguishable from a healthy "nothing to do". Every lookup shares this
+        guard so the contract does not vary by method: `partitions drop` reaches
+        partition_exists() without passing through is_table_partitioned().
+        """
+        cur.execute("SELECT to_regclass('queue');")
+        if cur.fetchone()[0] is None:
+            log.error("No queue table on search_path", hint="check the job's PGOPTIONS")
+            raise QueueTableNotFoundError(
+                "no 'queue' table on search_path; check the job's PGOPTIONS "
+                "(each maintenance job manages the queue in its own schema)"
+            )
+
     def list_partitions(self) -> list[dict[str, Any]]:
         """List all queue partitions with their sizes."""
         with self.conn.cursor() as cur:
+            self._require_parent(cur)
             cur.execute(
                 """
                 SELECT
@@ -55,6 +77,7 @@ class PartitionManager:
         """Check if a partition exists for the given date."""
         partition_name = f"queue_{partition_date.strftime('%Y_%m_%d')}"
         with self.conn.cursor() as cur:
+            self._require_parent(cur)
             cur.execute(
                 """
                 SELECT 1 FROM pg_class c
@@ -92,6 +115,18 @@ class PartitionManager:
         with self.conn.cursor() as cur:
             cur.execute(sql)
         self.conn.commit()
+
+        # IF NOT EXISTS skips on ANY relation of that name, not just a partition of
+        # queue -- migrate.py builds queue_YYYY_MM_DD tables under queue_new, so a
+        # half-finished migration leaves exactly such a shadow. Without this check
+        # the CREATE is silently absorbed and the day ends up with no partition,
+        # which is the failure this module exists to prevent.
+        if not self.partition_exists(partition_date):
+            raise PartitionNotAttachedError(
+                f"{partition_name} exists but is not a partition of queue; "
+                "a same-named relation is shadowing it (check for leftovers from "
+                "an interrupted migrate-queue)"
+            )
 
         log.info("Created partition", partition=partition_name)
         return True
@@ -365,13 +400,7 @@ class PartitionManager:
         the same silent shape as the outage in the module docstring.
         """
         with self.conn.cursor() as cur:
-            cur.execute("SELECT to_regclass('queue');")
-            if cur.fetchone()[0] is None:
-                raise QueueTableNotFoundError(
-                    "no 'queue' table on search_path; check the job's PGOPTIONS "
-                    "(each maintenance job manages the queue in its own schema)"
-                )
-
+            self._require_parent(cur)
             cur.execute(
                 """
                 SELECT pt.partstrat

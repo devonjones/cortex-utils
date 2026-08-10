@@ -18,23 +18,40 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from cortex_utils.queue.partitions import PartitionManager, QueueTableNotFoundError
+from cortex_utils.queue.partitions import (
+    PartitionManager,
+    PartitionNotAttachedError,
+    QueueTableNotFoundError,
+)
+
+Row = tuple[object, ...]
+
+# What "SELECT to_regclass('queue')" returns when the parent does and does not resolve.
+PARENT_OK: Row = ("queue",)
+PARENT_MISSING: Row = (None,)
 
 
 def _manager_capturing_sql(
-    fetchone: object = None, fetchall: object = None
+    fetchone: Row | list[Row | None] | None = PARENT_OK,
+    fetchall: list[Row] | None = None,
 ) -> tuple[PartitionManager, list[str]]:
     """PartitionManager whose executed SQL is captured instead of run.
 
     Bound parameters are appended to the statement so name assertions can see
-    them wherever the query passes the partition name as %s. `fetchone`/`fetchall`
-    set what the cursor returns, so callers can drive the found and not-found
-    branches -- defaulting to not-found would leave the found paths unasserted.
+    them wherever the query passes the partition name as %s.
+
+    Every lookup issues the _require_parent probe before its own query, so pass a
+    list for `fetchone` to answer those calls in order; a bare tuple answers all
+    of them. Defaults to PARENT_OK because a resolvable parent is the precondition
+    for reaching any of the behaviour under test.
     """
     executed: list[str] = []
     cur = MagicMock()
     cur.execute.side_effect = lambda sql, *a: executed.append(sql + repr(a))
-    cur.fetchone.return_value = fetchone
+    if isinstance(fetchone, list):
+        cur.fetchone.side_effect = fetchone
+    else:
+        cur.fetchone.return_value = fetchone
     cur.fetchall.return_value = fetchall if fetchall is not None else []
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -48,7 +65,7 @@ def test_lookups_bind_parent_by_search_path_not_bare_name() -> None:
         lambda m: m.list_partitions(),
         lambda m: m.is_table_partitioned(),
     ):
-        manager, executed = _manager_capturing_sql(fetchone=("queue",))
+        manager, executed = _manager_capturing_sql()
         call(manager)
         assert executed, "expected a catalog query"
         sql = executed[-1]
@@ -57,13 +74,31 @@ def test_lookups_bind_parent_by_search_path_not_bare_name() -> None:
         assert "relname = 'queue'" not in sql, f"matches queue in any schema: {sql}"
 
 
+def test_every_lookup_raises_when_queue_not_on_search_path() -> None:
+    """A misconfigured search_path must not read as an ordinary empty result.
+
+    Returning False/[] sends `partitions drop` down "Partition does not exist" and
+    the CLI's other commands down "run migrate-queue first", both exiting 0 -- the
+    green no-op that let the real outage run for 4.8 days. The contract must not
+    vary by method: `partitions drop` never calls is_table_partitioned().
+    """
+    for call in (
+        lambda m: m.partition_exists(date(2026, 8, 10)),
+        lambda m: m.list_partitions(),
+        lambda m: m.is_table_partitioned(),
+    ):
+        manager, _ = _manager_capturing_sql(fetchone=PARENT_MISSING)
+        with pytest.raises(QueueTableNotFoundError):
+            call(manager)
+
+
 def test_partition_exists_returns_false_when_no_row() -> None:
-    manager, _ = _manager_capturing_sql()
+    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, None])
     assert manager.partition_exists(date(2026, 8, 10)) is False
 
 
 def test_partition_exists_returns_true_when_row_found() -> None:
-    manager, _ = _manager_capturing_sql(fetchone=(1,))
+    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, (1,)])
     assert manager.partition_exists(date(2026, 8, 10)) is True
 
 
@@ -74,35 +109,44 @@ def test_list_partitions_maps_rows_to_dicts() -> None:
     ]
 
 
-def test_is_table_partitioned_true_when_parent_resolves() -> None:
-    manager, _ = _manager_capturing_sql(fetchone=("queue",))
+def test_is_table_partitioned_true_when_parent_is_partitioned() -> None:
+    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, ("r",)])
     assert manager.is_table_partitioned() is True
 
 
-def test_is_table_partitioned_raises_when_queue_not_on_search_path() -> None:
-    """A misconfigured search_path must not read as "not partitioned".
-
-    Returning False sends the CLI down "run migrate-queue first" and exits 0 --
-    the green no-op that let the real outage run for 4.8 days.
-    """
-    manager, _ = _manager_capturing_sql(fetchone=(None,))
-    with pytest.raises(QueueTableNotFoundError):
-        manager.is_table_partitioned()
+def test_is_table_partitioned_false_when_parent_is_plain_table() -> None:
+    """Queue resolves but has no partition strategy -- the migrate-queue case."""
+    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, None])
+    assert manager.is_table_partitioned() is False
 
 
 def test_partition_name_matches_created_partition() -> None:
     """create_partition and partition_exists must agree on the name."""
-    manager, executed = _manager_capturing_sql()
-    manager.partition_exists(date(2026, 8, 6))
+    # exists? no -> create -> post-check says attached.
+    manager, executed = _manager_capturing_sql(fetchone=[PARENT_OK, None, PARENT_OK, (1,)])
     manager.create_partition(date(2026, 8, 6))
-    assert "queue_2026_08_06" in executed[0]
-    assert "queue_2026_08_06" in executed[-1]
+    created = [s for s in executed if "CREATE TABLE" in s]
+    assert len(created) == 1
     # Bounds are the single day, half-open.
-    assert "FROM ('2026-08-06') TO ('2026-08-07')" in executed[-1]
+    assert "queue_2026_08_06" in created[0]
+    assert "FROM ('2026-08-06') TO ('2026-08-07')" in created[0]
 
 
 def test_create_partition_tolerates_concurrent_creation() -> None:
     """The other maintenance job may create the partition between check and CREATE."""
-    manager, executed = _manager_capturing_sql()
+    manager, executed = _manager_capturing_sql(fetchone=[PARENT_OK, None, PARENT_OK, (1,)])
     manager.create_partition(date(2026, 8, 6))
-    assert "IF NOT EXISTS" in executed[-1]
+    assert "IF NOT EXISTS" in [s for s in executed if "CREATE TABLE" in s][0]
+
+
+def test_create_partition_raises_when_name_is_shadowed() -> None:
+    """IF NOT EXISTS skips on any same-named relation, not just a partition of queue.
+
+    migrate.py creates queue_YYYY_MM_DD tables under queue_new, so an interrupted
+    migration leaves a shadow that would absorb the CREATE and leave the day
+    uncovered -- silently, which is the failure this module exists to prevent.
+    """
+    # exists? no -> create -> post-check still says not attached.
+    manager, _ = _manager_capturing_sql(fetchone=[PARENT_OK, None, PARENT_OK, None])
+    with pytest.raises(PartitionNotAttachedError):
+        manager.create_partition(date(2026, 8, 6))
