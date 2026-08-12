@@ -33,11 +33,19 @@ GREEN = 0x2ECC71
 
 @dataclass(frozen=True)
 class Peer:
-    """A host to watch, and the port used to decide it is alive."""
+    """A host to watch, and the port used to decide it is alive.
+
+    `failures_before_alert` overrides the watchdog default for this host alone.
+    Hosts are not equally reliable: a Raspberry Pi that drops off the network for
+    a couple of minutes and returns is behaving normally for a Raspberry Pi, and
+    paging on it trains you to ignore the channel. Raising the global threshold
+    instead would blind every solid host to a real outage.
+    """
 
     name: str
     host: str
     port: int
+    failures_before_alert: int | None = None
 
 
 @dataclass
@@ -49,7 +57,9 @@ class PeerState:
 
 
 def parse_peers(spec: str) -> list[Peer]:
-    """Parse "name=host:port,name=host:port" into peers.
+    """Parse "name=host:port[:failures],..." into peers.
+
+    The optional third field overrides the alert threshold for that host only.
 
     Raises ValueError on a malformed entry rather than skipping it: a typo that
     silently drops a host would leave that host unwatched, which is the failure
@@ -62,10 +72,21 @@ def parse_peers(spec: str) -> list[Peer]:
             continue
         try:
             name, target = entry.split("=", 1)
-            host, port = target.rsplit(":", 1)
-            peers.append(Peer(name=name.strip(), host=host.strip(), port=int(port)))
+            host, port, *rest = target.split(":")
+            if len(rest) > 1:
+                raise ValueError("too many fields")
+            peers.append(
+                Peer(
+                    name=name.strip(),
+                    host=host.strip(),
+                    port=int(port),
+                    failures_before_alert=int(rest[0]) if rest else None,
+                )
+            )
         except ValueError as exc:
-            raise ValueError(f"malformed peer entry {entry!r}; expected name=host:port") from exc
+            raise ValueError(
+                f"malformed peer entry {entry!r}; expected name=host:port[:failures]"
+            ) from exc
     return peers
 
 
@@ -113,14 +134,15 @@ class Watchdog:
             state.reported_down = False
             return
 
+        threshold = peer.failures_before_alert or self.failures_before_alert
         state.failures += 1
         log.warning(
             "Peer check failed",
             peer=peer.name,
             failures=state.failures,
-            threshold=self.failures_before_alert,
+            threshold=threshold,
         )
-        if state.failures >= self.failures_before_alert and not state.reported_down:
+        if state.failures >= threshold and not state.reported_down:
             state.reported_down = True
             self._announce_down(peer, state.failures)
 
