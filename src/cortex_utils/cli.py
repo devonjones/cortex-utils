@@ -17,6 +17,7 @@ import structlog
 
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
 from cortex_utils.config import Config
+from cortex_utils.health.watchdog import Watchdog, parse_peers
 from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.migrate import drop_old_queue_table, migrate_to_partitioned
@@ -618,6 +619,52 @@ def alerter_send(ctx: click.Context, message: str, ping: bool) -> None:
 
 
 # --- Utility Functions ---
+
+
+@main.group()
+def watchdog() -> None:
+    """Mutual liveness checks between hosts."""
+    pass
+
+
+@watchdog.command("run")
+@click.option("--interval", default=30.0, type=float, help="Seconds between polls")
+@click.option("--failures", default=3, type=int, help="Consecutive failures before alerting")
+@click.option("--timeout", default=5.0, type=float, help="TCP connect timeout in seconds")
+@click.option("--once", is_flag=True, help="Poll once and exit (for testing)")
+def watchdog_run(interval: float, failures: int, timeout: float, once: bool) -> None:
+    """Watch peer hosts and report outages to Discord.
+
+    Every host runs this against every other host, so no single machine has to
+    stay up for monitoring to work.
+
+    Requires DISCORD_WEBHOOK_URL, WATCHDOG_PEERS ("name=host:port,..." naming the
+    OTHER hosts) and WATCHDOG_OBSERVER (this host's name, so a reader can tell
+    several reports of one outage from several outages).
+    """
+    peers_spec = os.environ.get("WATCHDOG_PEERS")
+    if not peers_spec:
+        click.echo('Error: WATCHDOG_PEERS not set (e.g. "hades=10.0.0.1:22,gaia=10.0.0.2:22")')
+        raise SystemExit(1)
+    observer = os.environ.get("WATCHDOG_OBSERVER")
+    if not observer:
+        click.echo("Error: WATCHDOG_OBSERVER not set (this host's name)")
+        raise SystemExit(1)
+
+    dog = Watchdog(
+        peers=parse_peers(peers_spec),
+        discord=DiscordClient(get_webhook_url()),
+        observer=observer,
+        failures_before_alert=failures,
+        timeout=timeout,
+    )
+
+    if once:
+        for name, up in dog.poll_once().items():
+            click.echo(f"{name}: {'up' if up else 'DOWN'}")
+        return
+
+    dog.run(interval=interval)
 
 
 def get_webhook_url() -> str:
