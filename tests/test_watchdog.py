@@ -83,3 +83,36 @@ def test_alert_names_the_observer() -> None:
     dog, discord = _watchdog(failures_before_alert=1)
     _feed(dog, False)
     assert "ares" in discord.send_embed.call_args.kwargs["description"]
+
+
+def test_parse_peers_reads_optional_threshold() -> None:
+    peers = parse_peers("hades=10.0.0.1:22,trident=10.0.0.9:22:20")
+    assert peers[0].failures_before_alert is None
+    assert peers[1].failures_before_alert == 20
+
+
+def test_parse_peers_rejects_extra_fields() -> None:
+    with pytest.raises(ValueError):
+        parse_peers("hades=10.0.0.1:22:3:9")
+
+
+def test_per_peer_threshold_overrides_the_default() -> None:
+    """A flaky host must not page on a blip that a solid host should page on."""
+    discord = MagicMock()
+    flaky = Peer(name="trident", host="10.0.0.9", port=22, failures_before_alert=5)
+    dog = Watchdog(peers=[flaky], discord=discord, observer="ares", failures_before_alert=2)
+    for _ in range(4):
+        dog._record(flaky, False)
+    discord.send_embed.assert_not_called()  # past the global 2, under its own 5
+    dog._record(flaky, False)
+    assert discord.send_embed.call_count == 1
+
+
+def test_default_still_applies_to_peers_without_an_override() -> None:
+    """Raising one host's tolerance must not blind the others."""
+    discord = MagicMock()
+    solid = Peer(name="hades", host="10.0.0.1", port=22)
+    dog = Watchdog(peers=[solid], discord=discord, observer="ares", failures_before_alert=2)
+    dog._record(solid, False)
+    dog._record(solid, False)
+    assert discord.send_embed.call_count == 1
