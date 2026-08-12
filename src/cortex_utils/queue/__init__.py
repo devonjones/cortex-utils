@@ -6,7 +6,12 @@ from cortex_utils.queue.add_retry_columns import (
 )
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.migrate import is_queue_partitioned, migrate_to_partitioned
-from cortex_utils.queue.partitions import PartitionManager
+from cortex_utils.queue.partitions import (
+    PartitionError,
+    PartitionManager,
+    PartitionNotAttachedError,
+    QueueTableNotFoundError,
+)
 from cortex_utils.queue.retry import (
     DEFAULT_BASE_SECONDS,
     DEFAULT_CAP_SECONDS,
@@ -19,6 +24,9 @@ from cortex_utils.queue.stats import get_queue_depth, get_queue_stats, get_stale
 
 __all__ = [
     "PartitionManager",
+    "PartitionError",
+    "PartitionNotAttachedError",
+    "QueueTableNotFoundError",
     "DeadLetterManager",
     "get_queue_stats",
     "get_queue_depth",

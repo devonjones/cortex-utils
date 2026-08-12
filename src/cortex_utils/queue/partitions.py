@@ -4,6 +4,13 @@ Manages daily partitions for the queue table:
 - Create future partitions
 - Drop old partitions (after archiving failed jobs)
 - Migrate from non-partitioned to partitioned table
+
+Which queue table is managed is decided by search_path (set PGOPTIONS to point a
+job at a different schema). Catalog lookups must therefore resolve the parent via
+to_regclass('queue') rather than matching pg_class.relname = 'queue', which would
+match a same-named table in *any* schema. Getting this wrong once caused a 4.8-day
+silent ingestion outage: a second queue table's partitions made partition_exists()
+report True, so the real partitions were never created.
 """
 
 from datetime import date, datetime, timedelta
@@ -15,15 +22,50 @@ import structlog
 log = structlog.get_logger()
 
 
+class PartitionError(RuntimeError):
+    """Base for partition-management failures, so callers can catch the category."""
+
+
+class QueueTableNotFoundError(PartitionError):
+    """No queue table is visible on the connection's search_path."""
+
+
+class PartitionNotAttachedError(PartitionError):
+    """A relation of the partition's name exists but is not a partition of queue."""
+
+
 class PartitionManager:
     """Manages queue table partitions."""
 
     def __init__(self, conn: psycopg2.extensions.connection):
         self.conn = conn
 
+    def _require_parent(self, cur: psycopg2.extensions.cursor) -> None:
+        """Fail loudly when search_path resolves no queue table.
+
+        to_regclass() yields NULL rather than raising, so every lookup here would
+        report an ordinary empty result for a job pointed at the wrong schema --
+        indistinguishable from a healthy "nothing to do". Every lookup shares this
+        guard so the contract does not vary by method: `partitions drop` reaches
+        partition_exists() without passing through is_table_partitioned().
+        """
+        cur.execute("SELECT to_regclass('queue');")
+        if cur.fetchone()[0] is None:
+            cur.execute("SHOW search_path;")
+            log.error(
+                "No queue table on search_path",
+                search_path=cur.fetchone()[0],
+                hint="check the job's PGOPTIONS",
+            )
+            raise QueueTableNotFoundError(
+                "no 'queue' table on search_path; check the job's PGOPTIONS "
+                "(each maintenance job manages the queue in its own schema)"
+            )
+
     def list_partitions(self) -> list[dict[str, Any]]:
         """List all queue partitions with their sizes."""
         with self.conn.cursor() as cur:
+            self._require_parent(cur)
             cur.execute(
                 """
                 SELECT
@@ -32,8 +74,7 @@ class PartitionManager:
                     pg_relation_size(c.oid) as size_bytes
                 FROM pg_class c
                 JOIN pg_inherits i ON c.oid = i.inhrelid
-                JOIN pg_class p ON i.inhparent = p.oid
-                WHERE p.relname = 'queue'
+                WHERE i.inhparent = to_regclass('queue')
                 ORDER BY c.relname;
             """
             )
@@ -45,12 +86,12 @@ class PartitionManager:
         """Check if a partition exists for the given date."""
         partition_name = f"queue_{partition_date.strftime('%Y_%m_%d')}"
         with self.conn.cursor() as cur:
+            self._require_parent(cur)
             cur.execute(
                 """
                 SELECT 1 FROM pg_class c
                 JOIN pg_inherits i ON c.oid = i.inhrelid
-                JOIN pg_class p ON i.inhparent = p.oid
-                WHERE p.relname = 'queue' AND c.relname = %s;
+                WHERE i.inhparent = to_regclass('queue') AND c.relname = %s;
             """,
                 (partition_name,),
             )
@@ -68,8 +109,11 @@ class PartitionManager:
             log.debug("Partition already exists", partition=partition_name)
             return False
 
+        # IF NOT EXISTS closes the window between the check above and this CREATE.
+        # Two maintenance jobs share this database, so a duplicate here would abort
+        # the transaction and take the rest of maintain() down with it.
         sql = f"""
-            CREATE TABLE {partition_name} PARTITION OF queue
+            CREATE TABLE IF NOT EXISTS {partition_name} PARTITION OF queue
             FOR VALUES FROM ('{partition_date}') TO ('{next_date}');
         """
 
@@ -80,6 +124,19 @@ class PartitionManager:
         with self.conn.cursor() as cur:
             cur.execute(sql)
         self.conn.commit()
+
+        # IF NOT EXISTS skips on ANY relation of that name, not just a partition of
+        # queue -- migrate.py builds queue_YYYY_MM_DD tables under queue_new, so a
+        # half-finished migration leaves exactly such a shadow. Without this check
+        # the CREATE is silently absorbed and the day ends up with no partition,
+        # which is the failure this module exists to prevent.
+        if not self.partition_exists(partition_date):
+            log.error("Partition name is shadowed", partition=partition_name)
+            raise PartitionNotAttachedError(
+                f"{partition_name} exists but is not a partition of queue; "
+                "a same-named relation is shadowing it (check for leftovers from "
+                "an interrupted migrate-queue)"
+            )
 
         log.info("Created partition", partition=partition_name)
         return True
@@ -236,14 +293,40 @@ class PartitionManager:
         """Create partitions for the next N days.
 
         Returns count of partitions created.
+
+        One unusable date does not abandon the others. Raising straight out of the
+        loop would let a shadowed relation on today suppress tomorrow's partition
+        too, turning a guard against missing partitions into a cause of them --
+        every remaining date is attempted, then the first failure is re-raised so
+        the run still fails loudly.
+
+        The caller's retention pass is skipped when this raises. Exposure is bounded
+        by the days_ahead window rather than by run count: dates already created stay
+        created, and a later run re-creates only what is still missing.
         """
         created = 0
         today = date.today()
+        failures: list[PartitionNotAttachedError] = []
 
         for i in range(days_ahead + 1):  # Include today
             partition_date = today + timedelta(days=i)
-            if self.create_partition(partition_date, dry_run=dry_run):
-                created += 1
+            try:
+                if self.create_partition(partition_date, dry_run=dry_run):
+                    created += 1
+            except PartitionNotAttachedError as exc:
+                # create_partition already logged this one by name; logging again
+                # here would double-count the failure for anything watching error
+                # rates, so only the run-level summary below is emitted.
+                failures.append(exc)
+
+        if failures:
+            log.error(
+                "Partition creation incomplete",
+                created=created,
+                failed=len(failures),
+                days_ahead=days_ahead,
+            )
+            raise failures[0]
 
         return created
 
@@ -344,14 +427,21 @@ class PartitionManager:
         return result
 
     def is_table_partitioned(self) -> bool:
-        """Check if the queue table is partitioned."""
+        """Check if the queue table is partitioned.
+
+        Raises QueueTableNotFoundError when search_path resolves no queue table at all.
+        That is a misconfigured job, not an unpartitioned table, and the two must
+        not share an answer: callers treat False as "run migrate-queue first" and
+        return cleanly, which would turn a broken search_path into a green no-op --
+        the same silent shape as the outage in the module docstring.
+        """
         with self.conn.cursor() as cur:
+            self._require_parent(cur)
             cur.execute(
                 """
                 SELECT pt.partstrat
-                FROM pg_class c
-                JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
-                WHERE c.relname = 'queue';
+                FROM pg_partitioned_table pt
+                WHERE pt.partrelid = to_regclass('queue');
             """
             )
             row = cur.fetchone()
