@@ -130,16 +130,50 @@ def _tx(
     back, which is the contract they accepted by owning the transaction.
     """
     if not commit:
-        with conn.cursor() as cur:
-            yield cur
+        try:
+            with conn.cursor() as cur:
+                yield cur
+        except psycopg2.errors.UndefinedColumn as exc:
+            raise _missing_migration(exc) from exc
         return
     try:
         with conn.cursor() as cur:
             yield cur
         conn.commit()
+    except psycopg2.errors.UndefinedColumn as exc:
+        conn.rollback()
+        raise _missing_migration(exc) from exc
     except Exception:
         conn.rollback()
         raise
+
+
+def _missing_migration(exc: psycopg2.errors.UndefinedColumn) -> Exception:
+    """Turn a raw UndefinedColumn on claimed_by into the remedy.
+
+    All five primitives reference claimed_by, and the only thing protecting them
+    is the convention that a service calls ensure_claim_token_column() on boot.
+    A consumer who forgets gets UndefinedColumn out of claim() -- from the core
+    of the queue, not a side feature -- naming a column they never wrote.
+
+    Guarded here rather than at the five call sites because a half-guard reads
+    as safe and is not: guard four and the fifth still raises the raw error on
+    the same schema, which is worse than guarding none. Every primitive routes
+    through this function, so one place covers all of them, and it costs a
+    string comparison only on a path that was already failing.
+
+    Not a degraded answer, because there is no useful one: without the claim
+    token, complete() and release() cannot tell your row from one another worker
+    re-claimed, so proceeding would silently reintroduce the bug the column
+    exists to prevent.
+    """
+    if "claimed_by" not in str(exc):
+        return exc
+    return QueueError(
+        "queue.claimed_by is missing on this search_path. Run "
+        "cortex_utils.queue.ensure_claim_token_column(conn) once against this "
+        "schema before using the queue -- it is idempotent and safe on every boot."
+    )
 
 
 def has_claim_token_column(conn: psycopg2.extensions.connection) -> bool:

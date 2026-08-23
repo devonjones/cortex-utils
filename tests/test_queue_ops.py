@@ -1021,3 +1021,71 @@ def test_a_missing_queue_table_is_not_reported_as_a_missing_column() -> None:
     conn.cur.no_queue_table = True
     with pytest.raises(QueueTableNotFoundError, match="PGOPTIONS"):
         has_claim_token_column(conn)
+
+
+# --- the claimed_by migration guard (cryo D4) --------------------------------
+
+
+def _conn_without_claimed_by():
+    """A schema where ensure_claim_token_column() was never run."""
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "claimed_by" in sql:
+            raise psycopg2.errors.UndefinedColumn('column "claimed_by" does not exist')
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+    return conn
+
+
+def test_every_primitive_that_touches_claimed_by_names_the_remedy() -> None:
+    """All five reference claimed_by and the only protection is a convention.
+    A consumer who forgets gets UndefinedColumn out of the core of the queue,
+    naming a column they never wrote.
+
+    Asserted over all of them at once on purpose: a half-guard reads as safe and
+    is not. Guard four and the fifth still raises the raw error on the same
+    schema, which is worse than guarding none.
+    """
+    for label, call in (
+        ("claim", lambda c: claim(c, "triage", WORKER)),
+        ("complete", lambda c: complete(c, 5, WORKER)),
+        ("release", lambda c: release(c, 5, 60, WORKER)),
+        ("fail_or_retry", lambda c: fail_or_retry(c, 5, "boom", WORKER)),
+    ):
+        with pytest.raises(QueueError, match="ensure_claim_token_column") as excinfo:
+            call(_conn_without_claimed_by())
+        assert "search_path" in str(excinfo.value), label
+
+
+def test_an_unrelated_missing_column_is_not_relabelled() -> None:
+    """The guard must not claim every schema problem is this one -- a typo in a
+    caller's own SQL would be reported as a migration they have already run."""
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        raise psycopg2.errors.UndefinedColumn('column "widget" does not exist')
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    with pytest.raises(psycopg2.errors.UndefinedColumn):
+        complete(conn, 5, WORKER)
+
+
+def test_the_guard_still_rolls_the_connection_back() -> None:
+    """Relabelling the error must not skip the rollback -- a long-lived worker
+    would then fail every later job for a reason unrelated to this one."""
+    conn = _conn_without_claimed_by()
+    with pytest.raises(QueueError):
+        complete(conn, 5, WORKER)
+    conn.rollback.assert_called_once()
