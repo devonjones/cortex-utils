@@ -440,3 +440,41 @@ def test_resubmit_refuses_a_row_that_is_not_failed(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM queue")
         assert cur.fetchone()[0] == 1, "nothing was queued"
+
+
+def test_stuck_lists_the_worst_offenders_first(conn) -> None:
+    """With a LIMIT, the order decides which rows you can see at all. Reversed,
+    a queue with more stuck jobs than the limit shows the 50 *least* stuck and
+    hides every one worth looking at."""
+    today = _server_today(conn)
+    _partition(conn, today)
+    with conn.cursor() as cur:
+        for worker, hours in (("recent", 1), ("oldest", 9), ("middle", 5)):
+            cur.execute(
+                "INSERT INTO queue (queue_name, payload, status, claimed_by, claimed_at) "
+                "VALUES ('t', '{}'::jsonb, 'processing', %s, NOW() - (INTERVAL '1 hour' * %s))",
+                (worker, hours),
+            )
+    conn.commit()
+
+    assert [r.claimed_by for r in stuck(conn, visibility_timeout_min=30)] == [
+        "oldest",
+        "middle",
+        "recent",
+    ]
+
+
+def test_stuck_respects_its_limit(conn) -> None:
+    today = _server_today(conn)
+    _partition(conn, today)
+    with conn.cursor() as cur:
+        for i in range(5):
+            cur.execute(
+                "INSERT INTO queue (queue_name, payload, status, claimed_by, claimed_at) "
+                "VALUES ('t', '{}'::jsonb, 'processing', %s, NOW() - (INTERVAL '1 hour' * %s))",
+                (f"w{i}", i + 2),
+            )
+    conn.commit()
+
+    rows = stuck(conn, visibility_timeout_min=30, limit=2)
+    assert [r.claimed_by for r in rows] == ["w4", "w3"], "the limit must keep the worst"
