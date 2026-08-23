@@ -38,6 +38,7 @@ from cortex_utils.queue.ops import (
     fail_or_retry,
     has_claim_token_column,
     release,
+    server_today,
 )
 
 WORKER = "worker-a"
@@ -815,3 +816,11 @@ def test_conceding_a_partition_still_attempts_tomorrow() -> None:
     conn.cur.error = psycopg2.errors.DuplicateTable("exists")
     enqueue(conn, "triage", {"gmail_id": "abc"})
     assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
+
+
+def test_server_date_probe_closes_its_transaction() -> None:
+    """psycopg2 opens one even for a SELECT, and callers can finish without
+    ever reaching a write."""
+    conn = _conn(fetchone=(SERVER_TODAY,))
+    server_today(conn)
+    assert conn.commit.called or conn.rollback.called

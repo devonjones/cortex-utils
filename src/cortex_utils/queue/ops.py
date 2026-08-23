@@ -177,8 +177,13 @@ def server_today(conn: psycopg2.extensions.connection) -> date:
     in a possibly different timezone; it agrees only by coincidence, which means
     it tests green wherever client and server are both UTC and fails on the
     first deployment where they are not.
+
+    Goes through _tx like every other read here: psycopg2 opens a transaction
+    even for a SELECT, and callers such as create_future_partitions can finish
+    without ever reaching a write, which would leave the connection
+    idle-in-transaction on the steady-state path.
     """
-    with conn.cursor() as cur:
+    with _tx(conn) as cur:
         cur.execute("SELECT CURRENT_DATE")
         return cur.fetchone()[0]
 
