@@ -10,6 +10,8 @@ from typing import Any
 import psycopg2
 import structlog
 
+from cortex_utils.queue.ops import enqueue
+
 log = structlog.get_logger()
 
 # SQL to create dead_letter table
@@ -148,19 +150,12 @@ class DeadLetterManager:
             log.info("Would retry job", job_id=job_id, queue=job["queue_name"])
             return True
 
-        with self.conn.cursor() as cur:
-            # Re-enqueue to main queue
-            cur.execute(
-                """
-                INSERT INTO queue (queue_name, payload, status, attempts, created_at)
-                VALUES (%s, %s, 'pending', 0, NOW())
-                RETURNING id;
-            """,
-                (job["queue_name"], job["payload"]),
-            )
-            new_id = cur.fetchone()[0]
+        # commit=False so the re-enqueue and the dead_letter delete land in one
+        # transaction: committing separately would let a crash between them
+        # leave the job both queued and still in dead_letter.
+        new_id = enqueue(self.conn, job["queue_name"], job["payload"], commit=False)
 
-            # Remove from dead letter
+        with self.conn.cursor() as cur:
             cur.execute("DELETE FROM dead_letter WHERE id = %s;", (job_id,))
 
         self.conn.commit()
@@ -186,8 +181,20 @@ class DeadLetterManager:
         retried = 0
 
         for job in jobs:
-            if self.retry_job(job["id"], dry_run=dry_run):
-                retried += 1
+            # Per-job guard: without it one bad row aborts the shared connection
+            # and every remaining job in the batch fails for a reason that has
+            # nothing to do with it, losing the partial progress.
+            try:
+                if self.retry_job(job["id"], dry_run=dry_run):
+                    retried += 1
+            except psycopg2.Error as exc:
+                self.conn.rollback()
+                log.error(
+                    "Dead letter retry failed",
+                    dead_letter_id=job["id"],
+                    queue=job.get("queue_name"),
+                    error=str(exc),
+                )
 
         log.info("Retried dead letter jobs", count=retried, dry_run=dry_run)
         return retried
