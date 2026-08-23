@@ -21,6 +21,19 @@ Not on PyPI and not in Artifact Registry — a public GitHub repo installed by
 URL, so `pip install -r requirements.txt` needs no registry auth. Your image
 needs `git`.
 
+**Dependency weight, from cryo's integration.** Installing this for the queue
+alone pulls the whole package's base dependencies — `docker`, `schedule`,
+`prometheus-client`, `pydantic`, `httpx`, `pyyaml`, `click` — into the image.
+`src/cortex_utils/queue/` itself imports only `psycopg2` and `structlog`, plus
+stdlib. cryo's daemon went from four dependencies to roughly thirty by adding
+this line.
+
+That is not a blocker and cryo shipped it, but a `queue` extra with a lighter
+base would make the package cheaper for a consumer that wants one subsystem.
+Splitting it needs an audit of what the *other* modules genuinely require,
+which is yours to do — recording the observation and the evidence rather than
+guessing at the split from outside.
+
 **Pin a SHA, not a branch.** Existing consumers pin different SHAs on purpose,
 so each upgrades on its own cadence. `version` in `pyproject.toml` has said
 `0.1.0` since the repo began and is vestigial; the SHA is the only honest
