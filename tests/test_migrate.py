@@ -19,6 +19,8 @@ from datetime import date, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from cortex_utils.queue.migrate import (
     drop_old_queue_table,
     is_queue_partitioned,
@@ -40,6 +42,9 @@ class FakeCursor:
         self._next = None
         if "CURRENT_DATE" in sql:
             self._next = (SERVER_TODAY,)
+            return
+        if "to_regclass('queue_old')" in sql and "to_regclass('queue_old')" not in self.answers:
+            self._next = (1,)
             return
         for needle, value in self.answers.items():
             if needle in sql:
@@ -86,7 +91,7 @@ def test_partitioned_check_binds_the_parent_by_search_path() -> None:
 def test_queue_old_check_binds_by_search_path() -> None:
     """A schema-blind guard gating a DROP that resolves via search_path: the
     guard could answer about another schema's table and let the DROP through."""
-    conn = _conn()
+    conn = _conn({"COUNT(*)": (0,)})
     drop_old_queue_table(conn, dry_run=True)
     sql = _sql(conn, "queue_old")
     assert "to_regclass('queue_old')" in sql
@@ -143,3 +148,72 @@ def test_an_empty_queue_is_anchored_on_the_server_clock() -> None:
     assert any("CURRENT_DATE" in s for s, _ in conn.cur.executed), (
         "the anchor must be the server's date, not this process's"
     )
+
+
+def test_a_preview_does_not_drop_the_migration_rollback_path() -> None:
+    """queue_old is the migration's only way back. The guard above returns
+    early on a missing table, so nothing was executing this branch at all --
+    turning `if dry_run:` into a no-op silently destroys the rollback path."""
+    conn = _conn({"COUNT(*)": (12,)})
+    assert drop_old_queue_table(conn, dry_run=True) is True
+    assert not any("DROP TABLE" in s for s, _ in conn.cur.executed)
+    conn.commit.assert_not_called()
+
+
+def test_dropping_queue_old_for_real_commits() -> None:
+    conn = _conn()
+    assert drop_old_queue_table(conn, dry_run=False) is True
+    assert any("DROP TABLE queue_old" in s for s, _ in conn.cur.executed)
+    conn.commit.assert_called_once()
+
+
+def test_a_missing_queue_old_is_not_reported_as_dropped() -> None:
+    conn = _conn({"to_regclass('queue_old')": None})
+    assert drop_old_queue_table(conn) is False
+    assert not any("DROP TABLE" in s for s, _ in conn.cur.executed)
+
+
+def _real_run(answers: dict[str, Any]) -> Any:
+    """migrate_to_partitioned with dry_run=False. Nothing exercised this path."""
+    conn = _conn(answers)
+    import cortex_utils.queue.migrate as m
+
+    original = m.analyze_existing_queue
+    answers.setdefault("COUNT(*) FROM queue_new", (4,))  # the verification step
+    m.analyze_existing_queue = lambda c: {  # type: ignore[assignment]
+        "total_rows": 4,
+        "min_date": SERVER_TODAY,
+        "max_date": SERVER_TODAY,
+        "status_counts": {},
+    }
+    try:
+        m.migrate_to_partitioned(conn, days_ahead=1, dry_run=False)
+    finally:
+        m.analyze_existing_queue = original  # type: ignore[assignment]
+    return conn
+
+
+def test_the_sequence_is_reseeded_by_asking_the_table_which_one_it_uses() -> None:
+    """queue_new is BIGSERIAL, so it owns queue_new_id_seq -- and ALTER TABLE
+    ... RENAME TO does not rename an owned sequence. Naming queue_id_seq here
+    advanced the sequence now owned by queue_old while the live table kept
+    handing out ids from 1. Nothing raises: partitioning forces created_at into
+    the primary key, so the collisions are legal and the migration returns
+    success with id no longer unique -- which complete(), release() and
+    fail_or_retry() all rely on when they address a row by id.
+    """
+    conn = _real_run({"pg_get_serial_sequence": ("public.queue_new_id_seq",), "MAX(id)": (41,)})
+
+    setval = [(s, p) for s, p in conn.cur.executed if "setval" in s][0]
+    assert "pg_get_serial_sequence" in _sql(conn, "pg_get_serial_sequence")
+    assert setval[1] == ("public.queue_new_id_seq", 42), (
+        "must reseed the sequence the table reports, not a hardcoded name"
+    )
+    assert "queue_id_seq" not in setval[0], "the name must be bound, not interpolated"
+
+
+def test_a_table_with_no_owned_sequence_fails_loudly() -> None:
+    """Returning success with an unreseeded sequence is the silent version of
+    the same bug."""
+    with pytest.raises(RuntimeError, match="no owned sequence"):
+        _real_run({"pg_get_serial_sequence": (None,), "MAX(id)": (41,)})

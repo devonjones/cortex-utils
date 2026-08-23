@@ -243,9 +243,22 @@ def migrate_to_partitioned(
         )
 
         # 8. Reset sequence to continue from max id
+        #
+        # Ask the table which sequence it actually uses. queue_new was created
+        # with BIGSERIAL, so it owns queue_new_id_seq -- and ALTER TABLE ...
+        # RENAME TO does not rename an owned sequence. Naming queue_id_seq here
+        # advanced the sequence now owned by queue_old while the live table kept
+        # handing out ids from 1, colliding with every copied row. Legal, because
+        # partitioning forces created_at into the primary key, so nothing raised:
+        # the migration returned success and id stopped being unique. complete(),
+        # release() and fail_or_retry() all address rows by id.
+        cur.execute("SELECT pg_get_serial_sequence('queue', 'id');")
+        sequence = cur.fetchone()[0]
+        if sequence is None:
+            raise RuntimeError("queue.id has no owned sequence; refusing to leave ids unreseeded")
         cur.execute("SELECT MAX(id) FROM queue;")
         max_id = cur.fetchone()[0] or 0
-        cur.execute(f"SELECT setval('queue_id_seq', {max_id + 1}, false);")
+        cur.execute("SELECT setval(%s, %s, false);", (sequence, max_id + 1))
 
     conn.commit()
 

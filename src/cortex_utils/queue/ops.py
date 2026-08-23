@@ -504,6 +504,10 @@ def complete(conn: psycopg2.extensions.connection, job_id: int, worker: str) -> 
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s",
             (job_id, worker),
         )
+        # id alone, not the full (id, created_at) key: this is one statement, so
+        # there is no window to lose the claim in, and the shared sequence keeps
+        # id unique across partitions. fail_or_retry needs created_at because it
+        # reads first and writes second.
         held = cur.rowcount > 0
     if not held:
         log.warning("complete() bounced: claim no longer held", job_id=job_id, worker=worker)
@@ -532,6 +536,10 @@ def release(
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s",
             (delay_s, job_id, worker),
         )
+        # id alone, not the full (id, created_at) key: this is one statement, so
+        # there is no window to lose the claim in, and the shared sequence keeps
+        # id unique across partitions. fail_or_retry needs created_at because it
+        # reads first and writes second.
         held = cur.rowcount > 0
     if not held:
         log.warning("release() bounced: claim no longer held", job_id=job_id, worker=worker)

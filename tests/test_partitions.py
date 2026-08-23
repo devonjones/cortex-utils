@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from cortex_utils.queue.ops import QueueError
 from cortex_utils.queue.partitions import (
     PartitionError,
     PartitionManager,
@@ -220,6 +221,11 @@ def test_partition_errors_share_a_base() -> None:
     """Callers should be able to catch the category without an explicit tuple."""
     assert issubclass(QueueTableNotFoundError, PartitionError)
     assert issubclass(PartitionNotAttachedError, PartitionError)
+    # And one level further up, which is the level that actually matters to a
+    # consumer: enqueue() raises PartitionNotAttachedError, so a worker loop
+    # catching QueueError -- the documented way to catch queue failures -- must
+    # catch it. Pinning only the two leaves leaves this base free to revert.
+    assert issubclass(PartitionError, QueueError)
 
 
 def test_create_future_partitions_raises_the_first_failure() -> None:
@@ -307,3 +313,21 @@ def test_a_dry_run_drop_does_not_hold_the_partition_lock() -> None:
     assert not any("DROP TABLE" in sql for sql in executed), "a preview drops nothing"
     manager.conn.commit.assert_not_called()
     manager.conn.rollback.assert_called_once()
+
+
+def test_skipping_a_partition_with_active_jobs_releases_its_lock() -> None:
+    """The twin of the dry-run leak, and the worse one: it needs no --dry-run
+    flag, and the nightly `partitions maintain` cron is the caller. The comment
+    on the dry-run rollback claims this branch already does the right thing --
+    nothing was asserting that it does."""
+    manager, executed = _manager_capturing_sql(
+        rows=[(1,)],  # the partition exists
+        fetchall=[("pending", 3)],  # ...and still holds live work
+    )
+
+    result = manager.drop_partition(SERVER_TODAY - timedelta(days=30))
+
+    assert result["skipped_active"] == 3
+    assert not any("DROP TABLE" in sql for sql in executed), "live jobs must survive"
+    manager.conn.rollback.assert_called_once()
+    manager.conn.commit.assert_not_called()
