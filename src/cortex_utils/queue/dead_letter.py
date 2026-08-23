@@ -104,6 +104,13 @@ class DeadLetterManager:
         """
         missing = [c for c in LIFECYCLE_COLUMNS if not self._has_column(c)]
         if not missing:
+            if self._has_index("idx_dead_letter_open"):
+                # CREATE INDEX IF NOT EXISTS still takes a lock and waits on a
+                # writer even when the index is already there -- measured
+                # blocking for the full duration of an open transaction, and
+                # its queued ShareLock times out new inserts behind it. This is
+                # the path every boot takes, so it asks the catalogue instead.
+                return False
             with self.conn.cursor() as cur:
                 cur.execute(LIFECYCLE_INDEX)
             self.conn.commit()
@@ -140,6 +147,12 @@ class DeadLetterManager:
 
         log.info("Added dead_letter lifecycle columns", columns=missing)
         return True
+
+    def _has_index(self, name: str) -> bool:
+        """Bound through to_regclass, and cheap under a writer's lock."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s) IS NOT NULL", (name,))
+            return bool(cur.fetchone()[0])
 
     def _has_column(self, name: str) -> bool:
         """Bound through to_regclass so it answers about THIS schema's table."""
@@ -278,7 +291,10 @@ class DeadLetterManager:
         failed -- precisely the history you want when it dies again. Retrying
         twice is handled by enqueue()'s dedup, not by removing the record.
 
-        Returns True if the job was re-enqueued.
+        Returns True if the job was re-enqueued. A False can mean the row does
+        not exist, was already retried, or was dismissed -- `why_not_retryable`
+        gives the caller the difference, because telling an operator a row they
+        can see in the list does not exist is worse than saying nothing.
         """
         job = self.get_job(dead_letter_id)
         if not job:
@@ -335,6 +351,20 @@ class DeadLetterManager:
             queue=job["queue_name"],
         )
         return True
+
+    def why_not_retryable(self, dead_letter_id: int) -> str:
+        """Why retry_job() returned False. Empty string if it did not."""
+        job = self.get_job(dead_letter_id)
+        if not job:
+            return f"no dead letter job with id {dead_letter_id}"
+        if job["retried_at"]:
+            return (
+                f"already retried as queue job {job['retried_as']}; if that run "
+                "failed it archived a new dead letter row -- retry that one"
+            )
+        if job["dismissed_at"]:
+            return f"dismissed on {job['dismissed_at']}; it was written off deliberately"
+        return ""
 
     def dismiss(self, dead_letter_id: int) -> bool:
         """Write a job off: terminal, but not destructive.

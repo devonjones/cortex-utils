@@ -338,6 +338,9 @@ def dead_letter_show(ctx: click.Context, job_id: int) -> None:
 
     try:
         dlm = DeadLetterManager(conn)
+        # Every command that reads the lifecycle columns must migrate first:
+        # these two selected them on a table that might not have them yet.
+        dlm.ensure_table()
         job = dlm.get_job(job_id)
 
         if not job:
@@ -380,12 +383,18 @@ def dead_letter_retry(
 
     try:
         dlm = DeadLetterManager(conn)
+        # Every command that reads the lifecycle columns must migrate first:
+        # these two selected them on a table that might not have them yet.
+        dlm.ensure_table()
 
         if job_id:
             if dlm.retry_job(job_id, dry_run=dry_run):
                 click.echo(f"Retried job {job_id}")
             else:
-                click.echo(f"Job {job_id} not found")
+                # "not found" for a row the operator can see in the list, with
+                # exit 0, is worse than saying nothing.
+                click.echo(f"Did not retry job {job_id}: {dlm.why_not_retryable(job_id)}", err=True)
+                ctx.exit(1)
         else:
             count = dlm.retry_jobs(queue_name=queue_name, since=since_delta, dry_run=dry_run)
             click.echo(f"Retried {count} jobs")

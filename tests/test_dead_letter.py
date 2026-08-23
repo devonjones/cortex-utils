@@ -47,7 +47,8 @@ class FakeCursor:
             raise psycopg2.errors.UniqueViolation("boom")
 
     def fetchone(self) -> Any:
-        return self._fetchone
+        # Callable lets a test answer a sequence of probes differently.
+        return self._fetchone() if callable(self._fetchone) else self._fetchone
 
     def fetchall(self) -> Any:
         return []
@@ -294,13 +295,23 @@ def test_the_migration_probe_is_bound_to_this_schema() -> None:
     assert "relname" not in probe
 
 
-def test_an_already_migrated_table_is_not_altered() -> None:
-    """The index is still ensured -- it lives in the migration rather than the
-    create script, so a table that got its columns before the index existed
-    would otherwise never acquire it."""
+def test_a_fully_migrated_table_touches_nothing_on_boot() -> None:
+    """The path every boot takes. CREATE INDEX IF NOT EXISTS still takes a lock
+    and waits on an open writer even when the index already exists, and its
+    queued ShareLock times out inserts behind it -- so the steady state asks the
+    catalogue instead of issuing DDL."""
     mgr, conn = _manager(fetchone=(1,))
     assert mgr.ensure_lifecycle_columns() is False
     assert not [s for s, _ in conn.cur.executed if "ALTER TABLE" in s]
+    assert not [s for s, _ in conn.cur.executed if "CREATE INDEX" in s]
+
+
+def test_columns_present_but_index_missing_still_gets_the_index() -> None:
+    """A table migrated before the index existed must still acquire it."""
+    # Three column probes say present; the index probe returns a row saying False.
+    answers = [(1,), (1,), (1,), (False,)]
+    mgr, conn = _manager(fetchone=lambda: answers.pop(0) if answers else None)
+    assert mgr.ensure_lifecycle_columns() is False
     assert [s for s, _ in conn.cur.executed if "CREATE INDEX" in s]
 
 

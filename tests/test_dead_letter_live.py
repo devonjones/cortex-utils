@@ -305,3 +305,40 @@ def test_purge_is_by_age_regardless_of_state(conn) -> None:
     conn.commit()
 
     assert mgr.purge(timedelta(days=30)) == 2
+
+
+def test_show_and_retry_work_on_a_database_that_never_ran_the_migration(
+    legacy_conn,
+) -> None:
+    """The round-1 bug through a different door. This PR widened get_job() and
+    list_jobs() to select the lifecycle columns, but `dead-letter show` and
+    `dead-letter retry` reached them without calling ensure_table() -- so on a
+    legacy table they raised UndefinedColumn where the pre-PR versions worked.
+    """
+    with legacy_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+            "last_error, created_at, failed_at, archived_from_partition) "
+            "VALUES (1, 'triage', '{}'::jsonb, 3, 'boom', NOW(), NOW(), 'p') RETURNING id"
+        )
+        dl_id = cur.fetchone()[0]
+    legacy_conn.commit()
+
+    from click.testing import CliRunner
+
+    from cortex_utils.cli import main
+
+    dsn = os.environ["CORTEX_TEST_DSN"]
+    parts = dict(kv.split("=", 1) for kv in dsn.split())
+    env = {
+        "POSTGRES_HOST": parts["host"],
+        "POSTGRES_PORT": parts["port"],
+        "POSTGRES_USER": parts["user"],
+        "POSTGRES_PASSWORD": parts["password"],
+        "POSTGRES_DB": parts["dbname"],
+        "PGOPTIONS": "-c search_path=t_dl",
+    }
+    runner = CliRunner()
+    for args in (["dead-letter", "show", str(dl_id)], ["dead-letter", "retry", "--id", str(dl_id)]):
+        result = runner.invoke(main, args, env=env)
+        assert result.exit_code == 0, f"{args} -> {result.output}\n{result.exception}"
