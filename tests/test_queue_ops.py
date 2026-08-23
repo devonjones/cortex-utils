@@ -476,9 +476,9 @@ def test_dedup_predicate_is_scoped_to_queue_and_live_rows() -> None:
     enqueue(conn, "triage", {"gmail_id": "abc"}, dedup_key="gmail_id")
     where = [s for s, _ in conn.cur.executed if "NOT EXISTS" in s][0].split("NOT EXISTS")[1]
     assert "queue_name = %s" in where
-    assert (
-        "status IN ('pending', 'processing')" in where
-    ), "completed rows must not suppress a replay"
+    assert "status IN ('pending', 'processing')" in where, (
+        "completed rows must not suppress a replay"
+    )
 
 
 @pytest.mark.parametrize("dedup_key", [None, "gmail_id"])
