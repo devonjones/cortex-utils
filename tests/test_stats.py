@@ -111,8 +111,9 @@ def test_history_query_filters_at_all() -> None:
 
 
 def test_report_timestamp_comes_from_the_server() -> None:
-    """Every other timestamp in the document is server-produced; stamping it
-    with this process's clock would put two clocks in one report."""
+    """The history window this report describes is bounded by the server's NOW(),
+    so stamping the report itself with this process's clock would date it by a
+    different clock than the data it summarises."""
     conn = _conn()
     get_queue_stats(conn)
     assert any("SELECT NOW()" in s for s, _ in conn.cur.executed)
@@ -141,3 +142,13 @@ def test_a_queue_only_in_the_history_window_is_not_invented() -> None:
     conn.cur.status_rows = [("triage", "pending", 1)]
     conn.cur.history_rows = [("gone", "completed", 9)]
     assert set(get_queue_stats(conn)["queues"]) == {"triage"}
+
+
+def test_the_history_query_counts_both_outcomes() -> None:
+    """Dropping 'failed' from the status set pins failed_recent to zero forever
+    -- a throughput view that shows only successes, which is the shape of every
+    incident this module is read during."""
+    conn = _conn()
+    get_queue_stats(conn)
+    sql, _ = _sql_with(conn, "COALESCE(completed_at, created_at)")
+    assert "status IN ('completed', 'failed')" in sql

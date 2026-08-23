@@ -31,6 +31,7 @@ from cortex_utils.queue.ops import (
     PARTITION_LOCK_TIMEOUT_MS,
     PartitionNotAttachedError,
     QueueError,
+    _ensure_partition,
     _partition_name,
     claim,
     complete,
@@ -844,10 +845,10 @@ def test_server_date_probe_closes_its_transaction() -> None:
 
 
 def test_fail_or_retry_updates_by_the_whole_primary_key() -> None:
-    """`id` alone is not unique on a partitioned table -- the key is
-    (id, created_at), which is why claim() matches on both. Qualifying the
-    UPDATE on `id` alone would let a colliding id in another partition take the
-    write meant for this row."""
+    """(id, created_at) is the enforced key, and this function reads then writes:
+    the UPDATE must address the same row the SELECT ... FOR UPDATE locked, by the
+    key the table actually declares. complete() and release() are single
+    statements with no such window, which is why they address by id alone."""
     for fetchone, marker in ((2, "SET status = 'failed'"), (0, "SET status = 'pending'")):
         conn = _conn(fetchone=(fetchone, 3, ROW_CREATED_AT))
         fail_or_retry(conn, 7, "boom", WORKER)
@@ -911,3 +912,13 @@ def test_a_silently_skipped_create_for_tomorrow_does_not_fail_the_write() -> Non
     """Tomorrow is a favour; a shadowed name there must not take the write down."""
     conn = _conn_where_create_silently_skips(SERVER_TODAY + timedelta(days=1))
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+
+
+def test_ensure_partition_does_not_claim_to_have_created_what_was_there() -> None:
+    """CREATE TABLE IF NOT EXISTS succeeds whether or not it created anything,
+    so a 'created' outcome would be a guess. Tomorrow's partition usually
+    exists already, and the self-heal log is read to judge whether maintenance
+    is keeping up -- a wrong verb there is the thing being judged."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    assert _ensure_partition(conn, SERVER_TODAY, required=True) == "present"

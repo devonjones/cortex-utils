@@ -12,7 +12,7 @@ log = structlog.get_logger()
 def _server_now(conn: psycopg2.extensions.connection) -> datetime:
     """Wall clock from the server, so a reported timestamp matches the data.
 
-    Every other timestamp in these results is server-produced; stamping the
+    The history window's boundary is the server's NOW(); stamping the
     report with this process's clock would put two clocks in one document.
     """
     with conn.cursor() as cur:

@@ -228,7 +228,11 @@ def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool
 
 
 def _ensure_partition(conn: psycopg2.extensions.connection, target: date, required: bool) -> str:
-    """Make the partition for `target` exist. Returns created/present/absent.
+    """Make the partition for `target` exist. Returns present/absent.
+
+    Not created/present: CREATE TABLE IF NOT EXISTS succeeds either way, so
+    distinguishing them would cost a round trip to answer a question nobody
+    asks. The caller logs the outcome and branches on nothing.
 
     Neither failure mode proves anything on its own, so neither is interpreted:
     DuplicateTable can be a same-named relation that is not a partition of this
@@ -263,7 +267,7 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
                 raise PartitionNotAttachedError(
                     f"{name} exists but is not a partition of this queue"
                 )
-        return "created"
+        return "present"
     except PartitionNotAttachedError:
         if required:
             raise

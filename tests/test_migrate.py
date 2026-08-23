@@ -232,3 +232,43 @@ def test_the_source_table_is_frozen_before_it_is_read() -> None:
     lock = next(i for i, s in enumerate(statements) if "LOCK TABLE queue IN ACCESS EXCLUSIVE" in s)
     copy = next(i for i, s in enumerate(statements) if "INSERT INTO queue_new" in s)
     assert lock < copy, "the lock must precede the read it is protecting"
+
+
+def test_a_row_count_mismatch_aborts_before_the_rename() -> None:
+    """The last guard before an irreversible RENAME TO queue_old, and both
+    routes into the real migration pinned COUNT(*) equal to total_rows, so the
+    branch had never executed. 8754127 made this check able to see the rows it
+    loses; nothing asserted it fires."""
+    with pytest.raises(RuntimeError, match="Row count mismatch"):
+        _real_run(
+            {
+                "COUNT(*) FROM queue_new": (3,),  # one row short of total_rows=4
+                "pg_get_serial_sequence": ("public.queue_new_id_seq",),
+                "MAX(id)": (0,),
+            }
+        )
+
+
+def test_a_mismatch_never_reaches_the_rename() -> None:
+    conn = _conn({"COUNT(*) FROM queue_new": (3,)})
+    import cortex_utils.queue.migrate as m
+
+    original = m.analyze_existing_queue
+    m.analyze_existing_queue = lambda c: {  # type: ignore[assignment]
+        "total_rows": 4,
+        "min_date": SERVER_TODAY,
+        "max_date": SERVER_TODAY,
+        "status_counts": {},
+    }
+    try:
+        with pytest.raises(RuntimeError):
+            m.migrate_to_partitioned(conn, days_ahead=1, dry_run=False)
+    finally:
+        m.analyze_existing_queue = original  # type: ignore[assignment]
+
+    # Not asserting commit was never called: server_today() commits its own read
+    # before the migration starts, which is exactly the separate-transaction
+    # boundary the ACCESS EXCLUSIVE lock exists to compensate for. The property
+    # that matters is that the swap did not happen.
+    assert not any("RENAME TO" in s for s, _ in conn.cur.executed), "the swap must not happen"
+    assert not any("setval" in s for s, _ in conn.cur.executed)

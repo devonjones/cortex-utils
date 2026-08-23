@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from unittest.mock import MagicMock
 
+import psycopg2
 import pytest
 
 from cortex_utils.queue.ops import QueueError
@@ -399,3 +400,45 @@ def test_a_skipped_partition_is_not_counted_as_dropped() -> None:
     assert totals["partitions_skipped"] == 1
     assert totals["partitions_dropped"] == 1
     assert totals["rows_dropped"] == 5
+
+
+def test_a_concurrent_creator_does_not_abort_the_maintenance_run() -> None:
+    """IF NOT EXISTS narrows the window between the check and the CREATE but
+    does not close it -- the name check is not atomic with the creation. Two
+    maintenance jobs share this database, and an unhandled DuplicateTable would
+    abort the transaction and take the rest of maintain() down with it.
+    """
+    manager, executed = _manager_capturing_sql(rows=[None, (1,)])
+    raised = {"once": False}
+    plain = manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect
+
+    def execute(sql: str, *args: object) -> None:
+        plain(sql, *args)
+        if "CREATE TABLE" in sql and not raised["once"]:
+            raised["once"] = True
+            raise psycopg2.errors.DuplicateTable("beaten to it")
+
+    manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect = execute
+
+    assert manager.create_partition(date(2026, 8, 6)) is True
+    manager.conn.rollback.assert_called_once()
+    assert [sql for sql in executed if "pg_inherits" in sql], (
+        "losing the race is not proof the partition exists -- ask the catalogue"
+    )
+
+
+def test_a_shadowed_name_still_raises_when_the_create_is_lost() -> None:
+    """Same race, but the winner was not a partition of queue. Conceding on the
+    exception alone would report success for a day with no partition."""
+    manager, _ = _manager_capturing_sql(rows=[None, None])
+    plain = manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect
+
+    def execute(sql: str, *args: object) -> None:
+        plain(sql, *args)
+        if "CREATE TABLE" in sql:
+            raise psycopg2.errors.DuplicateTable("name taken")
+
+    manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect = execute
+
+    with pytest.raises(PartitionNotAttachedError):
+        manager.create_partition(date(2026, 8, 6))

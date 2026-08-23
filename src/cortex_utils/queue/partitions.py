@@ -102,7 +102,11 @@ class PartitionManager:
     def create_partition(self, partition_date: date, dry_run: bool = False) -> bool:
         """Create a partition for the given date.
 
-        Returns True if partition was created, False if it already exists.
+        Returns True if the partition was created or won by a concurrent
+        creator, False if it already existed when we looked.
+
+        Raises PartitionNotAttachedError if the name is taken by a relation that
+        is not a partition of queue.
         """
         partition_name = f"queue_{partition_date.strftime('%Y_%m_%d')}"
         next_date = partition_date + timedelta(days=1)
@@ -111,9 +115,12 @@ class PartitionManager:
             log.debug("Partition already exists", partition=partition_name)
             return False
 
-        # IF NOT EXISTS closes the window between the check above and this CREATE.
-        # Two maintenance jobs share this database, so a duplicate here would abort
-        # the transaction and take the rest of maintain() down with it.
+        # IF NOT EXISTS narrows the window between the check above and this CREATE
+        # but does not close it: the name check is not atomic with the creation, so
+        # a concurrent creator can still land DuplicateTable here. Two maintenance
+        # jobs share this database, and an unhandled duplicate would abort the
+        # transaction and take the rest of maintain() down with it, so the caller
+        # below catches it and re-asks the catalogue.
         sql = f"""
             CREATE TABLE IF NOT EXISTS {partition_name} PARTITION OF queue
             FOR VALUES FROM ('{partition_date}') TO ('{next_date}');
@@ -123,9 +130,16 @@ class PartitionManager:
             log.info("Would create partition", partition=partition_name, sql=sql)
             return True
 
-        with self.conn.cursor() as cur:
-            cur.execute(sql)
-        self.conn.commit()
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(sql)
+            self.conn.commit()
+        except psycopg2.errors.DuplicateTable:
+            # Someone created it between the check and the CREATE. That is a
+            # success for our purposes, but only the catalogue can say so -- the
+            # exception proves the name is taken, not that the partition exists.
+            # The post-check below does the asking, so fall through to it.
+            self.conn.rollback()
 
         # IF NOT EXISTS skips on ANY relation of that name, not just a partition of
         # queue -- migrate.py builds queue_YYYY_MM_DD tables under queue_new, so a
@@ -152,18 +166,26 @@ class PartitionManager:
     ) -> dict[str, int]:
         """Drop a partition safely.
 
-        Before dropping:
-        1. Re-enqueue any pending/processing jobs (they shouldn't be dropped)
-        2. Archive failed jobs to dead_letter
-        3. Only drop if partition contains only completed/cancelled jobs
+        Default behaviour (force=False): a partition still holding pending or
+        processing jobs is left alone and reported as skipped. Failed jobs are
+        archived to dead_letter first, then the partition is dropped.
+
+        With force=True the live jobs are re-enqueued with a fresh created_at --
+        so they land in today's partition, not the one being dropped -- and the
+        drop proceeds.
+
+        With archive_failed=False the failed rows go with the partition. Nothing
+        else preserves them; this is not a soft delete.
 
         Args:
             partition_date: Date of partition to drop
             archive_failed: Archive failed jobs to dead_letter before dropping
-            force: Force drop even if pending/processing jobs exist
+            force: Re-enqueue live jobs and drop anyway, instead of skipping
             dry_run: Show what would be done without making changes
 
-        Returns dict with counts: archived_failed, requeued, dropped_rows
+        Returns dict with counts: archived_failed, requeued, dropped_rows -- plus
+        skipped_active when the partition was kept back, which is the key
+        drop_old_partitions branches on to tell a skip from a drop.
         """
         partition_name = f"queue_{partition_date.strftime('%Y_%m_%d')}"
 
