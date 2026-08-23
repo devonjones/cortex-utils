@@ -17,6 +17,40 @@ Ordered by what blocks cryo's adoption.
 
 ---
 
+## Where consumer-side queue SQL IS legitimate
+
+The rule has one real exemption, and it is worth stating so this list is not
+read as "no consumer may ever write SQL naming `queue`":
+
+**Joining the queue against a consumer's own application tables.** A library
+cannot own that query — it does not know the other table exists. If a consumer
+needs "queued work for accounts in state X" or "failures whose payload points at
+a row that has since been deleted", that join belongs to the consumer, and it
+will legitimately name `queue` in its own SQL.
+
+The distinction is *what the query is about*:
+
+- **about the queue itself** — counts, failures, readiness, requeue, partition
+  health, schema shape. Belongs in the library. If a consumer writes it, the
+  library has a gap. That is everything in G1–G5.
+- **about the consumer's domain, with the queue as one input** — a join against
+  tables the library has never heard of. Belongs to the consumer, always.
+
+**This exemption does not currently apply to cryo at all.** cryo has no other
+tables: its store is a git repository, and the queue is the only postgres it
+owns (`docs/SCHEMA.md` — "no database, git IS the history layer"). Queue
+payloads are pointers *into* git, not foreign keys. So cryo has zero legitimate
+joins today, which is why the target for cryo really is **zero** queue SQL, and
+why every item below is evidence of a gap rather than a judgement call.
+
+It plausibly *does* apply to cortex, which has real application tables
+(`emails_raw_response` and friends) that a queue row might reasonably be joined
+against. Worth keeping in mind when deciding how far the shared read API should
+go: G2–G4 should cover queue-shaped questions completely, and stop there rather
+than growing toward a general query builder.
+
+---
+
 ## G1 — The DDL is not shared (P1)
 
 **cryo has its own `migrate()` and its own `CREATE TABLE queue ... PARTITION BY
