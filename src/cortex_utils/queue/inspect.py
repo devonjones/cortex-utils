@@ -129,6 +129,25 @@ class Failure:
     last_error: str | None
     created_at: datetime
 
+    def ref(self, dedup_key: str | None) -> str | None:
+        """The value that IDENTIFIES this work, without the rest of the payload.
+
+        A failure list needs to say WHICH item failed, and consumers reach for
+        `payload` to get it — which hands the whole payload to whatever renders
+        the list. That is often more than the surface should hold: cryo's drain
+        payloads carry URLs captured from browser tabs, including from private
+        sessions, and its failure list renders inside a privileged browser
+        extension page.
+
+        Offering the identifying value directly makes the minimal thing the
+        easy thing. Consumers that genuinely need the payload still have it;
+        those that only need a label no longer have to remember to strip it.
+        """
+        if not dedup_key:
+            return None
+        value = (self.payload or {}).get(dedup_key)
+        return str(value) if value is not None else None
+
 
 _HEALTH_SQL = """
 WITH depth AS (
