@@ -352,5 +352,19 @@ def resubmit(
             # rather than leaving the work queued twice.
             raise QueueError(f"resubmit could not cancel job {job_id}; rolled back")
 
-    log.info("Resubmitted failed job", original=job_id, new=new_id, queue=queue_name)
+    # Say which of the two things happened. new_id is None when the enqueue
+    # deduped against work that is already live again -- a correct and common
+    # outcome, but "Resubmitted failed job ... new=None" reads as a resubmit
+    # that produced nothing, which is the one line an operator would grep for
+    # while working out why a requeue seemed to vanish.
+    if new_id is None:
+        log.info(
+            "Resubmit deduped: work already queued",
+            original=job_id,
+            queue=queue_name,
+        )
+    else:
+        log.info(
+            "Resubmitted failed job", original=job_id, new=new_id, queue=queue_name
+        )
     return new_id
