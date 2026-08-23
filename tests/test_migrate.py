@@ -217,3 +217,18 @@ def test_a_table_with_no_owned_sequence_fails_loudly() -> None:
     the same bug."""
     with pytest.raises(RuntimeError, match="no owned sequence"):
         _real_run({"pg_get_serial_sequence": (None,), "MAX(id)": (41,)})
+
+
+def test_the_source_table_is_frozen_before_it_is_read() -> None:
+    """total_rows is read in an earlier transaction and nothing locked queue
+    until the RENAME, so a row committed after the copy's snapshot was copied
+    nowhere, counted in neither side of the verification, and stranded in
+    queue_old -- with success returned. The mirror ordering IS caught, so the
+    check fired on the harmless case and stayed silent on the lossy one.
+    """
+    conn = _real_run({"pg_get_serial_sequence": ("public.queue_new_id_seq",), "MAX(id)": (0,)})
+
+    statements = [s for s, _ in conn.cur.executed]
+    lock = next(i for i, s in enumerate(statements) if "LOCK TABLE queue IN ACCESS EXCLUSIVE" in s)
+    copy = next(i for i, s in enumerate(statements) if "INSERT INTO queue_new" in s)
+    assert lock < copy, "the lock must precede the read it is protecting"

@@ -19,6 +19,14 @@ from cortex_utils.queue.stats import get_queue_stats, get_stale_jobs
 
 
 class FakeCursor:
+    status_rows: list[Any] = [
+        ("triage", "pending", 7),
+        ("triage", "processing", 2),
+        ("triage", "completed", 500),
+        ("triage", "failed", 11),
+    ]
+    history_rows: list[Any] = [("triage", "completed", 40), ("triage", "failed", 400)]
+
     def __init__(self) -> None:
         self.executed: list[tuple[str, Any]] = []
 
@@ -26,6 +34,14 @@ class FakeCursor:
         self.executed.append((sql, params))
 
     def fetchall(self) -> list[Any]:
+        # Keyed by which query asked, so the two aggregation loops in
+        # get_queue_stats actually run. Returning [] for everything made both
+        # loops zero-iteration and left the row-to-field mapping unasserted.
+        sql = self.executed[-1][0]
+        if "COALESCE(completed_at, created_at)" in sql:
+            return list(self.history_rows)
+        if "GROUP BY queue_name, status" in sql:
+            return list(self.status_rows)
         return []
 
     def fetchone(self) -> Any:
@@ -100,3 +116,28 @@ def test_report_timestamp_comes_from_the_server() -> None:
     conn = _conn()
     get_queue_stats(conn)
     assert any("SELECT NOW()" in s for s, _ in conn.cur.executed)
+
+
+def test_each_status_lands_in_its_own_field() -> None:
+    """Both aggregation loops ran zero iterations before, so nothing pinned the
+    row-to-field mapping. Swapping completed_recent and failed_recent makes
+    format_stats_table (cli.py) print 400 failures as 400 done."""
+    conn = _conn()
+    triage = get_queue_stats(conn)["queues"]["triage"]
+    assert triage == {
+        "pending": 7,
+        "processing": 2,
+        "completed_total": 500,
+        "failed_total": 11,
+        "completed_recent": 40,
+        "failed_recent": 400,
+    }
+
+
+def test_a_queue_only_in_the_history_window_is_not_invented() -> None:
+    """The history loop must not create a queue the status query never saw --
+    it would appear with no pending/processing counts at all."""
+    conn = _conn()
+    conn.cur.status_rows = [("triage", "pending", 1)]
+    conn.cur.history_rows = [("gone", "completed", 9)]
+    assert set(get_queue_stats(conn)["queues"]) == {"triage"}

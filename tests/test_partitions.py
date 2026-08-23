@@ -331,3 +331,71 @@ def test_skipping_a_partition_with_active_jobs_releases_its_lock() -> None:
     assert not any("DROP TABLE" in sql for sql in executed), "live jobs must survive"
     manager.conn.rollback.assert_called_once()
     manager.conn.commit.assert_not_called()
+
+
+def test_failed_jobs_are_archived_before_the_partition_is_dropped() -> None:
+    """The whole reason retention is allowed to DROP: failed jobs move to
+    dead_letter first. Nothing was executing this body -- round 4 pinned the two
+    branches that exit *before* it. Disabling the archive leaves the DROP in
+    place and every failed job in that partition permanently gone, on the
+    nightly `partitions maintain` cron, with nothing raised.
+    """
+    manager, executed = _manager_capturing_sql(
+        rows=[(1,)],  # the partition exists
+        fetchall=[("failed", 4), ("completed", 9)],
+    )
+
+    result = manager.drop_partition(SERVER_TODAY - timedelta(days=30))
+
+    archive = [sql for sql in executed if "INSERT INTO dead_letter" in sql]
+    assert archive, "failed jobs must be archived before the drop"
+    drop_at = next(i for i, sql in enumerate(executed) if "DROP TABLE" in sql)
+    assert executed.index(archive[0]) < drop_at, "archive must precede the drop"
+    assert "WHERE status = 'failed'" in archive[0]
+    assert result["dropped_rows"] == 13
+
+
+def test_archiving_can_be_turned_off_but_then_nothing_is_archived() -> None:
+    manager, executed = _manager_capturing_sql(rows=[(1,)], fetchall=[("failed", 4)])
+    manager.drop_partition(SERVER_TODAY - timedelta(days=30), archive_failed=False)
+    assert not [sql for sql in executed if "INSERT INTO dead_letter" in sql]
+
+
+def test_forcing_a_drop_reenqueues_live_jobs_before_dropping() -> None:
+    """force=True is the only way live work survives a drop -- it is re-enqueued
+    with a fresh created_at so it lands in today's partition."""
+    manager, executed = _manager_capturing_sql(
+        rows=[(1,)], fetchall=[("pending", 2), ("processing", 1)]
+    )
+
+    result = manager.drop_partition(SERVER_TODAY - timedelta(days=30), force=True)
+
+    requeue = [sql for sql in executed if "INSERT INTO queue" in sql]
+    assert requeue, "live jobs must be re-enqueued, not dropped"
+    assert "WHERE status IN ('pending', 'processing')" in requeue[0]
+    assert "NOW()" in requeue[0], "fresh created_at, or it lands back in this partition"
+    assert executed.index(requeue[0]) < next(
+        i for i, sql in enumerate(executed) if "DROP TABLE" in sql
+    )
+    assert "skipped_active" not in result
+
+
+def test_a_skipped_partition_is_not_counted_as_dropped() -> None:
+    """The wedged-queue signal: a partition kept back because it still holds
+    live work must show up as skipped, not folded into the dropped count."""
+    manager, _ = _manager_capturing_sql()
+    manager.list_partitions = lambda: [  # type: ignore[method-assign]
+        {"name": _name(SERVER_TODAY - timedelta(days=d)), "size": "0", "size_bytes": 0}
+        for d in (10, 9)
+    ]
+    manager.drop_partition = lambda d, **kw: (  # type: ignore[method-assign]
+        {"skipped_active": 3, "dropped_rows": 0, "archived_failed": 0}
+        if d == SERVER_TODAY - timedelta(days=10)
+        else {"dropped_rows": 5, "archived_failed": 1}
+    )
+
+    totals = manager.drop_old_partitions(retention_days=7)
+
+    assert totals["partitions_skipped"] == 1
+    assert totals["partitions_dropped"] == 1
+    assert totals["rows_dropped"] == 5

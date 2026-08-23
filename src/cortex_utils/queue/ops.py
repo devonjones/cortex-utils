@@ -308,7 +308,7 @@ def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> No
             )
     finally:
         log.warning(
-            "Partitions ensured from the write path",
+            "Partition self-heal ran from the write path",
             outcomes=outcomes,
             hint="partition maintenance is not keeping up",
         )

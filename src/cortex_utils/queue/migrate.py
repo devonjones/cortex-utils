@@ -157,6 +157,15 @@ def migrate_to_partitioned(
     log.info("Starting migration to partitioned queue")
 
     with conn.cursor() as cur:
+        # 0. Freeze the source. analyze_existing_queue's total_rows is read in an
+        # earlier transaction, and nothing locks queue until the RENAME below, so
+        # a row committed after the copy's snapshot is copied nowhere, counted in
+        # neither side of the verification, and stranded in queue_old -- while the
+        # migration returns success. The mirror ordering is caught, so the check
+        # fires on the harmless case and stays silent on the lossy one.
+        log.info("Locking queue for the duration of the migration")
+        cur.execute("LOCK TABLE queue IN ACCESS EXCLUSIVE MODE;")
+
         # 1. Create partitioned table
         log.info("Creating partitioned table queue_new")
         cur.execute(PARTITIONED_QUEUE_SCHEMA)
