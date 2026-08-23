@@ -545,7 +545,8 @@ def claim(
             SET status = 'processing', claimed_at = NOW(), claimed_by = %(w)s
             FROM claimable c
             WHERE q.id = c.id AND q.created_at = c.created_at
-            RETURNING q.id, q.queue_name, q.payload, q.attempts, q.priority
+            RETURNING q.id, q.queue_name, q.payload, q.attempts, q.priority,
+                      q.created_at
             """,
             {"q": queue_name, "vis": visibility_timeout_min, "lim": limit, "w": worker},
         )
@@ -556,6 +557,14 @@ def claim(
                 "payload": r[2],
                 "attempts": r[3],
                 "priority": r[4],
+                # Free: partitioning forces created_at into the primary key, so
+                # the CTE already joins on it and the row is already in hand.
+                # Without it a consumer that needs the age of the work -- to
+                # route it, to report it, to decide it is too old to bother
+                # with -- must issue a second query per claimed row. cryo does
+                # exactly that today (_row_created_at), which is an N+1 the
+                # library can retire for every consumer at no cost.
+                "created_at": r[5],
             }
             for r in cur.fetchall()
         ]
