@@ -14,6 +14,7 @@ covering it against a real server.
 from __future__ import annotations
 
 from datetime import date, timedelta
+from typing import Any
 from unittest.mock import MagicMock
 
 import psycopg2
@@ -442,3 +443,74 @@ def test_a_shadowed_name_still_raises_when_the_create_is_lost() -> None:
 
     with pytest.raises(PartitionNotAttachedError):
         manager.create_partition(date(2026, 8, 6))
+
+
+def test_maintain_forwards_dry_run_to_both_halves() -> None:
+    """The cron entrypoint, and it had no tests: every mutation in it survived,
+    including flipping this flag on the drop half -- which makes
+    `partitions maintain --dry-run` drop partitions for real. Silent and
+    irreversible, in the one function the nightly job actually calls.
+    """
+    manager, _ = _manager_capturing_sql()
+    seen: dict[str, bool] = {}
+    manager.create_future_partitions = (  # type: ignore[method-assign]
+        lambda days_ahead, dry_run: seen.__setitem__("create", dry_run) or 0
+    )
+    manager.drop_old_partitions = lambda **kw: (  # type: ignore[method-assign]
+        seen.__setitem__("drop", kw["dry_run"]) or {"partitions_dropped": 0}
+    )
+
+    result = manager.maintain(dry_run=True)
+
+    assert seen == {"create": True, "drop": True}, "a preview must preview both halves"
+    assert result["dry_run"] is True, "and must say so, or the log reads as a real run"
+
+
+def test_maintain_creates_before_it_drops() -> None:
+    """Drop-then-create leaves a window with no partition for today: the write
+    path self-heals, but only after an insert has already failed."""
+    manager, _ = _manager_capturing_sql()
+    order: list[str] = []
+    manager.create_future_partitions = lambda **kw: order.append("create") or 2  # type: ignore[method-assign]
+    manager.drop_old_partitions = lambda **kw: order.append("drop") or {}  # type: ignore[method-assign]
+
+    manager.maintain()
+
+    assert order == ["create", "drop"]
+
+
+def test_maintain_reports_both_halves_and_its_own_mode() -> None:
+    """The cron's only output. Losing a key here makes a run that dropped
+    nothing indistinguishable from one that dropped everything."""
+    manager, _ = _manager_capturing_sql()
+    manager.create_future_partitions = lambda **kw: 3  # type: ignore[method-assign]
+    manager.drop_old_partitions = lambda **kw: {  # type: ignore[method-assign]
+        "partitions_dropped": 2,
+        "partitions_skipped": 1,
+        "rows_dropped": 40,
+    }
+
+    result = manager.maintain(retention_days=7, days_ahead=3)
+
+    assert result == {
+        "partitions_created": 3,
+        "partitions_dropped": 2,
+        "partitions_skipped": 1,
+        "rows_dropped": 40,
+        "dry_run": False,
+    }
+
+
+def test_maintain_passes_its_windows_through() -> None:
+    """retention_days and days_ahead swapped would retire three days of live
+    partitions and create a week of empty ones."""
+    manager, _ = _manager_capturing_sql()
+    got: dict[str, Any] = {}
+    manager.create_future_partitions = lambda **kw: got.update(create=kw) or 0  # type: ignore[method-assign]
+    manager.drop_old_partitions = lambda **kw: got.update(drop=kw) or {}  # type: ignore[method-assign]
+
+    manager.maintain(retention_days=14, days_ahead=5)
+
+    assert got["create"]["days_ahead"] == 5
+    assert got["drop"]["retention_days"] == 14
+    assert got["drop"]["archive_failed"] is True, "the cron must not drop failed jobs unarchived"
