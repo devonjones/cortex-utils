@@ -35,6 +35,7 @@ from cortex_utils.queue.ops import (
     QueueTableNotFoundError,
     _ensure_partition,
     _partition_name,
+    _reraise_missing_migration,
     claim,
     complete,
     enqueue,
@@ -1067,12 +1068,12 @@ def _conn_without_claimed_by():
 
 
 def test_every_primitive_that_touches_claimed_by_names_the_remedy() -> None:
-    """All five reference claimed_by and the only protection is a convention.
+    """All four reference claimed_by and the only protection is a convention.
     A consumer who forgets gets UndefinedColumn out of the core of the queue,
     naming a column they never wrote.
 
     Asserted over all of them at once on purpose: a half-guard reads as safe and
-    is not. Guard four and the fifth still raises the raw error on the same
+    is not. Guard three and the fourth still raises the raw error on the same
     schema, which is worse than guarding none.
     """
     for label, call in (
@@ -1155,3 +1156,38 @@ def test_a_passed_through_error_keeps_its_original_context() -> None:
     with pytest.raises(psycopg2.errors.UndefinedColumn) as excinfo:
         complete(conn, 5, WORKER)
     assert excinfo.value.__cause__ is not excinfo.value
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        'column "claimed_by" does not exist',
+        # A qualified reference drops the quotes entirely.
+        "column q.claimed_by does not exist",
+        # And a translated server brings its own: de emits these.
+        "Spalte »claimed_by« existiert nicht",
+    ],
+)
+def test_the_guard_recognises_every_shape_postgres_actually_emits(primary: str) -> None:
+    """Matching the quoted form missed two of these. The first was verified
+    against postgres:16; the third is why quoting is not dependable at all."""
+    exc = psycopg2.errors.UndefinedColumn(primary)
+
+    class _Diag:
+        message_primary = primary
+
+    exc.__class__ = type("_U", (psycopg2.errors.UndefinedColumn,), {"diag": _Diag()})
+    with pytest.raises(QueueError, match="ensure_claim_token_column"):
+        _reraise_missing_migration(exc)
+
+
+def test_a_differently_named_column_is_not_mistaken_for_ours() -> None:
+    """Word boundaries, not a substring: `_` is a word character, so a genuinely
+    missing claimed_by_anything is somebody else's problem."""
+    primary = 'column "claimed_by_at" does not exist'
+
+    class _Diag:
+        message_primary = primary
+
+    exc = type("_U", (psycopg2.errors.UndefinedColumn,), {"diag": _Diag()})(primary)
+    assert _reraise_missing_migration(exc) is None, "must fall through to a plain re-raise"
