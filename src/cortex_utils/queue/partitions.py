@@ -19,21 +19,21 @@ from typing import Any
 import psycopg2
 import structlog
 
-from cortex_utils.queue.ops import server_today
+from cortex_utils.queue.ops import (
+    PartitionError,
+    PartitionNotAttachedError,
+    QueueTableNotFoundError,
+    server_today,
+)
+
+__all__ = [
+    "PartitionError",
+    "PartitionManager",
+    "PartitionNotAttachedError",
+    "QueueTableNotFoundError",
+]
 
 log = structlog.get_logger()
-
-
-class PartitionError(RuntimeError):
-    """Base for partition-management failures, so callers can catch the category."""
-
-
-class QueueTableNotFoundError(PartitionError):
-    """No queue table is visible on the connection's search_path."""
-
-
-class PartitionNotAttachedError(PartitionError):
-    """A relation of the partition's name exists but is not a partition of queue."""
 
 
 class PartitionManager:
@@ -276,6 +276,13 @@ class PartitionManager:
                     partition=partition_name,
                     rows=row_count,
                 )
+                # Release the SHARE ROW EXCLUSIVE taken above. Without this a
+                # preview accumulates one lock per expired partition and holds
+                # them for the rest of the connection -- and claim()'s stale
+                # reset and retirement UPDATEs are not date-qualified, so a
+                # dry run would block the claim path pipeline-wide. The
+                # skipped-active branch above rolls back for the same reason.
+                self.conn.rollback()
             else:
                 cur.execute(f"DROP TABLE {partition_name};")
                 self.conn.commit()

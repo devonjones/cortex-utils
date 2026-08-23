@@ -178,3 +178,22 @@ def test_purge_scoped_to_one_queue_keeps_the_window() -> None:
     sql, params = [(s, p) for s, p in conn.cur.executed if "DELETE FROM dead_letter" in s][0]
     assert "failed_at <" in sql and "queue_name = %s" in sql
     assert params == [30 * 24 * 3600, "triage"]
+
+
+def test_list_jobs_since_window_is_seconds_on_the_server_clock() -> None:
+    """Not merely a reporting path: `dead-letter retry --since` selects through
+    here with limit=10000, so a one-word 'second'->'hour' widening re-enqueues
+    3600x the intended window rather than just mis-reporting it.
+    """
+    mgr, conn = _manager()
+    mgr.list_jobs(since=timedelta(hours=2))
+    sql, params = [(s, p) for s, p in conn.cur.executed if "FROM dead_letter" in s][0]
+    assert "failed_at > NOW() - (INTERVAL '1 second' * %s)" in sql
+    assert params[0] == 2 * 3600
+
+
+def test_list_jobs_without_a_window_has_no_age_predicate() -> None:
+    mgr, conn = _manager()
+    mgr.list_jobs()
+    sql, _ = [(s, p) for s, p in conn.cur.executed if "FROM dead_letter" in s][0]
+    assert "failed_at >" not in sql and "WHERE" not in sql

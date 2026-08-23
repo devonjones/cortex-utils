@@ -86,9 +86,8 @@ def is_queue_partitioned(conn: psycopg2.extensions.connection) -> bool:
         cur.execute(
             """
             SELECT pt.partstrat
-            FROM pg_class c
-            JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
-            WHERE c.relname = 'queue';
+            FROM pg_partitioned_table pt
+            WHERE pt.partrelid = to_regclass('queue');
         """
         )
         return cur.fetchone() is not None
@@ -124,18 +123,24 @@ def migrate_to_partitioned(
         status_counts=analysis["status_counts"],
     )
 
+    today = server_today(conn)
+
     if analysis["total_rows"] == 0:
         log.warning("Queue table is empty")
         # Still proceed - create structure with future partitions
-        today = server_today(conn)
         analysis["min_date"] = today
         analysis["max_date"] = today
+
+    # Anchor the window on today, not on the newest existing row. A quiet queue
+    # whose last insert predates the migration would otherwise get a range that
+    # ends before go-live: every partition created, none covering NOW(), and the
+    # migration reporting success.
+    end_date = max(analysis["max_date"], today) + timedelta(days=days_ahead)
 
     if dry_run:
         # Calculate partitions that would be created
         partitions = []
         current = analysis["min_date"]
-        end_date = analysis["max_date"] + timedelta(days=days_ahead)
         while current <= end_date:
             partitions.append(f"queue_{current.strftime('%Y_%m_%d')}")
             current += timedelta(days=1)
@@ -158,7 +163,6 @@ def migrate_to_partitioned(
 
         # 2. Create partitions for date range
         current = analysis["min_date"]
-        end_date = analysis["max_date"] + timedelta(days=days_ahead)
         partition_count = 0
 
         while current <= end_date:
@@ -267,7 +271,7 @@ def drop_old_queue_table(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT 1 FROM pg_class WHERE relname = 'queue_old';
+            SELECT 1 WHERE to_regclass('queue_old') IS NOT NULL;
         """
         )
         if not cur.fetchone():

@@ -17,7 +17,7 @@ argued in review and not covered here; ops.py has no live-server coverage today.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -29,6 +29,7 @@ from cortex_utils.queue.ops import (
     DEFAULT_VISIBILITY_TIMEOUT_MIN,
     MIGRATION_LOCK_TIMEOUT_MS,
     PARTITION_LOCK_TIMEOUT_MS,
+    PartitionNotAttachedError,
     QueueError,
     _partition_name,
     claim,
@@ -47,6 +48,9 @@ WORKER = "worker-a"
 # The date the fake server reports. Deliberately not date.today(): a test that
 # used the client clock could not tell the two apart, which is the bug.
 SERVER_TODAY = date(2026, 3, 1)
+# A row's created_at, deliberately not SERVER_TODAY: partitioned rows outlive
+# the day they were made, and the UPDATE must carry the row's own value.
+ROW_CREATED_AT = datetime(2026, 2, 27, 9, 30, tzinfo=UTC)
 
 
 class FakeCursor:
@@ -188,7 +192,7 @@ def test_reports_match_the_claim_token(call, needle: str) -> None:
 
 def test_fail_or_retry_matches_the_claim_token() -> None:
     """The report that actually spends the budget must be token-matched too."""
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     sql, params = conn.cur.executed[0]
     assert "SELECT attempts" in sql
@@ -230,7 +234,7 @@ def test_release_defers_and_clears_the_token_without_charging() -> None:
 
 
 def test_fail_or_retry_charges_an_attempt_and_backs_off() -> None:
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     assert fail_or_retry(conn, 7, "boom", WORKER) == "pending"
     params = _params_of(conn, "SET status = 'pending'")
     assert params[0] == 1, "attempts must go 0 -> 1"
@@ -240,14 +244,14 @@ def test_fail_or_retry_charges_an_attempt_and_backs_off() -> None:
 
 
 def test_fail_or_retry_retires_on_the_last_attempt() -> None:
-    conn = _conn(fetchone=(2, 3))
+    conn = _conn(fetchone=(2, 3, ROW_CREATED_AT))
     assert fail_or_retry(conn, 7, "boom", WORKER) == "failed"
     params = _params_of(conn, "SET status = 'failed'")
-    assert params == (3, "boom", 7)
+    assert params == (3, "boom", 7, ROW_CREATED_AT)
 
 
 def test_fail_or_retry_truncates_a_huge_error() -> None:
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "x" * 9000, WORKER)
     assert len(_params_of(conn, "SET status = 'pending'")[1]) == 2000
 
@@ -445,7 +449,7 @@ def test_every_operation_commits(call) -> None:
 
 
 def test_fail_or_retry_commits_its_report() -> None:
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     conn.commit.assert_called()
 
@@ -524,9 +528,9 @@ def test_release_defers_forward_not_backward() -> None:
 
 def test_backoff_grows_with_attempts() -> None:
     """Asserting non-zero allowed a constant; the point is that it backs off."""
-    first = _conn(fetchone=(0, 9))
+    first = _conn(fetchone=(0, 9, ROW_CREATED_AT))
     fail_or_retry(first, 7, "boom", WORKER)
-    later = _conn(fetchone=(5, 9))
+    later = _conn(fetchone=(5, 9, ROW_CREATED_AT))
     fail_or_retry(later, 7, "boom", WORKER)
     assert (
         _params_of(later, "SET status = 'pending'")[2]
@@ -604,7 +608,7 @@ def test_migration_lock_timeout_is_transaction_scoped() -> None:
 
 
 def test_terminal_failure_clears_the_retry_schedule() -> None:
-    conn = _conn(fetchone=(2, 3))
+    conn = _conn(fetchone=(2, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     assert (
         "next_attempt_at = NULL"
@@ -718,7 +722,7 @@ def test_claim_uses_the_documented_default_visibility_timeout() -> None:
 def test_fail_or_retry_defers_forward_in_seconds() -> None:
     """Backwards, a failing job is instantly re-claimable and burns its whole
     attempt budget in seconds during an outage -- the 2026-08-18 shape."""
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     sql = [s for s, _ in conn.cur.executed if "SET status = 'pending'" in s][0]
     assert "clock_timestamp() + (INTERVAL '1 second' * %s)" in sql
@@ -837,3 +841,73 @@ def test_server_date_probe_closes_its_transaction() -> None:
     conn = _conn(fetchone=(SERVER_TODAY,))
     server_today(conn)
     assert conn.commit.called or conn.rollback.called
+
+
+def test_fail_or_retry_updates_by_the_whole_primary_key() -> None:
+    """`id` alone is not unique on a partitioned table -- the key is
+    (id, created_at), which is why claim() matches on both. Qualifying the
+    UPDATE on `id` alone would let a colliding id in another partition take the
+    write meant for this row."""
+    for fetchone, marker in ((2, "SET status = 'failed'"), (0, "SET status = 'pending'")):
+        conn = _conn(fetchone=(fetchone, 3, ROW_CREATED_AT))
+        fail_or_retry(conn, 7, "boom", WORKER)
+        sql = [s for s, _ in conn.cur.executed if marker in s][0]
+        assert "WHERE id = %s AND created_at = %s" in sql, marker
+        assert _params_of(conn, marker)[-1] == ROW_CREATED_AT
+
+    # And the value must come from the locked row, not from a fresh clock.
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
+    fail_or_retry(conn, 7, "boom", WORKER)
+    select = [s for s, _ in conn.cur.executed if "FOR UPDATE" in s][0]
+    assert "created_at" in select, "must read the row's own created_at"
+
+
+def _conn_where_create_silently_skips(shadowed: date = SERVER_TODAY) -> Any:
+    """A connection where CREATE TABLE IF NOT EXISTS returns cleanly but the
+    name belongs to a relation that is not a partition of this queue."""
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+    state = {"insert_failed": False}
+    shadow_name = _partition_name(shadowed)
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        # Only the shadowed date answers "not attached"; every other partition
+        # is healthy, so the test isolates one date at a time. Reset on every
+        # other statement so the probe's answer cannot leak into the retry
+        # INSERT's RETURNING and read as a dedup hit.
+        if "pg_inherits" in sql:
+            cur._fetchone = None if params == (shadow_name,) else (99,)
+        else:
+            cur._fetchone = (99,)
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+    return conn
+
+
+def test_a_create_that_silently_skipped_is_not_reported_as_created() -> None:
+    """CREATE TABLE IF NOT EXISTS ... PARTITION OF raises nothing when the name
+    is already a non-partition relation -- it emits a NOTICE and skips. So the
+    statement returning cleanly is not evidence the partition exists, and
+    migrate.py creates exactly those shadow names (queue_YYYY_MM_DD as
+    partitions of queue_new). Without the post-check the retry INSERT fails
+    again, explaining nothing.
+    """
+    conn = _conn_where_create_silently_skips()
+    with pytest.raises(PartitionNotAttachedError):
+        enqueue(conn, "triage", {"gmail_id": "abc"})
+    probes = [s for s, _ in conn.cur.executed if "pg_inherits" in s]
+    assert probes, "success must be confirmed, not assumed"
+    assert "to_regclass('queue')" in probes[0]
+
+
+def test_a_silently_skipped_create_for_tomorrow_does_not_fail_the_write() -> None:
+    """Tomorrow is a favour; a shadowed name there must not take the write down."""
+    conn = _conn_where_create_silently_skips(SERVER_TODAY + timedelta(days=1))
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99

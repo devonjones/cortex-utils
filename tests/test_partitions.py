@@ -48,6 +48,10 @@ def _is_meta(sql: str) -> bool:
     )
 
 
+def _name(day: date) -> str:
+    return f"queue_{day.strftime('%Y_%m_%d')}"
+
+
 def _manager_capturing_sql(
     rows: list[Row | None] | None = None,
     parent: Row = PARENT_OK,
@@ -287,5 +291,19 @@ def test_retention_drops_only_partitions_older_than_the_window() -> None:
     assert SERVER_TODAY not in dropped, "today must never be dropped"
 
 
-def _name(day: date) -> str:
-    return f"queue_{day.strftime('%Y_%m_%d')}"
+def test_a_dry_run_drop_does_not_hold_the_partition_lock() -> None:
+    """drop_partition takes SHARE ROW EXCLUSIVE before counting. On the real
+    path the DROP commits and releases it; a preview reaches no commit, so
+    without an explicit rollback drop_old_partitions accumulates one lock per
+    expired partition and holds them for the rest of the connection. claim()'s
+    stale-reset and retirement UPDATEs are not date-qualified, so a *preview*
+    would block the claim path pipeline-wide.
+    """
+    manager, executed = _manager_capturing_sql(rows=[(1,)])  # the partition exists
+
+    manager.drop_partition(SERVER_TODAY - timedelta(days=30), dry_run=True)
+
+    assert any("LOCK TABLE" in sql for sql in executed), "the lock is what needs releasing"
+    assert not any("DROP TABLE" in sql for sql in executed), "a preview drops nothing"
+    manager.conn.commit.assert_not_called()
+    manager.conn.rollback.assert_called_once()

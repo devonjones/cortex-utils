@@ -91,6 +91,18 @@ class QueueError(RuntimeError):
     """Base for queue operation failures."""
 
 
+class PartitionError(QueueError):
+    """Base for partition-management failures, so callers can catch the category."""
+
+
+class QueueTableNotFoundError(PartitionError):
+    """No queue table is visible on the connection's search_path."""
+
+
+class PartitionNotAttachedError(PartitionError):
+    """A relation of the partition's name exists but is not a partition of queue."""
+
+
 @contextmanager
 def _tx(
     conn: psycopg2.extensions.connection, commit: bool = True
@@ -182,10 +194,26 @@ def server_today(conn: psycopg2.extensions.connection) -> date:
     even for a SELECT, and callers such as create_future_partitions can finish
     without ever reaching a write, which would leave the connection
     idle-in-transaction on the steady-state path.
+
+    Invariant this rests on: every connection operating a given queue uses the
+    same session TimeZone. CURRENT_DATE and the FROM/TO bounds on a TIMESTAMPTZ
+    column are both TimeZone-dependent, so two connections disagreeing puts the
+    boundary rows of each day in the wrong partition. PGOPTIONS is already the
+    schema-selection knob here (`-c search_path=cryo`) and carries `-c timezone=`
+    too, so this is one env var away from being violated. The create path fails
+    loudly if it happens; drop_old_partitions compares a name-derived date
+    against a differently-framed cutoff and would drop silently.
     """
     with _tx(conn) as cur:
         cur.execute("SELECT CURRENT_DATE")
         return cur.fetchone()[0]
+
+
+_ATTACHED_SQL = """
+    SELECT 1 FROM pg_class c
+    JOIN pg_inherits i ON c.oid = i.inhrelid
+    WHERE i.inhparent = to_regclass('queue') AND c.relname = %s
+"""
 
 
 def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool:
@@ -195,14 +223,7 @@ def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool
     resolves, not a same-named table in another schema.
     """
     with _tx(conn) as cur:
-        cur.execute(
-            """
-            SELECT 1 FROM pg_class c
-            JOIN pg_inherits i ON c.oid = i.inhrelid
-            WHERE i.inhparent = to_regclass('queue') AND c.relname = %s
-            """,
-            (name,),
-        )
+        cur.execute(_ATTACHED_SQL, (name,))
         return cur.fetchone() is not None
 
 
@@ -215,6 +236,13 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
     parent rather than another creator -- ensure_claim_token_column's lock
     timeout is longer than this one, so it can outlast us. Ask the catalogue
     instead of guessing.
+
+    Success is not interpreted either. CREATE TABLE IF NOT EXISTS raises nothing
+    when the name is already taken by a relation that is not a partition of this
+    queue -- it emits a NOTICE and skips -- so the statement returning cleanly is
+    not evidence the partition exists. migrate.py creates exactly those shadow
+    names (queue_YYYY_MM_DD as partitions of queue_new), and partitions.py guards
+    the identical statement the same way.
 
     `required` marks the partition the caller actually needs. A speculative one
     must never fail the caller's write: its whole purpose is to save a later
@@ -230,7 +258,17 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
                 FOR VALUES FROM ('{target}') TO ('{target + timedelta(days=1)}')
                 """
             )
+            cur.execute(_ATTACHED_SQL, (name,))
+            if cur.fetchone() is None:
+                raise PartitionNotAttachedError(
+                    f"{name} exists but is not a partition of this queue"
+                )
         return "created"
+    except PartitionNotAttachedError:
+        if required:
+            raise
+        log.warning("Partition name is taken by something else", partition=name)
+        return "absent"
     except (psycopg2.errors.DuplicateTable, psycopg2.errors.LockNotAvailable):
         if _partition_attached(conn, name):
             return "present"
@@ -526,7 +564,7 @@ def fail_or_retry(
     truncated = str(error)[:ERROR_MAX_CHARS]
     with _tx(conn) as cur:
         cur.execute(
-            "SELECT attempts, max_attempts FROM queue "
+            "SELECT attempts, max_attempts, created_at FROM queue "
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s FOR UPDATE",
             (job_id, worker),
         )
@@ -541,13 +579,14 @@ def fail_or_retry(
 
         attempts = (row[0] or 0) + 1
         max_attempts = row[1]
+        created_at = row[2]
 
         if attempts >= max_attempts:
             cur.execute(
                 "UPDATE queue SET status = 'failed', attempts = %s, last_error = %s, "
                 "claimed_at = NULL, claimed_by = NULL, next_attempt_at = NULL "
-                "WHERE id = %s",
-                (attempts, truncated, job_id),
+                "WHERE id = %s AND created_at = %s",
+                (attempts, truncated, job_id, created_at),
             )
             log.error(
                 "Job retired after exhausting attempts",
@@ -567,8 +606,8 @@ def fail_or_retry(
             "UPDATE queue SET status = 'pending', attempts = %s, last_error = %s, "
             "claimed_at = NULL, claimed_by = NULL, "
             "next_attempt_at = clock_timestamp() + (INTERVAL '1 second' * %s) "
-            "WHERE id = %s",
-            (attempts, truncated, delay, job_id),
+            "WHERE id = %s AND created_at = %s",
+            (attempts, truncated, delay, job_id, created_at),
         )
         log.warning(
             "Job failed, scheduled for retry",
