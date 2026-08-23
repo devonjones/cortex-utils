@@ -9,6 +9,7 @@ refactor.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -135,3 +136,34 @@ def test_a_non_database_error_is_not_swallowed() -> None:
     mgr.retry_job = broken  # type: ignore[method-assign]
     with pytest.raises(ValueError):
         mgr.retry_jobs()
+
+
+# --- clock discipline -------------------------------------------------------
+
+
+def test_list_window_is_measured_on_the_server() -> None:
+    """failed_at is a server TIMESTAMPTZ; a naive local cutoff is a second
+    clock in a possibly different timezone."""
+    mgr, conn = _manager(fetchone=None)
+    mgr.list_jobs(since=timedelta(hours=2))
+    sql, params = [(s, p) for s, p in conn.cur.executed if "failed_at" in s][0]
+    assert "NOW() - (INTERVAL '1 second' * %s)" in sql
+    assert 7200.0 in params
+
+
+def test_purge_window_is_measured_on_the_server() -> None:
+    """This one drives a DELETE with no undo: a local clock running ahead of
+    the server purges rows still inside the operator's retention window."""
+    mgr, conn = _manager(fetchone=(0,))
+    mgr.purge(older_than=timedelta(days=30), dry_run=True)
+    sql, params = [(s, p) for s, p in conn.cur.executed if "failed_at" in s][0]
+    assert "NOW() - (INTERVAL '1 second' * %s)" in sql
+    assert 2592000.0 in params
+
+
+def test_purge_looks_backwards() -> None:
+    """A flipped comparison purges everything newer than the window instead."""
+    mgr, conn = _manager(fetchone=(0,))
+    mgr.purge(older_than=timedelta(days=30), dry_run=True)
+    sql = [s for s, _ in conn.cur.executed if "failed_at" in s][0]
+    assert "failed_at < NOW() -" in sql
