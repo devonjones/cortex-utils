@@ -1,0 +1,287 @@
+"""Reading the queue, and acting on what you find.
+
+Every question here was asked during a real incident and answered with
+hand-written SQL, which is the definition of a gap in this library.
+
+Three properties hold throughout, and each exists because losing it cost
+somebody an outage:
+
+**Read-only, and independent of the workers.** These touch postgres and nothing
+else. A queue dashboard that needs the pipeline alive dies alongside the thing
+it is supposed to report -- cryo ran fourteen hours blind on 2026-08-18 for
+exactly that reason, because its only failure channel was a digest the workers
+produced. Nothing here may grow a dependency on a worker, a scheduler, or a
+message bus.
+
+**One round trip for the overview.** health() answers six of the eight questions
+in a single statement. A card that needs five queries will either be slow or be
+written wrong.
+
+**Cheap enough to poll.** Counts over a partitioned table with a status index,
+and catalogue reads. Nothing that scans history.
+
+Everything binds the queue through to_regclass('queue') under the active
+search_path. A bare relname lookup reports healthy off a *different* schema's
+rows, which is the defect that cost cortex 4.8 days of email and cryo two days
+of silently dropped enqueues.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+import psycopg2
+import structlog
+
+from cortex_utils.queue.ops import SELF_HEALED_MARKER, QueueError, _tx, enqueue
+
+log = structlog.get_logger()
+
+DEFAULT_FAILURE_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class QueueDepth:
+    """One queue's shape right now.
+
+    `ready` and `deferred` are reported apart on purpose. Collapsing them into
+    "pending" is actively misleading: six rows all backing off for another hour
+    read as a working queue with a backlog, when they are a queue in retry
+    storm. `oldest_ready_age_s` separates "four things arrived this minute" from
+    "four things have been stuck since Tuesday", which need different responses.
+    """
+
+    queue_name: str
+    ready: int
+    deferred: int
+    processing: int
+    failed: int
+    oldest_ready_age_s: float | None
+
+
+@dataclass(frozen=True)
+class QueueHealth:
+    """Everything a dashboard needs, from one statement."""
+
+    depths: list[QueueDepth]
+    dead_letter: int
+    partition_headroom_days: int | None
+    self_healed_partitions: int
+    server_time: datetime
+
+    @property
+    def is_healthy(self) -> bool:
+        """A cheap top-level assertion for a monitor to alert on."""
+        return (
+            self.partition_headroom_days is not None
+            and self.partition_headroom_days >= 1
+            and self.self_healed_partitions == 0
+        )
+
+
+@dataclass(frozen=True)
+class StuckJob:
+    """Claimed, and older than the visibility window.
+
+    `claimed_by` is the point: it separates "a worker is chewing on this" from
+    "a worker died holding it and the row is waiting out its timeout".
+    """
+
+    id: int
+    queue_name: str
+    claimed_by: str | None
+    claimed_at: datetime
+    stuck_for_s: float
+    attempts: int
+
+
+@dataclass(frozen=True)
+class Failure:
+    """A failed row, with its error text intact.
+
+    last_error is never summarised or truncated here. All fourteen rows cryo
+    lost on 2026-08-18 read `visibility timeout, attempts exhausted`, and it was
+    that uniformity -- visible only in the raw text -- that proved the cause was
+    infrastructure rather than fourteen unrelated content failures.
+    """
+
+    id: int
+    queue_name: str
+    payload: dict[str, Any]
+    attempts: int
+    max_attempts: int
+    last_error: str | None
+    created_at: datetime
+
+
+_HEALTH_SQL = """
+WITH depth AS (
+    SELECT
+        queue_name,
+        COUNT(*) FILTER (
+            WHERE status = 'pending'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+        ) AS ready,
+        COUNT(*) FILTER (
+            WHERE status = 'pending' AND next_attempt_at > NOW()
+        ) AS deferred,
+        COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+        COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+        EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (
+            WHERE status = 'pending'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+        ))) AS oldest_ready_age_s
+    FROM queue
+    GROUP BY queue_name
+),
+partitions AS (
+    SELECT
+        MAX((regexp_match(
+            pg_get_expr(c.relpartbound, c.oid), $re$TO \\('([^']+)'\\)$re$
+        ))[1]::timestamptz::date) - CURRENT_DATE AS headroom_days,
+        COUNT(*) FILTER (
+            WHERE obj_description(c.oid, 'pg_class') = %(marker)s
+        ) AS self_healed
+    FROM pg_class c
+    JOIN pg_inherits i ON c.oid = i.inhrelid
+    WHERE i.inhparent = to_regclass('queue')
+)
+SELECT
+    COALESCE(
+        (SELECT json_agg(row_to_json(depth) ORDER BY queue_name) FROM depth),
+        '[]'::json
+    ),
+    (SELECT COUNT(*) FROM dead_letter),
+    (SELECT headroom_days FROM partitions),
+    (SELECT self_healed FROM partitions),
+    NOW()
+"""
+
+
+def health(conn: psycopg2.extensions.connection) -> QueueHealth:
+    """The whole overview in one round trip.
+
+    Answers: what is in the queue, what is ready versus merely deferred, how far
+    behind the oldest ready work is, how much has been given up on, how many
+    days before enqueues start failing, and whether the write path has been
+    self-healing partitions because maintenance stopped.
+    """
+    with _tx(conn) as cur:
+        cur.execute(_HEALTH_SQL, {"marker": SELF_HEALED_MARKER})
+        depths, dead_letter, headroom, self_healed, now = cur.fetchone()
+
+    return QueueHealth(
+        depths=[
+            QueueDepth(
+                queue_name=d["queue_name"],
+                ready=d["ready"],
+                deferred=d["deferred"],
+                processing=d["processing"],
+                failed=d["failed"],
+                oldest_ready_age_s=d["oldest_ready_age_s"],
+            )
+            for d in depths
+        ],
+        dead_letter=dead_letter,
+        partition_headroom_days=headroom,
+        self_healed_partitions=self_healed,
+        server_time=now,
+    )
+
+
+def stuck(
+    conn: psycopg2.extensions.connection,
+    visibility_timeout_min: int = 30,
+    limit: int = DEFAULT_FAILURE_LIMIT,
+) -> list[StuckJob]:
+    """Rows claimed longer ago than the visibility window.
+
+    The window is measured server-side: claimed_at is a server timestamp, so a
+    locally-computed cutoff would be a second clock disagreeing with it.
+    """
+    with _tx(conn) as cur:
+        cur.execute(
+            """
+            SELECT id, queue_name, claimed_by, claimed_at,
+                   EXTRACT(EPOCH FROM (NOW() - claimed_at)) AS stuck_for_s,
+                   attempts
+            FROM queue
+            WHERE status = 'processing'
+              AND claimed_at < NOW() - (INTERVAL '1 minute' * %s)
+            ORDER BY claimed_at
+            LIMIT %s
+            """,
+            (visibility_timeout_min, limit),
+        )
+        return [StuckJob(*row) for row in cur.fetchall()]
+
+
+def failures(
+    conn: psycopg2.extensions.connection,
+    limit: int = DEFAULT_FAILURE_LIMIT,
+    queue_name: str | None = None,
+) -> list[Failure]:
+    """Failed rows, newest first, with last_error intact."""
+    with _tx(conn) as cur:
+        cur.execute(
+            """
+            SELECT id, queue_name, payload, attempts, max_attempts,
+                   last_error, created_at
+            FROM queue
+            WHERE status = 'failed'
+              AND (%s::text IS NULL OR queue_name = %s)
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (queue_name, queue_name, limit),
+        )
+        return [Failure(*row) for row in cur.fetchall()]
+
+
+def resubmit(
+    conn: psycopg2.extensions.connection,
+    job_id: int,
+    dedup_key: str | None = None,
+) -> int | None:
+    """Re-queue a failed job as a new row. Returns the new id, or None if deduped.
+
+    Deliberately not a status flip back to 'pending'. The obvious implementation
+    is wrong: created_at is unchanged, so a revived row stays in an old
+    partition, and retention drops partitions on age rather than status -- the
+    row would be on a clock nobody intended, and could vanish mid-flight.
+
+    Instead the payload is enqueued fresh, landing in today's partition, and the
+    original is marked cancelled rather than deleted. A failure list whose
+    entries disappear when someone retries them defeats the purpose; the record
+    of what happened is the point.
+
+    Both halves commit together, so a crash cannot leave the work re-queued and
+    the original still showing failed.
+    """
+    with _tx(conn) as cur:
+        cur.execute(
+            "SELECT queue_name, payload, priority FROM queue "
+            "WHERE id = %s AND status = 'failed' FOR UPDATE",
+            (job_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise QueueError(f"job {job_id} is not a failed row")
+        queue_name, payload, priority = row
+
+        # commit=False: the cancel below must land with it or not at all.
+        new_id = enqueue(
+            conn, queue_name, payload, priority=priority, dedup_key=dedup_key, commit=False
+        )
+
+        cur.execute(
+            "UPDATE queue SET status = 'cancelled', "
+            "last_error = COALESCE(last_error, '') || %s "
+            "WHERE id = %s",
+            (f" [resubmitted as {new_id}]" if new_id else " [resubmit deduped]", job_id),
+        )
+
+    log.info("Resubmitted failed job", original=job_id, new=new_id, queue=queue_name)
+    return new_id

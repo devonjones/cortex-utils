@@ -77,6 +77,12 @@ MIGRATION_LOCK_TIMEOUT_MS = 5000
 # is almost certainly creating this very partition.
 PARTITION_LOCK_TIMEOUT_MS = 2000
 
+# Stamped on partitions the write path had to create. A non-zero count means
+# scheduled maintenance is not running -- a countable signal rather than a log
+# line, because a log line is the channel that already failed to surface a
+# two-day outage. Recorded on the object itself so Postgres holds the fact.
+SELF_HEALED_MARKER = "created by enqueue self-heal"
+
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Values whose Python str() matches Postgres's jsonb ->> text output. bool gives
@@ -267,6 +273,11 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
                 raise PartitionNotAttachedError(
                     f"{name} exists but is not a partition of this queue"
                 )
+            # Marks it as made by the write path rather than by maintenance, so
+            # health() can count self-heals without a side table. Set after the
+            # attachment check: commenting on a shadow relation would attribute
+            # the marker to something that is not our partition.
+            cur.execute(f"COMMENT ON TABLE {name} IS %s", (SELF_HEALED_MARKER,))
         return "present"
     except PartitionNotAttachedError:
         if required:

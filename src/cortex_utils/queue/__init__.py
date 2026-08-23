@@ -5,6 +5,16 @@ from cortex_utils.queue.add_retry_columns import (
     has_next_attempt_at_column,
 )
 from cortex_utils.queue.dead_letter import DeadLetterManager
+from cortex_utils.queue.inspect import (
+    Failure,
+    QueueDepth,
+    QueueHealth,
+    StuckJob,
+    failures,
+    health,
+    resubmit,
+    stuck,
+)
 from cortex_utils.queue.migrate import is_queue_partitioned, migrate_to_partitioned
 from cortex_utils.queue.ops import (
     QueueError,
@@ -40,6 +50,14 @@ __all__ = [
     "has_claim_token_column",
     "fail_or_retry",
     "QueueError",
+    "health",
+    "failures",
+    "stuck",
+    "resubmit",
+    "QueueHealth",
+    "QueueDepth",
+    "StuckJob",
+    "Failure",
     "PartitionManager",
     "PartitionError",
     "PartitionNotAttachedError",
