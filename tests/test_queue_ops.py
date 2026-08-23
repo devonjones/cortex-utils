@@ -563,19 +563,29 @@ def test_partition_creation_is_lock_bounded() -> None:
     timeouts = [p for s, p in conn.cur.executed if "lock_timeout" in s]
     assert len(timeouts) == len(ddl), "every write-path DDL must be lock-bounded"
     assert all(t[0] == f"{PARTITION_LOCK_TIMEOUT_MS}ms" for t in timeouts)
+    # A bare SET leaks the bound into the whole session rather than the statement.
+    assert all("SET LOCAL lock_timeout" in s for s, _ in conn.cur.executed if "lock_timeout" in s)
     assert PARTITION_LOCK_TIMEOUT_MS < MIGRATION_LOCK_TIMEOUT_MS, (
         "the live producer path must give up sooner than the deploy path"
     )
 
 
-def test_losing_the_partition_lock_is_not_fatal() -> None:
-    """Whoever holds it is almost certainly creating this very partition, so
-    conceding is success: the retry finds it there."""
+def test_losing_the_partition_lock_consults_the_catalogue() -> None:
+    """Losing a lock race is evidence of contention, not of creation.
+
+    The holder can be ensure_claim_token_column's ALTER -- whose timeout is
+    longer than this path's, so it outlasts us -- or drop_partition's DROP.
+    Conceding without asking would report success for a partition nobody made.
+    """
     conn = _conn_failing_first_insert(_missing_partition())
     conn.cur.raise_on = "CREATE TABLE"
     conn.cur.error = psycopg2.errors.LockNotAvailable("timeout")
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
     assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
+    probes = [s for s, _ in conn.cur.executed if "pg_inherits" in s]
+    assert probes, "must ask the catalogue rather than infer from the exception"
+    assert "to_regclass('queue')" in probes[0], "and ask about THIS schema's queue"
+    assert "relname = 'queue'" not in probes[0], "the two-schema outage shape"
 
 
 def test_migration_precheck_looks_for_the_right_column() -> None:
@@ -816,6 +826,9 @@ def test_conceding_a_partition_still_attempts_tomorrow() -> None:
     conn.cur.error = psycopg2.errors.DuplicateTable("exists")
     enqueue(conn, "triage", {"gmail_id": "abc"})
     assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
+    assert [s for s, _ in conn.cur.executed if "pg_inherits" in s], (
+        "a concession must be confirmed, not assumed"
+    )
 
 
 def test_server_date_probe_closes_its_transaction() -> None:

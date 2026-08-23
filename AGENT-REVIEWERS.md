@@ -1713,6 +1713,11 @@ because the caller then proceeds on a false belief.
 
 1. Find `except` clauses that set a state variable, return a status, or log
    success, rather than re-raising or handling a genuine error.
+1b. And find statements whose own result is discarded before success is
+   reported -- a DELETE or UPDATE whose `rowcount` is never read, an INSERT
+   whose RETURNING is ignored. This is the same defect without an exception to
+   notice: the database said how many rows it touched and the code did not
+   listen. Grepping for `except` alone misses it, which is how it survived here.
 2. For each, ask what the exception actually proves, and whether the code's next
    action assumes more than that.
 3. If more: can the truth be obtained with a cheap query on the open connection?

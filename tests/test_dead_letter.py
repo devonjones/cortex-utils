@@ -135,3 +135,13 @@ def test_a_non_database_error_is_not_swallowed() -> None:
     mgr.retry_job = broken  # type: ignore[method-assign]
     with pytest.raises(ValueError):
         mgr.retry_jobs()
+
+
+def test_a_row_that_vanished_mid_retry_is_not_reported_as_retried() -> None:
+    """A concurrent retry or purge can take it while we work. Claiming success
+    would also leave the re-enqueue above as a duplicate."""
+    mgr, conn = _manager()
+    conn.cur.rowcount = 0
+    assert mgr.retry_job(5) is False
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()

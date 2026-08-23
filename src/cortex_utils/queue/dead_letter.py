@@ -160,6 +160,14 @@ class DeadLetterManager:
 
         with self.conn.cursor() as cur:
             cur.execute("DELETE FROM dead_letter WHERE id = %s;", (job_id,))
+            if cur.rowcount == 0:
+                # The row went while we were working -- a concurrent retry, or
+                # purge(). Reporting success would claim we moved something
+                # nobody else can see we moved, and the re-enqueue above would
+                # be a duplicate. Ask the database rather than assume.
+                self.conn.rollback()
+                log.warning("Dead letter row vanished mid-retry", dead_letter_id=job_id)
+                return False
 
         self.conn.commit()
         log.info(

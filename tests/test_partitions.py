@@ -13,7 +13,7 @@ covering it against a real server.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -261,3 +261,31 @@ def test_retention_cutoff_uses_the_server_clock() -> None:
     assert any("SELECT CURRENT_DATE" in sql for sql in executed), (
         "the retention cutoff must come from the server, not this process"
     )
+
+
+def test_retention_drops_only_partitions_older_than_the_window() -> None:
+    """Asserting the clock source alone left the arithmetic free: a sign flip or
+    an off-by-N still drops live partitions, silently and irreversibly.
+
+    SERVER_TODAY is 2026-03-01, so a 7-day window retains 02-23 onward and
+    retires anything older.
+    """
+    parts = [
+        {"name": _name(SERVER_TODAY - timedelta(days=d)), "size": "0", "size_bytes": 0}
+        for d in (10, 8, 7, 6, 0)
+    ]
+    manager, _ = _manager_capturing_sql()
+    manager.list_partitions = lambda: parts  # type: ignore[method-assign]
+    dropped: list[date] = []
+    manager.drop_partition = (  # type: ignore[method-assign]
+        lambda d, **kw: dropped.append(d) or {"dropped_rows": 0, "archived_failed": 0}
+    )
+
+    manager.drop_old_partitions(retention_days=7)
+
+    assert dropped == [SERVER_TODAY - timedelta(days=10), SERVER_TODAY - timedelta(days=8)]
+    assert SERVER_TODAY not in dropped, "today must never be dropped"
+
+
+def _name(day: date) -> str:
+    return f"queue_{day.strftime('%Y_%m_%d')}"
