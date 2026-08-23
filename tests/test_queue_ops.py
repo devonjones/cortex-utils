@@ -658,3 +658,41 @@ def test_fail_or_retry_defers_forward_in_seconds() -> None:
     fail_or_retry(conn, 7, "boom", WORKER)
     sql = [s for s, _ in conn.cur.executed if "SET status = 'pending'" in s][0]
     assert "clock_timestamp() + (INTERVAL '1 second' * %s)" in sql
+
+
+# --- transaction composition ------------------------------------------------
+
+
+def test_composed_enqueue_leaves_the_transaction_to_the_caller() -> None:
+    """Two real callers need this: approving a proposal and queueing its apply
+    job, and moving a row out of dead_letter while re-queueing it. Committing
+    separately would let a crash leave the two halves disagreeing."""
+    conn = _conn(fetchone=(42,))
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}, commit=False) == 42
+    conn.commit.assert_not_called()
+    conn.rollback.assert_not_called()
+
+
+def test_composed_enqueue_does_not_roll_back_the_callers_work() -> None:
+    """Rolling back here would discard whatever the caller already did."""
+    conn = _conn(fetchone=(42,))
+    conn.cur.raise_on = "INSERT INTO queue"
+    conn.cur.error = psycopg2.OperationalError("boom")
+    with pytest.raises(psycopg2.OperationalError):
+        enqueue(conn, "triage", {"gmail_id": "abc"}, commit=False)
+    conn.rollback.assert_not_called()
+
+
+def test_composed_enqueue_gives_up_the_partition_self_heal() -> None:
+    """Creating a partition has to commit, which would commit the caller's
+    pending work behind their back. The violation propagates instead."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    with pytest.raises(psycopg2.errors.CheckViolation):
+        enqueue(conn, "triage", {"gmail_id": "abc"}, commit=False)
+    assert "CREATE TABLE" not in "\n".join(s for s, _ in conn.cur.executed)
+
+
+def test_default_enqueue_still_commits_and_self_heals() -> None:
+    conn = _conn_failing_first_insert(_missing_partition())
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+    conn.commit.assert_called()

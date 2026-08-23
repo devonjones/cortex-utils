@@ -24,12 +24,17 @@ Dedup returns success. "Already queued" and "emission failed" are different
 answers, and a caller that must not proceed unless the work is covered needs to
 tell them apart.
 
-Transactions: each function is one unit of work and commits its own. A failure
-rolls back before re-raising, so a caller never inherits an aborted transaction
-and never sees its next, unrelated statement fail because of this one. The cost
-is that operations cannot be composed into a larger transaction by the caller;
-if that is ever needed, it wants a separate explicitly-transactional API rather
-than the removal of these commits.
+Transactions: each function is one unit of work and commits its own by default.
+A failure rolls back before re-raising, so a caller never inherits an aborted
+transaction and never sees its next, unrelated statement fail because of this
+one.
+
+enqueue() takes commit=False for callers that must land the job atomically with
+their own work -- approving a proposal and queueing its apply job, or moving a
+row out of dead_letter and re-queueing it. Committing those separately would let
+a crash between them leave the two halves disagreeing. In that mode the caller
+owns the transaction entirely, which is the convention retry.fail_or_retry
+already follows.
 """
 
 from __future__ import annotations
@@ -75,14 +80,24 @@ class QueueError(RuntimeError):
 
 
 @contextmanager
-def _tx(conn: psycopg2.extensions.connection) -> Iterator[psycopg2.extensions.cursor]:
+def _tx(
+    conn: psycopg2.extensions.connection, commit: bool = True
+) -> Iterator[psycopg2.extensions.cursor]:
     """One unit of work: commit on success, roll back before re-raising.
 
     Without the rollback a failure leaves the connection in an aborted
     transaction, and the caller's next statement fails complaining about this
     one. For a long-lived worker that means every later job fails for reasons
     that look unrelated to the job that actually broke.
+
+    commit=False hands both halves to the caller: no commit, and no rollback
+    either, since rolling back here would discard the caller's own pending work
+    on the same connection.
     """
+    if not commit:
+        with conn.cursor() as cur:
+            yield cur
+        return
     try:
         with conn.cursor() as cur:
             yield cur
@@ -199,6 +214,7 @@ def enqueue(
     payload: dict[str, Any],
     priority: int = 0,
     dedup_key: str | None = None,
+    commit: bool = True,
 ) -> int | None:
     """Insert a job, returning its id, or None if an identical job is queued.
 
@@ -213,18 +229,24 @@ def enqueue(
     timestamps.
 
     A missing partition for today is created and the insert retried once.
+
+    commit=False leaves the transaction to the caller, for work that must land
+    atomically with the job. It also gives up the partition self-heal: creating a
+    partition requires committing, which would commit the caller's pending work
+    behind their back. The CheckViolation propagates instead, the caller rolls
+    back, and the next ordinary enqueue or maintenance run creates the partition.
     """
     dedup_value = _validate_dedup(dedup_key, payload) if dedup_key is not None else None
 
     try:
-        return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value)
+        return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value, commit)
     except psycopg2.errors.CheckViolation as exc:
-        if not _is_missing_partition(exc):
+        if not commit or not _is_missing_partition(exc):
             raise
 
     _create_partition_for(conn, date.today())
     # Exactly one retry. Anything still failing is not a partition problem.
-    return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value)
+    return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value, commit)
 
 
 def _insert(
@@ -234,9 +256,10 @@ def _insert(
     priority: int,
     dedup_key: str | None,
     dedup_value: str | None,
+    commit: bool = True,
 ) -> int | None:
     """Do the insert itself, honouring dedup. Caller owns partition recovery."""
-    with _tx(conn) as cur:
+    with _tx(conn, commit=commit) as cur:
         if dedup_key is None:
             cur.execute(
                 "INSERT INTO queue (queue_name, payload, priority) "

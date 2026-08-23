@@ -17,8 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import psycopg2
-from psycopg2.extras import Json
 
+from cortex_utils.queue.ops import enqueue
 from cortex_utils.queue.retry import ready_predicate
 
 APPLY_QUEUE = "proposal_apply"
@@ -42,12 +42,13 @@ def enqueue_proposal_apply(
     Does not commit — the caller runs this in the same transaction that approves
     the proposal, so the job and the approval land atomically.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO queue (queue_name, payload, priority) VALUES (%s, %s, %s) RETURNING id",
-            (APPLY_QUEUE, Json({"proposal_id": proposal_id}), priority),
-        )
-        return cur.fetchone()[0]
+    return enqueue(
+        conn,
+        APPLY_QUEUE,
+        {"proposal_id": proposal_id},
+        priority=priority,
+        commit=False,
+    )
 
 
 def claim_proposal_apply_jobs(
