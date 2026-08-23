@@ -57,9 +57,17 @@ CREATE INDEX IF NOT EXISTS idx_dead_letter_queue
     ON dead_letter(queue_name, failed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dead_letter_created
     ON dead_letter(created_at);
--- The default list and the default count are both "not written off yet".
+"""
+
+# Deliberately NOT in the script above. CREATE TABLE IF NOT EXISTS no-ops on an
+# existing table, and IF NOT EXISTS on an index guards the NAME, not the
+# predicate -- so a partial index over dismissed_at ran against the pre-upgrade
+# shape and raised UndefinedColumn, taking ensure_table() down before the
+# migration it was supposed to reach. Every deployment that already had the
+# table, which is every deployment this feature exists for.
+LIFECYCLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_dead_letter_open
-    ON dead_letter(queue_name, failed_at DESC) WHERE dismissed_at IS NULL;
+    ON dead_letter(failed_at DESC) WHERE dismissed_at IS NULL AND retried_at IS NULL
 """
 
 # Added after the table shipped, so an existing deployment needs the ALTER.
@@ -96,21 +104,40 @@ class DeadLetterManager:
         """
         missing = [c for c in LIFECYCLE_COLUMNS if not self._has_column(c)]
         if not missing:
+            with self.conn.cursor() as cur:
+                cur.execute(LIFECYCLE_INDEX)
+            self.conn.commit()
             return False
 
-        with self.conn.cursor() as cur:
-            # Fail fast rather than queue ACCESS EXCLUSIVE behind a long read.
-            cur.execute("SET LOCAL lock_timeout = '5000ms'")
-            for name in missing:
-                cur.execute(
-                    f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
-                    f"{LIFECYCLE_COLUMNS[name]}"
-                )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_dead_letter_open "
-                "ON dead_letter(queue_name, failed_at DESC) WHERE dismissed_at IS NULL"
-            )
-        self.conn.commit()
+        # SET LOCAL is a silent no-op under autocommit -- there is no
+        # transaction for it to be local to -- and each ALTER would then commit
+        # on its own, so both the lock bound and the all-or-nothing property
+        # would be false exactly where this class does not own the connection.
+        # Only when it is actually on: psycopg2 refuses to change the session
+        # mode inside a transaction, and on a normal connection the probe above
+        # has already opened one -- where the commit below covers the ALTERs
+        # anyway, so there is nothing to fix.
+        was_autocommit = self.conn.autocommit
+        if was_autocommit:
+            self.conn.autocommit = False
+        try:
+            with self.conn.cursor() as cur:
+                # Fail fast rather than queue ACCESS EXCLUSIVE behind a long read.
+                cur.execute("SET LOCAL lock_timeout = '5000ms'")
+                for name in missing:
+                    cur.execute(
+                        f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
+                        f"{LIFECYCLE_COLUMNS[name]}"
+                    )
+                cur.execute(LIFECYCLE_INDEX)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            if was_autocommit:
+                self.conn.autocommit = True
+
         log.info("Added dead_letter lifecycle columns", columns=missing)
         return True
 
@@ -130,7 +157,7 @@ class DeadLetterManager:
         queue_name: str | None = None,
         since: timedelta | None = None,
         limit: int = 100,
-        include_dismissed: bool = False,
+        include_resolved: bool = False,
     ) -> list[dict[str, Any]]:
         """List dead letter jobs.
 
@@ -142,11 +169,17 @@ class DeadLetterManager:
         conditions = []
         params: list[Any] = []
 
-        if not include_dismissed:
+        if not include_resolved:
             # get_stats() applies the identical predicate from the identical
             # flag. Two human-facing views of one number that filter differently
             # is worse than either being wrong alone.
-            conditions.append("dismissed_at IS NULL")
+            #
+            # Retried counts as resolved, not only dismissed. The DELETE this
+            # replaced was what kept retry_jobs() self-limiting: without it, a
+            # second sweep re-enqueues everything the first sweep already put
+            # back, and overwrites retried_as -- erasing the very record this
+            # change exists to keep.
+            conditions.append("dismissed_at IS NULL AND retried_at IS NULL")
 
         if queue_name:
             conditions.append("queue_name = %s")
@@ -229,6 +262,9 @@ class DeadLetterManager:
             "created_at": row[6],
             "failed_at": row[7],
             "archived_from_partition": row[8],
+            "retried_at": row[9],
+            "retried_as": row[10],
+            "dismissed_at": row[11],
         }
 
     def retry_job(self, dead_letter_id: int, dry_run: bool = False) -> bool:
@@ -247,6 +283,25 @@ class DeadLetterManager:
         job = self.get_job(dead_letter_id)
         if not job:
             log.warning("Dead letter job not found", dead_letter_id=dead_letter_id)
+            return False
+
+        if job["retried_at"]:
+            # Re-enqueueing would run the work twice and overwrite retried_as,
+            # destroying the record of where it went the first time. If the
+            # retry itself failed, that failure archived a NEW dead_letter row;
+            # retry that one.
+            log.warning(
+                "Dead letter job was already retried",
+                dead_letter_id=dead_letter_id,
+                retried_as=job["retried_as"],
+            )
+            return False
+
+        if job["dismissed_at"]:
+            # Re-enqueueing a written-off row would put live work back on the
+            # queue while leaving it hidden from every default view -- the
+            # invisible-backlog failure this whole lifecycle exists to prevent.
+            log.warning("Dead letter job was dismissed", dead_letter_id=dead_letter_id)
             return False
 
         if dry_run:
@@ -391,14 +446,14 @@ class DeadLetterManager:
         log.info("Purged dead letter jobs", count=count, older_than=str(older_than))
         return count
 
-    def get_stats(self, include_dismissed: bool = False) -> dict[str, Any]:
+    def get_stats(self, include_resolved: bool = False) -> dict[str, Any]:
         """Dead letter counts, over exactly what list_jobs() shows.
 
         Same flag and same default as list_jobs() on purpose. A page reporting 2
         while a digest reports 6 is worse than either being wrong alone: whichever
         you read last is the one you believe.
         """
-        where = "" if include_dismissed else "WHERE dismissed_at IS NULL"
+        where = "" if include_resolved else "WHERE dismissed_at IS NULL AND retried_at IS NULL"
         with self.conn.cursor() as cur:
             cur.execute(
                 f"""

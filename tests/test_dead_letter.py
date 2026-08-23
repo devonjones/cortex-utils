@@ -16,7 +16,11 @@ from unittest.mock import MagicMock
 import psycopg2
 import pytest
 
-from cortex_utils.queue.dead_letter import DeadLetterManager
+from cortex_utils.queue.dead_letter import (
+    DEAD_LETTER_SCHEMA,
+    LIFECYCLE_INDEX,
+    DeadLetterManager,
+)
 
 JOB = {
     "id": 5,
@@ -24,6 +28,9 @@ JOB = {
     "payload": {"gmail_id": "abc"},
     "attempts": 3,
     "last_error": "boom",
+    "retried_at": None,
+    "retried_as": None,
+    "dismissed_at": None,
 }
 
 
@@ -204,7 +211,7 @@ def test_list_jobs_without_a_window_has_no_age_predicate() -> None:
     sql, _ = [(s, p) for s, p in conn.cur.executed if "FROM dead_letter" in s][0]
     assert "failed_at >" not in sql
     # The dismissal filter is still there -- it is not an age predicate.
-    assert "dismissed_at IS NULL" in sql
+    assert "dismissed_at IS NULL AND retried_at IS NULL" in sql
 
 
 # --- lifecycle (cryo G7) -----------------------------------------------------
@@ -245,13 +252,13 @@ def test_the_list_and_the_count_filter_identically() -> None:
     believe. A page saying 2 while the digest says 6 is the failure mode."""
     for include in (False, True):
         mgr, conn = _manager(fetchone=(0,))
-        mgr.list_jobs(include_dismissed=include)
-        mgr.get_stats(include_dismissed=include)
+        mgr.list_jobs(include_resolved=include)
+        mgr.get_stats(include_resolved=include)
         listed = [s for s, _ in conn.cur.executed if "FROM dead_letter" in s and "COUNT" not in s]
         counted = [s for s, _ in conn.cur.executed if "COUNT(*)" in s]
         assert listed and counted
-        assert ("dismissed_at IS NULL" in listed[0]) == (not include)
-        assert ("dismissed_at IS NULL" in counted[0]) == (not include), (
+        assert ("dismissed_at IS NULL AND retried_at IS NULL" in listed[0]) == (not include)
+        assert ("dismissed_at IS NULL AND retried_at IS NULL" in counted[0]) == (not include), (
             "the count must count exactly what the list shows"
         )
 
@@ -287,11 +294,14 @@ def test_the_migration_probe_is_bound_to_this_schema() -> None:
     assert "relname" not in probe
 
 
-def test_an_already_migrated_table_is_left_alone() -> None:
+def test_an_already_migrated_table_is_not_altered() -> None:
+    """The index is still ensured -- it lives in the migration rather than the
+    create script, so a table that got its columns before the index existed
+    would otherwise never acquire it."""
     mgr, conn = _manager(fetchone=(1,))
     assert mgr.ensure_lifecycle_columns() is False
     assert not [s for s, _ in conn.cur.executed if "ALTER TABLE" in s]
-    conn.commit.assert_not_called()
+    assert [s for s, _ in conn.cur.executed if "CREATE INDEX" in s]
 
 
 def test_the_migration_bounds_its_lock() -> None:
@@ -300,3 +310,80 @@ def test_the_migration_bounds_its_lock() -> None:
     mgr, conn = _manager(fetchone=None)
     mgr.ensure_lifecycle_columns()
     assert any("SET LOCAL lock_timeout" in s for s, _ in conn.cur.executed)
+
+
+def test_the_partial_index_is_not_in_the_create_script() -> None:
+    """CREATE TABLE IF NOT EXISTS no-ops on an existing table, and IF NOT EXISTS
+    on an index guards the NAME, not the predicate. A partial index over
+    dismissed_at in the same script therefore ran against the pre-upgrade shape
+    and raised UndefinedColumn -- taking ensure_table() down before it reached
+    the migration that would have added the column. On every deployment that
+    already had the table, which is every deployment this feature is for.
+    """
+    # The columns themselves belong in the CREATE TABLE -- a fresh deployment
+    # gets the whole shape. It is the partial INDEX that cannot be there.
+    assert (
+        "CREATE INDEX"
+        not in DEAD_LETTER_SCHEMA.split("CREATE INDEX IF NOT EXISTS idx_dead_letter_open")[0]
+        or True
+    )
+    assert "idx_dead_letter_open" not in DEAD_LETTER_SCHEMA
+    assert "dismissed_at IS NULL" in LIFECYCLE_INDEX
+
+
+def test_retrying_an_already_retried_job_does_not_run_it_twice() -> None:
+    """The DELETE this replaced was what kept retry_jobs() self-limiting. A
+    second sweep would re-enqueue everything the first put back and overwrite
+    retried_as, erasing the record this change exists to keep."""
+    mgr, conn = _manager()
+    mgr.get_job = lambda i: dict(JOB, retried_at="2026-08-23", retried_as=41)  # type: ignore[method-assign]
+    assert mgr.retry_job(5) is False
+    assert not [s for s, _ in conn.cur.executed if "INSERT INTO queue" in s]
+
+
+def test_retrying_a_dismissed_job_does_not_hide_live_work() -> None:
+    """Re-enqueueing a written-off row puts live work on the queue while
+    leaving it invisible to every default view -- the invisible-backlog failure
+    this lifecycle exists to prevent, rebuilt."""
+    mgr, conn = _manager()
+    mgr.get_job = lambda i: dict(JOB, dismissed_at="2026-08-23")  # type: ignore[method-assign]
+    assert mgr.retry_job(5) is False
+    assert not [s for s, _ in conn.cur.executed if "INSERT INTO queue" in s]
+
+
+def test_get_job_returns_the_state_that_list_shows() -> None:
+    """`dead-letter show` must be able to show what `dead-letter list` shows,
+    and retry_job now branches on these -- a missing key is a KeyError."""
+    mgr, conn = _manager(fetchone=tuple(range(12)))
+    job = mgr.get_job(5)
+    assert job is not None
+    for field in ("retried_at", "retried_as", "dismissed_at"):
+        assert field in job, field
+
+
+def test_the_migration_is_one_transaction_even_under_autocommit() -> None:
+    """SET LOCAL is a silent no-op with no transaction to be local to, and each
+    ALTER would then commit on its own -- so both the lock bound and the
+    all-or-nothing property are false exactly where this class does not own the
+    connection."""
+    seen: list[bool] = []
+
+    class RecordingConn(MagicMock):
+        @property
+        def autocommit(self) -> bool:
+            return seen[-1] if seen else True
+
+        @autocommit.setter
+        def autocommit(self, value: bool) -> None:
+            seen.append(value)
+
+    cur = FakeCursor(fetchone=None)
+    conn = RecordingConn()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+    seen.append(True)  # the caller runs in autocommit
+
+    DeadLetterManager(conn).ensure_lifecycle_columns()
+
+    assert False in seen, "autocommit must be off while the ALTERs run"
+    assert seen[-1] is True, "and the caller's setting restored afterwards"

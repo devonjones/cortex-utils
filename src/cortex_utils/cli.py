@@ -273,14 +273,16 @@ def dead_letter() -> None:
 @click.option("--queue", "queue_name", help="Filter by queue name")
 @click.option("--since", help="Only jobs failed within duration (e.g., 24h, 7d)")
 @click.option("--limit", default=20, help="Max jobs to show")
-@click.option("--include-dismissed", is_flag=True, help="Also show jobs that have been written off")
+@click.option(
+    "--include-resolved", is_flag=True, help="Also show jobs already retried or written off"
+)
 @click.pass_context
 def dead_letter_list(
     ctx: click.Context,
     queue_name: str | None,
     since: str | None,
     limit: int,
-    include_dismissed: bool,
+    include_resolved: bool,
 ) -> None:
     """List dead letter jobs."""
     config = ctx.obj["config"]
@@ -298,7 +300,7 @@ def dead_letter_list(
             queue_name=queue_name,
             since=since_delta,
             limit=limit,
-            include_dismissed=include_dismissed,
+            include_resolved=include_resolved,
         )
 
         if not jobs:
@@ -447,10 +449,10 @@ def dead_letter_purge(
 
 @dead_letter.command("stats")
 @click.option(
-    "--include-dismissed", is_flag=True, help="Also count jobs that have been written off"
+    "--include-resolved", is_flag=True, help="Also count jobs already retried or written off"
 )
 @click.pass_context
-def dead_letter_stats(ctx: click.Context, include_dismissed: bool) -> None:
+def dead_letter_stats(ctx: click.Context, include_resolved: bool) -> None:
     """Show dead letter queue statistics."""
     config = ctx.obj["config"]
     conn = get_connection(config)
@@ -458,9 +460,9 @@ def dead_letter_stats(ctx: click.Context, include_dismissed: bool) -> None:
     try:
         dlm = DeadLetterManager(conn)
         dlm.ensure_table()
-        stats = dlm.get_stats(include_dismissed=include_dismissed)
+        stats = dlm.get_stats(include_resolved=include_resolved)
 
-        scope = "total" if include_dismissed else "open"
+        scope = "total" if include_resolved else "open"
         click.echo(f"Dead Letter Queue: {stats['total']} {scope} jobs")
         click.echo("")
 
