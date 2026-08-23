@@ -273,9 +273,14 @@ def dead_letter() -> None:
 @click.option("--queue", "queue_name", help="Filter by queue name")
 @click.option("--since", help="Only jobs failed within duration (e.g., 24h, 7d)")
 @click.option("--limit", default=20, help="Max jobs to show")
+@click.option("--include-dismissed", is_flag=True, help="Also show jobs that have been written off")
 @click.pass_context
 def dead_letter_list(
-    ctx: click.Context, queue_name: str | None, since: str | None, limit: int
+    ctx: click.Context,
+    queue_name: str | None,
+    since: str | None,
+    limit: int,
+    include_dismissed: bool,
 ) -> None:
     """List dead letter jobs."""
     config = ctx.obj["config"]
@@ -289,21 +294,33 @@ def dead_letter_list(
         dlm = DeadLetterManager(conn)
         dlm.ensure_table()
 
-        jobs = dlm.list_jobs(queue_name=queue_name, since=since_delta, limit=limit)
+        jobs = dlm.list_jobs(
+            queue_name=queue_name,
+            since=since_delta,
+            limit=limit,
+            include_dismissed=include_dismissed,
+        )
 
         if not jobs:
             click.echo("No dead letter jobs found.")
             return
 
-        click.echo(f"{'ID':<8} {'Queue':<12} {'Failed At':<20} {'Error (truncated)':<40}")
+        click.echo(f"{'ID':<8} {'Queue':<12} {'Failed At':<20} {'St':<4} {'Error':<36}")
         click.echo("-" * 80)
         for job in jobs:
-            error = (job["last_error"] or "")[:37]
-            if len(job["last_error"] or "") > 37:
+            error = (job["last_error"] or "")[:33]
+            if len(job["last_error"] or "") > 33:
                 error += "..."
+            # A row that was already retried or written off looks identical to an
+            # untouched one otherwise, which makes the list unusable for triage.
+            state = "--"
+            if job["dismissed_at"]:
+                state = "DIS"
+            elif job["retried_at"]:
+                state = "RTY"
             click.echo(
                 f"{job['id']:<8} {job['queue_name']:<12} "
-                f"{str(job['failed_at'])[:19]:<20} {error:<40}"
+                f"{str(job['failed_at'])[:19]:<20} {state:<4} {error:<36}"
             )
     finally:
         conn.close()
@@ -374,6 +391,29 @@ def dead_letter_retry(
         conn.close()
 
 
+@dead_letter.command("dismiss")
+@click.argument("dead_letter_id", type=int)
+@click.pass_context
+def dead_letter_dismiss(ctx: click.Context, dead_letter_id: int) -> None:
+    """Write a job off. Terminal, but keeps the record.
+
+    DEAD_LETTER_ID is an id from `dead-letter list`, not a queue id.
+    """
+    config = ctx.obj["config"]
+    conn = get_connection(config)
+
+    try:
+        dlm = DeadLetterManager(conn)
+        dlm.ensure_table()
+        if dlm.dismiss(dead_letter_id):
+            click.echo(f"Dismissed dead letter job {dead_letter_id}.")
+        else:
+            click.echo(f"No dead letter job with id {dead_letter_id}.", err=True)
+            ctx.exit(1)
+    finally:
+        conn.close()
+
+
 @dead_letter.command("purge")
 @click.option("--older-than", required=True, help="Purge jobs older than duration (e.g., 30d)")
 @click.option("--queue", "queue_name", help="Only purge from specific queue")
@@ -406,8 +446,11 @@ def dead_letter_purge(
 
 
 @dead_letter.command("stats")
+@click.option(
+    "--include-dismissed", is_flag=True, help="Also count jobs that have been written off"
+)
 @click.pass_context
-def dead_letter_stats(ctx: click.Context) -> None:
+def dead_letter_stats(ctx: click.Context, include_dismissed: bool) -> None:
     """Show dead letter queue statistics."""
     config = ctx.obj["config"]
     conn = get_connection(config)
@@ -415,9 +458,10 @@ def dead_letter_stats(ctx: click.Context) -> None:
     try:
         dlm = DeadLetterManager(conn)
         dlm.ensure_table()
-        stats = dlm.get_stats()
+        stats = dlm.get_stats(include_dismissed=include_dismissed)
 
-        click.echo(f"Dead Letter Queue: {stats['total']} total jobs")
+        scope = "total" if include_dismissed else "open"
+        click.echo(f"Dead Letter Queue: {stats['total']} {scope} jobs")
         click.echo("")
 
         if stats["by_queue"]:
