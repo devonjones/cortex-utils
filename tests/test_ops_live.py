@@ -97,29 +97,42 @@ def conns():
 
 
 def test_skip_locked_never_double_claims(conns):
-    """Two workers claiming at once must partition the rows, not share them.
+    """A claim must SKIP rows another transaction holds, not wait for them.
 
-    The failure this guards is silent and expensive: the same job runs twice,
-    both workers believe they own it, and whichever finishes second overwrites
-    the first. A mock cannot show it because SKIP LOCKED is the database
-    declining to wait, not code taking a branch.
+    Racing this properly matters. An earlier version of this test called
+    claim() on both connections in sequence and passed even with SKIP LOCKED
+    removed — because claim() commits internally, so the first connection had
+    already released its locks before the second ran. It proved nothing.
+
+    So the contention is created directly: connection A locks three rows in an
+    OPEN transaction, and B then claims with a short statement_timeout. With
+    SKIP LOCKED, B steps over them and returns the rest. Without it, B queues
+    behind A's locks and the timeout fires — which is the assertion.
     """
     a, b = conns
-    ids = {enqueue(a, "q", {"n": i}) for i in range(6)}
-    assert len(ids) == 6
-
-    # A claims inside an OPEN transaction, so its row locks are still held
-    # when B claims. Committing first would make this prove nothing.
-    got_a = claim(a, "q", "worker-a", limit=3)
-    got_b = claim(b, "q", "worker-b", limit=3)
+    ids = [enqueue(a, "q", {"n": i}) for i in range(6)]
     a.commit()
-    b.commit()
 
-    ids_a = {r["id"] for r in got_a}
-    ids_b = {r["id"] for r in got_b}
-    assert ids_a and ids_b, "both workers should get work from a 6-row queue"
-    assert not (ids_a & ids_b), f"same row claimed twice: {ids_a & ids_b}"
-    assert (ids_a | ids_b) <= ids
+    with a.cursor() as cur:  # held open, deliberately, for the whole test
+        cur.execute(
+            "SELECT id FROM queue WHERE id = ANY(%s) ORDER BY id "
+            "LIMIT 3 FOR UPDATE",
+            (ids,),
+        )
+        locked = {r[0] for r in cur.fetchall()}
+    assert len(locked) == 3
+
+    with b.cursor() as cur:
+        # without this, a regression HANGS the suite instead of failing it
+        cur.execute("SET LOCAL statement_timeout = '3s'")
+    got = claim(b, "q", "worker-b", limit=6)
+    b.commit()
+    a.rollback()
+
+    claimed = {r["id"] for r in got}
+    assert claimed, "B must claim the rows A is not holding"
+    assert not (claimed & locked), f"claimed a row A had locked: {claimed & locked}"
+    assert claimed == set(ids) - locked
 
 
 def test_advisory_lock_serialises_same_key_producers(conns):
@@ -128,20 +141,41 @@ def test_advisory_lock_serialises_same_key_producers(conns):
     The partial unique index cannot backstop this: partitioning forces
     created_at into every unique key, so two producers in different
     transactions get different timestamps and BOTH inserts satisfy it. The
-    advisory xact lock is the only thing standing between that and a
-    double-queued job, and it only exists at runtime.
+    advisory xact lock is the only thing between that and a double-queued job.
+
+    This must be genuinely concurrent. An earlier version committed A before B
+    ran, so B's NOT EXISTS saw the committed row and deduped without ever
+    needing the lock — it passed with the lock removed. Here B runs in a
+    thread WHILE A holds the lock uncommitted, which is the only arrangement
+    that can tell the two apart.
     """
+    import threading
+
     a, b = conns
     first = enqueue(a, "q", {"vid": "same"}, dedup_key="vid", commit=False)
-
-    # B blocks on the advisory lock A holds until A's transaction ends. If the
-    # lock were absent, B's NOT EXISTS would see no COMMITTED row and insert.
-    a.commit()
-    second = enqueue(b, "q", {"vid": "same"}, dedup_key="vid")
-    b.commit()
-
     assert first is not None
-    assert second is None, "the second producer must dedup, not insert"
+
+    result: dict[str, object] = {}
+
+    def producer_b() -> None:
+        try:
+            result["id"] = enqueue(b, "q", {"vid": "same"}, dedup_key="vid")
+        except Exception as exc:  # noqa: BLE001 — reported, not swallowed
+            result["error"] = exc
+
+    t = threading.Thread(target=producer_b)
+    t.start()
+    t.join(timeout=2)
+    # B must still be blocked on the advisory lock A holds. If it finished, it
+    # never waited — which is what happens when the lock is gone.
+    assert t.is_alive(), "B did not block on the advisory lock A holds"
+
+    a.commit()          # releases the xact lock; B proceeds and sees the row
+    t.join(timeout=10)
+    assert not t.is_alive(), "B never completed after A committed"
+    assert "error" not in result, f"B failed: {result.get('error')}"
+    assert result["id"] is None, "the second producer must dedup, not insert"
+
     with a.cursor() as cur:
         cur.execute("SELECT count(*) FROM queue WHERE payload->>'vid' = 'same'")
         assert cur.fetchone()[0] == 1, "exactly one row may exist for a dedup key"
