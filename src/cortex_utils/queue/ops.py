@@ -70,6 +70,13 @@ ERROR_MAX_CHARS = 2000
 # every partition. Bounded so a boot cannot wedge the pipeline behind a claim.
 MIGRATION_LOCK_TIMEOUT_MS = 5000
 
+# CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on the parent, which
+# blocks every insert and every claim across all queue_names while held. On the
+# deploy path a few seconds is fine; this one runs on the live producer path, so
+# it gets a tighter bound. Losing the race is success -- whoever holds the lock
+# is almost certainly creating this very partition.
+PARTITION_LOCK_TIMEOUT_MS = 2000
+
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Values whose Python str() matches Postgres's jsonb ->> text output. bool gives
@@ -161,33 +168,65 @@ def _partition_name(day: date) -> str:
     return f"queue_{day.strftime('%Y_%m_%d')}"
 
 
-def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> None:
-    """Create the daily partition covering `day` in the current schema.
+def server_today(conn: psycopg2.extensions.connection) -> date:
+    """Today according to the server, not this process.
 
-    Only ever called for the current date: created_at defaults to NOW() and no
-    caller supplies it, so nothing can steer creation into the past (resurrecting
-    a partition retention just dropped) or the future (spraying junk partitions).
+    created_at is TIMESTAMPTZ DEFAULT NOW(), a value the *server* produces, so
+    any date used to route or create a partition for that row has to come from
+    the same clock. A client-side date.today() is a second, unsynchronised clock
+    in a possibly different timezone; it agrees only by coincidence, which means
+    it tests green wherever client and server are both UTC and fails on the
+    first deployment where they are not.
     """
-    name = _partition_name(day)
-    try:
-        with _tx(conn) as cur:
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
-                FOR VALUES FROM ('{day}') TO ('{day + timedelta(days=1)}')
-                """
-            )
-    except psycopg2.errors.DuplicateTable:
-        # IF NOT EXISTS checks the name before taking the lock that serialises
-        # creation, so a concurrent creator can still win in between. The
-        # partition exists either way, which is all the caller needs.
-        log.info("Partition created concurrently", partition=name)
-        return
-    # Loud on purpose. Reaching here means scheduled maintenance is not running;
-    # a silent self-heal would let that stay true for weeks.
+    with conn.cursor() as cur:
+        cur.execute("SELECT CURRENT_DATE")
+        return cur.fetchone()[0]
+
+
+def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> None:
+    """Create the partitions covering `day` and the day after, in this schema.
+
+    `day` must come from the server (see server_today), never from this process.
+
+    Tomorrow is created in the same pass so a retry that crosses midnight does
+    not find itself missing a partition again; that removes the race rather than
+    narrowing it. Tomorrow is inside maintenance's normal +3 horizon, so this
+    cannot push one schema's partitions past another's -- which the shared-image
+    coupling forbids.
+
+    Reaching here at all means scheduled maintenance is not keeping up, so the
+    outcome is logged either way: a silent self-heal would let that stay true for
+    weeks, which is the failure this whole module exists to prevent.
+    """
+    created, conceded = [], []
+    for offset in (0, 1):
+        target = day + timedelta(days=offset)
+        name = _partition_name(target)
+        try:
+            with _tx(conn) as cur:
+                cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
+                    FOR VALUES FROM ('{target}') TO ('{target + timedelta(days=1)}')
+                    """
+                )
+            created.append(name)
+        except psycopg2.errors.DuplicateTable:
+            # IF NOT EXISTS checks the name before taking the lock that
+            # serialises creation, so a concurrent creator can still win in
+            # between. The partition exists either way.
+            conceded.append(name)
+        except psycopg2.errors.LockNotAvailable:
+            # Whoever holds the parent lock is almost certainly creating this
+            # very partition, so losing is success: the retry finds it there.
+            # A distinct error is better operator signal than a generic timeout.
+            conceded.append(name)
+
     log.warning(
-        "Created queue partition from the write path",
-        partition=name,
+        "Partitions ensured from the write path",
+        created=created,
+        conceded=conceded,
         hint="partition maintenance is not keeping up",
     )
 
@@ -254,7 +293,7 @@ def enqueue(
         if not commit or not _is_missing_partition(exc):
             raise
 
-    _create_partition_for(conn, date.today())
+    _create_partition_for(conn, server_today(conn))
     # Exactly one retry. Anything still failing is not a partition problem.
     return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value, commit)
 

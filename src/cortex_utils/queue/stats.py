@@ -1,12 +1,23 @@
 """Queue statistics and monitoring."""
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import psycopg2
 import structlog
 
 log = structlog.get_logger()
+
+
+def _server_now(conn: psycopg2.extensions.connection) -> datetime:
+    """Wall clock from the server, so a reported timestamp matches the data.
+
+    Every other timestamp in these results is server-produced; stamping the
+    report with this process's clock would put two clocks in one document.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT NOW()")
+        return cur.fetchone()[0]
 
 
 def get_queue_stats(
@@ -22,7 +33,6 @@ def get_queue_stats(
     Returns:
         Dictionary with queue stats by queue name
     """
-    cutoff = datetime.now() - timedelta(hours=history_hours)
 
     with conn.cursor() as cur:
         # Current status counts
@@ -48,10 +58,11 @@ def get_queue_stats(
                 COUNT(*) as count
             FROM queue
             WHERE status IN ('completed', 'failed')
-              AND COALESCE(completed_at, created_at) > %s
+              AND COALESCE(completed_at, created_at)
+                  > NOW() - (INTERVAL '1 hour' * %s)
             GROUP BY queue_name, status;
         """,
-            (cutoff,),
+            (history_hours,),
         )
         history_rows = cur.fetchall()
 
@@ -90,7 +101,7 @@ def get_queue_stats(
     return {
         "queues": stats,
         "history_hours": history_hours,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": _server_now(conn).isoformat(),
     }
 
 
@@ -121,7 +132,6 @@ def get_stale_jobs(
 
     These may indicate crashed workers.
     """
-    cutoff = datetime.now() - timedelta(minutes=stale_minutes)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -131,10 +141,10 @@ def get_stale_jobs(
                 EXTRACT(EPOCH FROM (NOW() - claimed_at)) / 60 as minutes_stuck
             FROM queue
             WHERE status = 'processing'
-              AND claimed_at < %s
+              AND claimed_at < NOW() - (INTERVAL '1 minute' * %s)
             ORDER BY claimed_at;
         """,
-            (cutoff,),
+            (stale_minutes,),
         )
         rows = cur.fetchall()
 

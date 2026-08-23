@@ -19,6 +19,8 @@ from typing import Any
 import psycopg2
 import structlog
 
+from cortex_utils.queue.ops import server_today
+
 log = structlog.get_logger()
 
 
@@ -305,7 +307,10 @@ class PartitionManager:
         created, and a later run re-creates only what is still missing.
         """
         created = 0
-        today = date.today()
+        # Server clock, not this process: created_at is NOW() on the server, so
+        # a partition dated by the client only lines up by coincidence. Same
+        # defect cryo found on the write path.
+        today = server_today(self.conn)
         failures: list[PartitionNotAttachedError] = []
 
         for i in range(days_ahead + 1):  # Include today
@@ -345,7 +350,7 @@ class PartitionManager:
         Returns totals: partitions_dropped, rows_dropped, failed_archived,
                        requeued, partitions_skipped
         """
-        cutoff = date.today() - timedelta(days=retention_days)
+        cutoff = server_today(self.conn) - timedelta(days=retention_days)
         partitions = self.list_partitions()
 
         total_dropped = 0

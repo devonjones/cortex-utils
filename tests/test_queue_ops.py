@@ -28,7 +28,9 @@ import pytest
 from cortex_utils.queue.ops import (
     DEFAULT_VISIBILITY_TIMEOUT_MIN,
     MIGRATION_LOCK_TIMEOUT_MS,
+    PARTITION_LOCK_TIMEOUT_MS,
     QueueError,
+    _partition_name,
     claim,
     complete,
     enqueue,
@@ -41,8 +43,17 @@ from cortex_utils.queue.ops import (
 WORKER = "worker-a"
 
 
+# The date the fake server reports. Deliberately not date.today(): a test that
+# used the client clock could not tell the two apart, which is the bug.
+SERVER_TODAY = date(2026, 3, 1)
+
+
 class FakeCursor:
-    """Records (sql, params) and replays canned results."""
+    """Records (sql, params) and replays canned results.
+
+    Answers SELECT CURRENT_DATE itself, so tests do not have to thread the
+    server-date probe through every fetchone sequence.
+    """
 
     def __init__(self, fetchone: Any = None, fetchall: Any = (), rowcount: int = 1):
         self.executed: list[tuple[str, Any]] = []
@@ -51,13 +62,18 @@ class FakeCursor:
         self.rowcount = rowcount
         self.raise_on: str | None = None
         self.error: Exception | None = None
+        self._pending_date = False
 
     def execute(self, sql: str, params: Any = None) -> None:
         self.executed.append((sql, params))
+        self._pending_date = "CURRENT_DATE" in sql
         if self.raise_on and self.raise_on in sql and self.error:
             raise self.error
 
     def fetchone(self) -> Any:
+        if self._pending_date:
+            self._pending_date = False
+            return (SERVER_TODAY,)
         return self._fetchone() if callable(self._fetchone) else self._fetchone
 
     def fetchall(self) -> Any:
@@ -342,7 +358,8 @@ def test_missing_partition_is_created_and_the_insert_retried_once() -> None:
     conn = _conn_failing_first_insert(_missing_partition())
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
     sql = "\n".join(s for s, _ in conn.cur.executed)
-    assert f"queue_{date.today().strftime('%Y_%m_%d')}" in sql
+    # Dated by the server, not this process - see the dedicated test below.
+    assert _partition_name(SERVER_TODAY) in sql
     assert sql.count("INSERT INTO queue") == 2, "exactly one retry"
     conn.rollback.assert_called()
 
@@ -516,12 +533,45 @@ def test_backoff_grows_with_attempts() -> None:
     )
 
 
-def test_partition_covers_exactly_one_day() -> None:
+def test_partitions_are_dated_by_the_server_not_this_process() -> None:
+    """The bug cryo found: created_at is server NOW(), so the partition date has
+    to come from the same clock. A client date.today() only agrees by accident."""
     conn = _conn_failing_first_insert(_missing_partition())
     enqueue(conn, "triage", {"gmail_id": "abc"})
-    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s][0]
-    today = date.today()
-    assert f"FROM ('{today}') TO ('{today + timedelta(days=1)}')" in ddl
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
+    assert any("SELECT CURRENT_DATE" in s for s, _ in conn.cur.executed)
+    assert f"FROM ('{SERVER_TODAY}') TO ('{SERVER_TODAY + timedelta(days=1)}')" in ddl[0]
+    assert str(date.today()) not in ddl[0] or date.today() == SERVER_TODAY
+
+
+def test_self_heal_creates_tomorrow_too() -> None:
+    """Removes the midnight race rather than narrowing it."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
+    assert len(ddl) == 2
+    tomorrow = SERVER_TODAY + timedelta(days=1)
+    assert _partition_name(tomorrow) in ddl[1]
+
+
+def test_partition_creation_is_lock_bounded() -> None:
+    """It runs on the live producer path and takes ACCESS EXCLUSIVE on the
+    parent, blocking every insert and claim across all queues while held."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    timeouts = [p for s, p in conn.cur.executed if "lock_timeout" in s]
+    assert timeouts, "the write-path DDL must be lock-bounded"
+    assert timeouts[0][0] == f"{PARTITION_LOCK_TIMEOUT_MS}ms"
+
+
+def test_losing_the_partition_lock_is_not_fatal() -> None:
+    """Whoever holds it is almost certainly creating this very partition, so
+    conceding is success: the retry finds it there."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    conn.cur.raise_on = "CREATE TABLE"
+    conn.cur.error = psycopg2.errors.LockNotAvailable("timeout")
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+    assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
 
 
 def test_migration_precheck_looks_for_the_right_column() -> None:

@@ -32,10 +32,20 @@ PARENT_OK: Row = ("queue",)
 PARENT_MISSING: Row = (None,)
 
 
+# The date the fake server reports, deliberately not date.today(): partition
+# dates must come from the server clock that produces created_at, so a test
+# using the client clock could not tell a regression from correct behaviour.
+SERVER_TODAY = date(2026, 3, 1)
+
+
 def _is_meta(sql: str) -> bool:
-    """True for the guard's own probe statements, which carry no lookup logic."""
+    """True for probe statements that carry no lookup logic of their own."""
     stripped = sql.strip()
-    return stripped.startswith("SELECT to_regclass") or stripped.startswith("SHOW search_path")
+    return (
+        stripped.startswith("SELECT to_regclass")
+        or stripped.startswith("SHOW search_path")
+        or stripped.startswith("SELECT CURRENT_DATE")
+    )
 
 
 def _manager_capturing_sql(
@@ -64,6 +74,8 @@ def _manager_capturing_sql(
             answered_meta.append(parent)
         elif sql.strip().startswith("SHOW search_path"):
             answered_meta.append(("public",))
+        elif sql.strip().startswith("SELECT CURRENT_DATE"):
+            answered_meta.append((SERVER_TODAY,))
 
     def _fetchone() -> Row | None:
         if answered_meta:
@@ -212,8 +224,8 @@ def test_create_future_partitions_raises_the_first_failure() -> None:
     manager, _ = _manager_capturing_sql(rows=[None, None, None, None])
     with pytest.raises(PartitionNotAttachedError) as excinfo:
         manager.create_future_partitions(days_ahead=1)
-    today = date.today()
-    assert f"queue_{today.strftime('%Y_%m_%d')}" in str(excinfo.value)
+    # The server's date, not this process's: the two agree only by coincidence.
+    assert f"queue_{SERVER_TODAY.strftime('%Y_%m_%d')}" in str(excinfo.value)
 
 
 def test_create_future_partitions_returns_count_when_all_succeed() -> None:
