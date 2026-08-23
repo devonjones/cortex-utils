@@ -26,6 +26,7 @@ import psycopg2
 import pytest
 
 from cortex_utils.queue.ops import (
+    MIGRATION_LOCK_TIMEOUT_MS,
     QueueError,
     claim,
     complete,
@@ -497,6 +498,9 @@ def test_release_defers_forward_not_backward() -> None:
     sql, params = conn.cur.executed[0]
     assert "clock_timestamp() + (INTERVAL '1 second' * %s)" in sql
     assert params[0] == 120
+    # Without this the row stays 'processing' with claimed_at = NULL, which the
+    # stale sweep's "claimed_at < ..." can never match: unclaimable forever.
+    assert "SET status = 'pending'" in sql
 
 
 def test_backoff_grows_with_attempts() -> None:
@@ -543,10 +547,14 @@ def test_terminal_failure_clears_the_retry_schedule() -> None:
     )
 
 
-def test_complete_stamps_completed_at() -> None:
+def test_complete_marks_the_job_completed() -> None:
+    """Asserting only completed_at let status = 'failed' pass: succeeded work
+    would land in dead-letter while complete() returned True."""
     conn = _conn(rowcount=1)
     complete(conn, 7, WORKER)
-    assert "completed_at = NOW()" in conn.cur.executed[0][0]
+    sql = conn.cur.executed[0][0]
+    assert "SET status = 'completed'" in sql
+    assert "completed_at = NOW()" in sql
 
 
 def test_empty_dedup_key_is_rejected_not_silently_ignored() -> None:
@@ -554,3 +562,64 @@ def test_empty_dedup_key_is_rejected_not_silently_ignored() -> None:
     dedup branch, producing payload->>'' = NULL, which never matches."""
     with pytest.raises(QueueError):
         enqueue(_conn(fetchone=(42,)), "triage", {"": 1}, dedup_key="")
+
+
+def test_stale_sweep_targets_expired_processing_rows_only() -> None:
+    """Two silent inversions live here.
+
+    Flipping the comparison steals claims from live workers and never recovers
+    abandoned ones; dropping the status filter resurrects completed jobs on a
+    loop. Both return normally.
+    """
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    sql = conn.cur.executed[0][0]
+    for cte in (
+        sql.split("retire_exhausted")[0],
+        sql.split("retire_exhausted")[1].split("claimable")[0],
+    ):
+        assert "status = 'processing'" in cte, "must not touch rows that are not claimed"
+        assert "claimed_at < NOW()" in cte, "must target expired claims, not fresh ones"
+
+
+def test_claimable_is_scoped_and_budget_bounded() -> None:
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    claimable = conn.cur.executed[0][0].split("claimable AS")[1]
+    assert "queue_name = %(q)s" in claimable, "must not claim another queue's work"
+    assert "attempts < max_attempts" in claimable
+    assert "next_attempt_at IS NULL" in claimable, "a never-deferred row must be claimable"
+
+
+def test_migration_adds_exactly_the_claim_token_column_with_a_real_timeout() -> None:
+    conn = _conn(fetchone=None)
+    ensure_claim_token_column(conn)
+    ddl = [s for s, _ in conn.cur.executed if "ADD COLUMN" in s][0]
+    assert ddl.rstrip().endswith("claimed_by TEXT"), "prefix matching would accept claimed_bys"
+    timeout = _params_of(conn, "lock_timeout")[0]
+    assert timeout == f"{MIGRATION_LOCK_TIMEOUT_MS}ms"
+    assert not timeout.startswith("0"), "0 means wait forever, inverting the intent"
+
+
+def test_losing_the_partition_creation_race_counts_as_success() -> None:
+    """IF NOT EXISTS checks the name before taking the lock that serialises
+    creation, so a concurrent creator can still win in between."""
+    state = {"insert_failed": False}
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        if "CREATE TABLE" in sql:
+            raise psycopg2.errors.DuplicateTable("already exists")
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+    assert len([s for s, _ in cur.executed if "INSERT INTO queue" in s]) == 2
