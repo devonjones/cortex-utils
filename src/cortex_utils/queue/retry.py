@@ -69,6 +69,11 @@ def fail_or_retry(
     cannot report on a row another worker has since re-claimed. This version is
     retained for callers not yet migrated; new code should use ops.
 
+    Note the return values differ: this returns "retrying", ops returns
+    "pending" for the same outcome. A migration that swaps the import without
+    updating an `== "retrying"` check gets a comparison that is silently always
+    false rather than an error.
+
     Returns "retrying" if the job was re-queued for a future attempt,
     or "failed" if it has now exhausted its retries (or the row was
     already in a terminal state, or the row was not found).

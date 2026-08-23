@@ -17,7 +17,7 @@ argued in review and not covered here; ops.py has no live-server coverage today.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -32,6 +32,7 @@ from cortex_utils.queue.ops import (
     enqueue,
     ensure_claim_token_column,
     fail_or_retry,
+    has_claim_token_column,
     release,
 )
 
@@ -397,3 +398,159 @@ def test_package_fail_or_retry_is_the_claim_token_aware_one() -> None:
     from cortex_utils import queue as pkg
 
     assert pkg.fail_or_retry is fail_or_retry
+
+
+# --- the transaction actually completes -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: enqueue(c, "triage", {"gmail_id": "abc"}),
+        lambda c: claim(c, "triage", WORKER),
+        lambda c: complete(c, 7, WORKER),
+        lambda c: release(c, 7, 30, WORKER),
+        lambda c: ensure_claim_token_column(c),
+    ],
+)
+def test_every_operation_commits(call) -> None:
+    """Deleting conn.commit() must not pass.
+
+    Only the rollback half was pinned before, so a module that never committed
+    anything looked healthy: every write silently rolled back.
+    """
+    conn = _conn(fetchone=(1,), fetchall=[])
+    call(conn)
+    conn.commit.assert_called()
+
+
+def test_fail_or_retry_commits_its_report() -> None:
+    conn = _conn(fetchone=(0, 3))
+    fail_or_retry(conn, 7, "boom", WORKER)
+    conn.commit.assert_called()
+
+
+def test_read_only_precheck_does_not_leave_a_transaction_open() -> None:
+    """psycopg2 opens a transaction even for a SELECT."""
+    conn = _conn(fetchone=(1,))
+    has_claim_token_column(conn)
+    assert conn.commit.called or conn.rollback.called
+
+
+# --- clauses that consume the asserted parameters ---------------------------
+
+
+def test_claim_writes_the_token_and_honours_its_limits() -> None:
+    """A param can be bound and then not used; assert the clause too."""
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER, limit=3, visibility_timeout_min=9)
+    sql = conn.cur.executed[0][0]
+    assert "claimed_by = %(w)s" in sql, "the token must actually be written"
+    assert "LIMIT %(lim)s" in sql, "limit must be bound, not hardcoded"
+    assert "INTERVAL '1 minute' * %(vis)s" in sql, "timeout must be bound"
+
+
+def test_claim_only_takes_pending_rows_that_are_ready() -> None:
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    claimable = conn.cur.executed[0][0].split("claimable AS")[1]
+    assert "status = 'pending'" in claimable
+    assert "next_attempt_at <= statement_timestamp()" in claimable, "deferral must be honoured"
+    assert "FOR UPDATE SKIP LOCKED" in claimable
+
+
+def test_stale_recovery_is_scoped_to_this_queue() -> None:
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    sql = conn.cur.executed[0][0]
+    reset = sql.split("retire_exhausted")[0]
+    retire = sql.split("retire_exhausted")[1].split("claimable")[0]
+    assert "queue_name = %(q)s" in reset, "must not recover another queue's rows"
+    assert "queue_name = %(q)s" in retire
+
+
+def test_dedup_predicate_is_scoped_to_queue_and_live_rows() -> None:
+    """Dropping queue_name would make dedup global: one enqueue suppressing the
+    same id in every other queue, silently, while returning success."""
+    conn = _conn(fetchone=(42,))
+    enqueue(conn, "triage", {"gmail_id": "abc"}, dedup_key="gmail_id")
+    where = [s for s, _ in conn.cur.executed if "NOT EXISTS" in s][0].split("NOT EXISTS")[1]
+    assert "queue_name = %s" in where
+    assert (
+        "status IN ('pending', 'processing')" in where
+    ), "completed rows must not suppress a replay"
+
+
+@pytest.mark.parametrize("dedup_key", [None, "gmail_id"])
+def test_priority_is_carried_on_both_insert_paths(dedup_key) -> None:
+    """CLAUDE.md fixes -100 for backfill; hardcoding 0 would erase that."""
+    conn = _conn(fetchone=(42,))
+    enqueue(conn, "triage", {"gmail_id": "abc"}, priority=-100, dedup_key=dedup_key)
+    params = _params_of(conn, "INSERT INTO queue")
+    assert -100 in params
+
+
+def test_release_defers_forward_not_backward() -> None:
+    """A negative interval would make the row instantly ready: a hot loop."""
+    conn = _conn(rowcount=1)
+    release(conn, 7, 120, WORKER)
+    sql, params = conn.cur.executed[0]
+    assert "clock_timestamp() + (INTERVAL '1 second' * %s)" in sql
+    assert params[0] == 120
+
+
+def test_backoff_grows_with_attempts() -> None:
+    """Asserting non-zero allowed a constant; the point is that it backs off."""
+    first = _conn(fetchone=(0, 9))
+    fail_or_retry(first, 7, "boom", WORKER)
+    later = _conn(fetchone=(5, 9))
+    fail_or_retry(later, 7, "boom", WORKER)
+    assert (
+        _params_of(later, "SET status = 'pending'")[2]
+        > _params_of(first, "SET status = 'pending'")[2]
+    )
+
+
+def test_partition_covers_exactly_one_day() -> None:
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s][0]
+    today = date.today()
+    assert f"FROM ('{today}') TO ('{today + timedelta(days=1)}')" in ddl
+
+
+def test_migration_precheck_looks_for_the_right_column() -> None:
+    conn = _conn(fetchone=(1,))
+    has_claim_token_column(conn)
+    sql = conn.cur.executed[0][0]
+    assert "attname = 'claimed_by'" in sql
+    assert "to_regclass('queue')" in sql, "must resolve through search_path"
+
+
+def test_migration_lock_timeout_is_transaction_scoped() -> None:
+    """A bare SET would leak the timeout into the whole session."""
+    conn = _conn(fetchone=None)
+    ensure_claim_token_column(conn)
+    assert any("SET LOCAL lock_timeout" in s for s, _ in conn.cur.executed)
+
+
+def test_terminal_failure_clears_the_retry_schedule() -> None:
+    conn = _conn(fetchone=(2, 3))
+    fail_or_retry(conn, 7, "boom", WORKER)
+    assert (
+        "next_attempt_at = NULL"
+        in [s for s, _ in conn.cur.executed if "SET status = 'failed'" in s][0]
+    )
+
+
+def test_complete_stamps_completed_at() -> None:
+    conn = _conn(rowcount=1)
+    complete(conn, 7, WORKER)
+    assert "completed_at = NOW()" in conn.cur.executed[0][0]
+
+
+def test_empty_dedup_key_is_rejected_not_silently_ignored() -> None:
+    """'' is falsy but not None: it used to skip validation and still take the
+    dedup branch, producing payload->>'' = NULL, which never matches."""
+    with pytest.raises(QueueError):
+        enqueue(_conn(fetchone=(42,)), "triage", {"": 1}, dedup_key="")

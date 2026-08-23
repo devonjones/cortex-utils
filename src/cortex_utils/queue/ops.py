@@ -93,8 +93,14 @@ def _tx(conn: psycopg2.extensions.connection) -> Iterator[psycopg2.extensions.cu
 
 
 def has_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
-    """True if this schema's queue table already has claimed_by."""
-    with conn.cursor() as cur:
+    """True if this schema's queue table already has claimed_by.
+
+    Goes through _tx like everything else: psycopg2 opens a transaction even for
+    a read, and this is the fast path on every service boot, so a bare cursor
+    would leave long-lived worker connections idle-in-transaction as the normal
+    case rather than the exception.
+    """
+    with _tx(conn) as cur:
         cur.execute(
             """
             SELECT 1 FROM pg_attribute
@@ -138,13 +144,20 @@ def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> No
     a partition retention just dropped) or the future (spraying junk partitions).
     """
     name = _partition_name(day)
-    with _tx(conn) as cur:
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
-            FOR VALUES FROM ('{day}') TO ('{day + timedelta(days=1)}')
-            """
-        )
+    try:
+        with _tx(conn) as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
+                FOR VALUES FROM ('{day}') TO ('{day + timedelta(days=1)}')
+                """
+            )
+    except psycopg2.errors.DuplicateTable:
+        # IF NOT EXISTS checks the name before taking the lock that serialises
+        # creation, so a concurrent creator can still win in between. The
+        # partition exists either way, which is all the caller needs.
+        log.info("Partition created concurrently", partition=name)
+        return
     # Loud on purpose. Reaching here means scheduled maintenance is not running;
     # a silent self-heal would let that stay true for weeks.
     log.warning(
@@ -201,7 +214,7 @@ def enqueue(
 
     A missing partition for today is created and the insert retried once.
     """
-    dedup_value = _validate_dedup(dedup_key, payload) if dedup_key else None
+    dedup_value = _validate_dedup(dedup_key, payload) if dedup_key is not None else None
 
     try:
         return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value)
