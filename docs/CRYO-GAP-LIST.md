@@ -205,6 +205,53 @@ consumes visibility windows as a side effect of asking a question.
 
 ---
 
+## G7 — No dead-letter lifecycle (P1)
+
+Added 2026-08-23 after building it in cryo. `dead_letter` is written to and
+never read from: there is no shared way to see what is in it, put something
+back, or close it out. cryo now has `dead_letters()`, `resubmit_dead_many()`
+and `dismiss_dead()`, which by the rule above means the gap is real.
+
+**This is not theoretical.** The 2026-08-18 outage looked like it cost cryo 4
+videos. Two more were already in `dead_letter` with the identical
+`visibility timeout, attempts exhausted`, invisible to every `queue` query.
+The real number was 6, and it was only found because Devon asked "what about
+dead letter?". A depth counter is not observability.
+
+Four design points, each of which the obvious implementation gets wrong:
+
+1. **A terminal state is mandatory, not optional.** Replay alone means every
+   genuinely-undoable item accumulates forever until the real failures are
+   buried in noise — and a triage list nobody can clear stops being read. cryo
+   added `dismissed_at`: terminal but NOT destructive, and idempotent, so
+   re-dismissing keeps the date it was actually written off.
+
+2. **Replay must LEAVE the archive row in place.** That row is the record that
+   work was given up on and when. Deleting it on replay erases the only
+   evidence it ever died — which is precisely the history you want when the
+   same item dies again. Double-replay is handled by `enqueue()`'s dedup, not
+   by bookkeeping.
+
+3. **The depth counter must count exactly what the list shows.** cryo's
+   `stats()` and its digest job both report a dead-letter count. Once
+   dismissal existed, one filtered and one did not, and two human-facing views
+   of one number silently diverged. Whichever you read last is the one you
+   believe; a page saying 2 while the digest says 6 is worse than either being
+   wrong alone.
+
+4. **Dead-letter ids are a SEPARATE NAMESPACE from queue ids.** Both tables
+   number from 1. An API that takes "an id" without saying which will
+   eventually resurrect an unrelated row.
+
+**Schema divergence you should know about (re: G1).** cryo's `dead_letter` now
+carries `dismissed_at`, added by cryo's own `migrate()`. Cortex's does not.
+That is exactly the drift G1 warns about, and we created it knowingly rather
+than block on the shared DDL — flagging it so it is a decision on your side
+rather than a surprise. If the shared version adopts a different mechanism for
+"written off", cryo will migrate to it.
+
+---
+
 ## G6 — LISTEN/NOTIFY, recorded so it moves intact (P3)
 
 Deliberately declined for now (adoption doc §6.3) and cryo is fine owning it.
@@ -288,6 +335,49 @@ separately-timed statements, so the budget is ~3× what a reader expects.
 A distinct `LockNotAvailable` is also better operator signal than a generic
 timeout: if someone else holds the parent they are almost certainly creating
 this very partition, so losing the race is success and the retry finds it there.
+
+## D4 — The five primitives reference `claimed_by` unguarded (P2, worth a look)
+
+Not a defect, and your probe is genuinely correct — `has_claim_token_column()`
+binds `to_regclass('queue')`, so it resolves under `search_path` and does NOT
+have the bare-relname problem. Credit where it is due.
+
+The observation is narrower: `claim()` (`ops.py:484`), `complete()` (508),
+`release()` (538) and `fail_or_retry()` (580) all reference `claimed_by`
+directly, and the protection is a CONVENTION — "services call this on every
+boot" — plus a helper the consumer must remember to call. A consumer that
+forgets gets `UndefinedColumn` out of `claim()`, i.e. from the core of the
+queue rather than a side feature.
+
+We raise it because cryo just lived the identical failure and is about to
+become the consumer most likely to forget:
+
+cryo added `dismissed_at` via its `migrate()`, and readers referenced it
+directly. On the live schema that produced `UndefinedColumn` from
+`GET /api/queue` — the dashboard's primary endpoint — and from the daily
+digest job, because `jobs/` reaches the host by `git pull` while the DDL rides
+the daemon image. **Two deploy paths, one schema assumption.**
+
+The rule we settled on, offered for whatever it is worth to you:
+
+> **Degrade where a useful answer exists; fail loudly where none does.**
+
+The three reads degrade (an unfiltered list is still the list, and on an
+unmigrated schema nothing *can* have been dismissed, so the unfiltered list is
+in fact the correct one) and say so in the response. The dismiss WRITE refuses
+with the command to run, because there is nowhere to record the decision and
+reporting success would leave an operator believing a list was cleared when it
+was not.
+
+And the part that cost us three review rounds, which generalises:
+
+> **A half-guard reads as safe and is not.**
+
+We guarded `stats()`, shipped, and left `dead_letters()` raising on the exact
+same schema. Then guarded that and nearly left the write. If you add a guard
+for `claimed_by`, add it to all five at once, or none.
+
+---
 
 ## D3 — Question, not a defect: rollback before the retry (P3)
 
