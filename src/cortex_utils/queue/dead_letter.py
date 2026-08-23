@@ -4,7 +4,7 @@ Failed jobs are archived to the dead_letter table before partition drops.
 This module provides tools to inspect, retry, and purge dead letter jobs.
 """
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import psycopg2
@@ -69,8 +69,11 @@ class DeadLetterManager:
             params.append(queue_name)
 
         if since:
-            conditions.append("failed_at > %s")
-            params.append(datetime.now() - since)
+            # Server clock: failed_at is TIMESTAMPTZ set by the server, and a
+            # naive local datetime.now() is a different clock in a possibly
+            # different timezone.
+            conditions.append("failed_at > NOW() - (INTERVAL '1 second' * %s)")
+            params.append(since.total_seconds())
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
@@ -157,6 +160,14 @@ class DeadLetterManager:
 
         with self.conn.cursor() as cur:
             cur.execute("DELETE FROM dead_letter WHERE id = %s;", (job_id,))
+            if cur.rowcount == 0:
+                # The row went while we were working -- a concurrent retry, or
+                # purge(). Reporting success would claim we moved something
+                # nobody else can see we moved, and the re-enqueue above would
+                # be a duplicate. Ask the database rather than assume.
+                self.conn.rollback()
+                log.warning("Dead letter row vanished mid-retry", dead_letter_id=job_id)
+                return False
 
         self.conn.commit()
         log.info(
@@ -214,9 +225,11 @@ class DeadLetterManager:
 
         Returns count of jobs purged.
         """
-        cutoff = datetime.now() - older_than
-        conditions = ["failed_at < %s"]
-        params: list[Any] = [cutoff]
+        # Server clock. This one drives a DELETE that cannot be undone: a local
+        # clock running ahead of the server would purge rows that are younger
+        # than the retention window the operator asked for.
+        conditions = ["failed_at < NOW() - (INTERVAL '1 second' * %s)"]
+        params: list[Any] = [older_than.total_seconds()]
 
         if queue_name:
             conditions.append("queue_name = %s")
@@ -228,14 +241,14 @@ class DeadLetterManager:
             if dry_run:
                 cur.execute(f"SELECT COUNT(*) FROM dead_letter WHERE {where};", params)
                 count = cur.fetchone()[0]
-                log.info("Would purge dead letter jobs", count=count, cutoff=cutoff)
+                log.info("Would purge dead letter jobs", count=count, older_than=str(older_than))
                 return count
 
             cur.execute(f"DELETE FROM dead_letter WHERE {where};", params)
             count = cur.rowcount
 
         self.conn.commit()
-        log.info("Purged dead letter jobs", count=count, cutoff=cutoff)
+        log.info("Purged dead letter jobs", count=count, older_than=str(older_than))
         return count
 
     def get_stats(self) -> dict[str, Any]:

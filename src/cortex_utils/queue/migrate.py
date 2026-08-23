@@ -11,11 +11,13 @@ This is a one-time migration that:
 The old table is preserved as queue_old for safety.
 """
 
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import Any
 
 import psycopg2
 import structlog
+
+from cortex_utils.queue.ops import server_today
 
 log = structlog.get_logger()
 
@@ -84,9 +86,8 @@ def is_queue_partitioned(conn: psycopg2.extensions.connection) -> bool:
         cur.execute(
             """
             SELECT pt.partstrat
-            FROM pg_class c
-            JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
-            WHERE c.relname = 'queue';
+            FROM pg_partitioned_table pt
+            WHERE pt.partrelid = to_regclass('queue');
         """
         )
         return cur.fetchone() is not None
@@ -122,17 +123,24 @@ def migrate_to_partitioned(
         status_counts=analysis["status_counts"],
     )
 
+    today = server_today(conn)
+
     if analysis["total_rows"] == 0:
         log.warning("Queue table is empty")
         # Still proceed - create structure with future partitions
-        analysis["min_date"] = date.today()
-        analysis["max_date"] = date.today()
+        analysis["min_date"] = today
+        analysis["max_date"] = today
+
+    # Anchor the window on today, not on the newest existing row. A quiet queue
+    # whose last insert predates the migration would otherwise get a range that
+    # ends before go-live: every partition created, none covering NOW(), and the
+    # migration reporting success.
+    end_date = max(analysis["max_date"], today) + timedelta(days=days_ahead)
 
     if dry_run:
         # Calculate partitions that would be created
         partitions = []
         current = analysis["min_date"]
-        end_date = analysis["max_date"] + timedelta(days=days_ahead)
         while current <= end_date:
             partitions.append(f"queue_{current.strftime('%Y_%m_%d')}")
             current += timedelta(days=1)
@@ -149,13 +157,21 @@ def migrate_to_partitioned(
     log.info("Starting migration to partitioned queue")
 
     with conn.cursor() as cur:
+        # 0. Freeze the source. analyze_existing_queue's total_rows is read in an
+        # earlier transaction, and nothing locks queue until the RENAME below, so
+        # a row committed after the copy's snapshot is copied nowhere, counted in
+        # neither side of the verification, and stranded in queue_old -- while the
+        # migration returns success. The mirror ordering is caught, so the check
+        # fires on the harmless case and stays silent on the lossy one.
+        log.info("Locking queue for the duration of the migration")
+        cur.execute("LOCK TABLE queue IN ACCESS EXCLUSIVE MODE;")
+
         # 1. Create partitioned table
         log.info("Creating partitioned table queue_new")
         cur.execute(PARTITIONED_QUEUE_SCHEMA)
 
         # 2. Create partitions for date range
         current = analysis["min_date"]
-        end_date = analysis["max_date"] + timedelta(days=days_ahead)
         partition_count = 0
 
         while current <= end_date:
@@ -236,9 +252,22 @@ def migrate_to_partitioned(
         )
 
         # 8. Reset sequence to continue from max id
+        #
+        # Ask the table which sequence it actually uses. queue_new was created
+        # with BIGSERIAL, so it owns queue_new_id_seq -- and ALTER TABLE ...
+        # RENAME TO does not rename an owned sequence. Naming queue_id_seq here
+        # advanced the sequence now owned by queue_old while the live table kept
+        # handing out ids from 1, colliding with every copied row. Legal, because
+        # partitioning forces created_at into the primary key, so nothing raised:
+        # the migration returned success and id stopped being unique. complete(),
+        # release() and fail_or_retry() all address rows by id.
+        cur.execute("SELECT pg_get_serial_sequence('queue', 'id');")
+        sequence = cur.fetchone()[0]
+        if sequence is None:
+            raise RuntimeError("queue.id has no owned sequence; refusing to leave ids unreseeded")
         cur.execute("SELECT MAX(id) FROM queue;")
         max_id = cur.fetchone()[0] or 0
-        cur.execute(f"SELECT setval('queue_id_seq', {max_id + 1}, false);")
+        cur.execute("SELECT setval(%s, %s, false);", (sequence, max_id + 1))
 
     conn.commit()
 
@@ -264,7 +293,7 @@ def drop_old_queue_table(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT 1 FROM pg_class WHERE relname = 'queue_old';
+            SELECT 1 WHERE to_regclass('queue_old') IS NOT NULL;
         """
         )
         if not cur.fetchone():

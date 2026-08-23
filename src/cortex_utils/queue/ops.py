@@ -70,6 +70,13 @@ ERROR_MAX_CHARS = 2000
 # every partition. Bounded so a boot cannot wedge the pipeline behind a claim.
 MIGRATION_LOCK_TIMEOUT_MS = 5000
 
+# CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on the parent, which
+# blocks every insert and every claim across all queue_names while held. On the
+# deploy path a few seconds is fine; this one runs on the live producer path, so
+# it gets a tighter bound. Losing the race is success -- whoever holds the lock
+# is almost certainly creating this very partition.
+PARTITION_LOCK_TIMEOUT_MS = 2000
+
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Values whose Python str() matches Postgres's jsonb ->> text output. bool gives
@@ -82,6 +89,18 @@ Report = Literal["pending", "failed", "stale"]
 
 class QueueError(RuntimeError):
     """Base for queue operation failures."""
+
+
+class PartitionError(QueueError):
+    """Base for partition-management failures, so callers can catch the category."""
+
+
+class QueueTableNotFoundError(PartitionError):
+    """No queue table is visible on the connection's search_path."""
+
+
+class PartitionNotAttachedError(PartitionError):
+    """A relation of the partition's name exists but is not a partition of queue."""
 
 
 @contextmanager
@@ -161,35 +180,142 @@ def _partition_name(day: date) -> str:
     return f"queue_{day.strftime('%Y_%m_%d')}"
 
 
-def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> None:
-    """Create the daily partition covering `day` in the current schema.
+def server_today(conn: psycopg2.extensions.connection) -> date:
+    """Today according to the server, not this process.
 
-    Only ever called for the current date: created_at defaults to NOW() and no
-    caller supplies it, so nothing can steer creation into the past (resurrecting
-    a partition retention just dropped) or the future (spraying junk partitions).
+    created_at is TIMESTAMPTZ DEFAULT NOW(), a value the *server* produces, so
+    any date used to route or create a partition for that row has to come from
+    the same clock. A client-side date.today() is a second, unsynchronised clock
+    in a possibly different timezone; it agrees only by coincidence, which means
+    it tests green wherever client and server are both UTC and fails on the
+    first deployment where they are not.
+
+    Goes through _tx like every other read here: psycopg2 opens a transaction
+    even for a SELECT, and callers such as create_future_partitions can finish
+    without ever reaching a write, which would leave the connection
+    idle-in-transaction on the steady-state path.
+
+    Invariant this rests on: every connection operating a given queue uses the
+    same session TimeZone. CURRENT_DATE and the FROM/TO bounds on a TIMESTAMPTZ
+    column are both TimeZone-dependent, so two connections disagreeing puts the
+    boundary rows of each day in the wrong partition. PGOPTIONS is already the
+    schema-selection knob here (`-c search_path=cryo`) and carries `-c timezone=`
+    too, so this is one env var away from being violated. The create path fails
+    loudly if it happens; drop_old_partitions compares a name-derived date
+    against a differently-framed cutoff and would drop silently.
     """
-    name = _partition_name(day)
+    with _tx(conn) as cur:
+        cur.execute("SELECT CURRENT_DATE")
+        return cur.fetchone()[0]
+
+
+_ATTACHED_SQL = """
+    SELECT 1 FROM pg_class c
+    JOIN pg_inherits i ON c.oid = i.inhrelid
+    WHERE i.inhparent = to_regclass('queue') AND c.relname = %s
+"""
+
+
+def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool:
+    """True if `name` is a partition of this schema's queue.
+
+    Bound via to_regclass so it answers about the queue this search_path
+    resolves, not a same-named table in another schema.
+    """
+    with _tx(conn) as cur:
+        cur.execute(_ATTACHED_SQL, (name,))
+        return cur.fetchone() is not None
+
+
+def _ensure_partition(conn: psycopg2.extensions.connection, target: date, required: bool) -> str:
+    """Make the partition for `target` exist. Returns present/absent.
+
+    Not created/present: CREATE TABLE IF NOT EXISTS succeeds either way, so
+    distinguishing them would cost a round trip to answer a question nobody
+    asks. The caller logs the outcome and branches on nothing.
+
+    Neither failure mode proves anything on its own, so neither is interpreted:
+    DuplicateTable can be a same-named relation that is not a partition of this
+    queue, and LockNotAvailable can be ALTER TABLE or DROP TABLE holding the
+    parent rather than another creator -- ensure_claim_token_column's lock
+    timeout is longer than this one, so it can outlast us. Ask the catalogue
+    instead of guessing.
+
+    Success is not interpreted either. CREATE TABLE IF NOT EXISTS raises nothing
+    when the name is already taken by a relation that is not a partition of this
+    queue -- it emits a NOTICE and skips -- so the statement returning cleanly is
+    not evidence the partition exists. migrate.py creates exactly those shadow
+    names (queue_YYYY_MM_DD as partitions of queue_new), and partitions.py guards
+    the identical statement the same way.
+
+    `required` marks the partition the caller actually needs. A speculative one
+    must never fail the caller's write: its whole purpose is to save a later
+    call, and failing now to save a hypothetical later failure is a bad trade.
+    """
+    name = _partition_name(target)
     try:
         with _tx(conn) as cur:
+            cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
-                FOR VALUES FROM ('{day}') TO ('{day + timedelta(days=1)}')
+                FOR VALUES FROM ('{target}') TO ('{target + timedelta(days=1)}')
                 """
             )
-    except psycopg2.errors.DuplicateTable:
-        # IF NOT EXISTS checks the name before taking the lock that serialises
-        # creation, so a concurrent creator can still win in between. The
-        # partition exists either way, which is all the caller needs.
-        log.info("Partition created concurrently", partition=name)
-        return
-    # Loud on purpose. Reaching here means scheduled maintenance is not running;
-    # a silent self-heal would let that stay true for weeks.
-    log.warning(
-        "Created queue partition from the write path",
-        partition=name,
-        hint="partition maintenance is not keeping up",
-    )
+            cur.execute(_ATTACHED_SQL, (name,))
+            if cur.fetchone() is None:
+                raise PartitionNotAttachedError(
+                    f"{name} exists but is not a partition of this queue"
+                )
+        return "present"
+    except PartitionNotAttachedError:
+        if required:
+            raise
+        log.warning("Partition name is taken by something else", partition=name)
+        return "absent"
+    except (psycopg2.errors.DuplicateTable, psycopg2.errors.LockNotAvailable):
+        if _partition_attached(conn, name):
+            return "present"
+        if required:
+            raise
+        return "absent"
+    except psycopg2.Error:
+        # Disk, permissions, a deadlock. The caller's own partition must surface
+        # that; a speculative one must not take the write down with it.
+        if required:
+            raise
+        log.warning("Could not pre-create tomorrow's partition", partition=name)
+        return "absent"
+
+
+def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> None:
+    """Ensure the partitions covering `day` and the day after, in this schema.
+
+    `day` must come from the server (see server_today), never from this process.
+
+    Tomorrow is created in the same pass so a retry that crosses midnight does
+    not find itself missing a partition again; that removes the race rather than
+    narrowing it. Tomorrow is inside maintenance's normal +3 horizon, so this
+    cannot push one schema's partitions past another's -- which the shared-image
+    coupling forbids.
+
+    Reaching here at all means scheduled maintenance is not keeping up, so the
+    outcome is logged whatever happens: a silent self-heal would let that stay
+    true for weeks, which is the failure this module exists to prevent.
+    """
+    outcomes = {}
+    try:
+        for offset in (0, 1):
+            target = day + timedelta(days=offset)
+            outcomes[_partition_name(target)] = _ensure_partition(
+                conn, target, required=(offset == 0)
+            )
+    finally:
+        log.warning(
+            "Partition self-heal ran from the write path",
+            outcomes=outcomes,
+            hint="partition maintenance is not keeping up",
+        )
 
 
 def _is_missing_partition(exc: psycopg2.Error) -> bool:
@@ -254,7 +380,7 @@ def enqueue(
         if not commit or not _is_missing_partition(exc):
             raise
 
-    _create_partition_for(conn, date.today())
+    _create_partition_for(conn, server_today(conn))
     # Exactly one retry. Anything still failing is not a partition problem.
     return _insert(conn, queue_name, payload, priority, dedup_key, dedup_value, commit)
 
@@ -382,6 +508,10 @@ def complete(conn: psycopg2.extensions.connection, job_id: int, worker: str) -> 
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s",
             (job_id, worker),
         )
+        # id alone, not the full (id, created_at) key: this is one statement, so
+        # there is no window to lose the claim in, and the shared sequence keeps
+        # id unique across partitions. fail_or_retry needs created_at because it
+        # reads first and writes second.
         held = cur.rowcount > 0
     if not held:
         log.warning("complete() bounced: claim no longer held", job_id=job_id, worker=worker)
@@ -410,6 +540,10 @@ def release(
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s",
             (delay_s, job_id, worker),
         )
+        # id alone, not the full (id, created_at) key: this is one statement, so
+        # there is no window to lose the claim in, and the shared sequence keeps
+        # id unique across partitions. fail_or_retry needs created_at because it
+        # reads first and writes second.
         held = cur.rowcount > 0
     if not held:
         log.warning("release() bounced: claim no longer held", job_id=job_id, worker=worker)
@@ -430,11 +564,19 @@ def fail_or_retry(
     Returns "pending", "failed", or "stale" when the claim was no longer ours.
     Call this only when the work was attempted and failed; for "never started",
     use release().
+
+    This reads attempts and then writes, rather than letting one UPDATE with a
+    CASE decide -- which is the shape the database should normally arbitrate.
+    The exception is deliberate: expressing the backoff in SQL would put a second
+    copy of compute_backoff_delay in a second language, and two consumers already
+    share the Python one. FOR UPDATE holds the row for the round trip, so the
+    read-modify-write is atomic; the cost is one round trip to keep the backoff
+    in a single place.
     """
     truncated = str(error)[:ERROR_MAX_CHARS]
     with _tx(conn) as cur:
         cur.execute(
-            "SELECT attempts, max_attempts FROM queue "
+            "SELECT attempts, max_attempts, created_at FROM queue "
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s FOR UPDATE",
             (job_id, worker),
         )
@@ -449,13 +591,14 @@ def fail_or_retry(
 
         attempts = (row[0] or 0) + 1
         max_attempts = row[1]
+        created_at = row[2]
 
         if attempts >= max_attempts:
             cur.execute(
                 "UPDATE queue SET status = 'failed', attempts = %s, last_error = %s, "
                 "claimed_at = NULL, claimed_by = NULL, next_attempt_at = NULL "
-                "WHERE id = %s",
-                (attempts, truncated, job_id),
+                "WHERE id = %s AND created_at = %s",
+                (attempts, truncated, job_id, created_at),
             )
             log.error(
                 "Job retired after exhausting attempts",
@@ -475,8 +618,8 @@ def fail_or_retry(
             "UPDATE queue SET status = 'pending', attempts = %s, last_error = %s, "
             "claimed_at = NULL, claimed_by = NULL, "
             "next_attempt_at = clock_timestamp() + (INTERVAL '1 second' * %s) "
-            "WHERE id = %s",
-            (attempts, truncated, delay, job_id),
+            "WHERE id = %s AND created_at = %s",
+            (attempts, truncated, delay, job_id, created_at),
         )
         log.warning(
             "Job failed, scheduled for retry",

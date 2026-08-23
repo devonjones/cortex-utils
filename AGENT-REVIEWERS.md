@@ -1580,6 +1580,161 @@ Review test changes for **isolation from live infrastructure**. Cortex tests mus
 
 ---
 
+## clock-discipline-reviewer
+
+Review any date or time that reaches the database for **which clock produced
+it**. Postgres rows are stamped by the *server*; a value computed in the Python
+process comes from a *different* clock, in a possibly different timezone, and
+the two agree only by coincidence.
+
+That coincidence is what makes this class dangerous. It tests green on every box
+where client and server are both UTC, passes review because the code reads
+naturally, and fails on the first deployment where they are not. It is not a
+race that shows up under load — it is a correctness bug that shows up under
+*deployment*.
+
+**Default severity: P1** when the value routes or creates a partition, because
+the failure is silent data loss: rows route to a partition that does not exist,
+or a self-heal creates the wrong day and the insert fails for a partition that
+was never missing. **P2** for filters and reported timestamps, where the result
+is wrong answers rather than lost writes.
+
+**What to flag:**
+
+1. **`date.today()`, `datetime.now()`, `datetime.utcnow()`, `time.time()` whose
+   value reaches SQL** — as a bound parameter, an interpolated partition name, a
+   date range, or a cutoff. The partition case is the worst: the partition key is
+   `created_at TIMESTAMPTZ DEFAULT NOW()`, a value the server produces, so a
+   client-derived partition date is a second clock deciding where a server-dated
+   row lives.
+2. **A single statement mixing both clocks** — e.g. `WHERE claimed_at < %s` with
+   a Python cutoff, while the same query computes `NOW() - claimed_at`. The
+   filter and the arithmetic then disagree.
+3. **Naive datetimes compared against `TIMESTAMPTZ`.** `datetime.now()` is naive
+   local time; the column is timezone-aware. The comparison is doubly wrong and
+   silently so.
+4. **A tolerance or window that narrows a race instead of removing it.** Creating
+   only "today" leaves a retry that crosses midnight still broken; creating today
+   *and* tomorrow in one pass removes it.
+5. **Tests that assert the client clock.** A test written against `date.today()`
+   cannot distinguish correct behaviour from the bug, and will keep passing after
+   a regression. Fixtures should use a fixed date that is deliberately *not*
+   today.
+
+**The fix, not a suggestion:** derive the value from the same clock that produces
+the data — `CURRENT_DATE`, `NOW()`, `clock_timestamp()`, or an
+`INTERVAL` expression evaluated server-side. If Python needs the value, fetch it
+(`SELECT CURRENT_DATE`) rather than computing it.
+
+**Do NOT flag:**
+
+- Clocks that never reach the database: log timestamps, in-process rate-limiter
+  windows, sleep durations, metrics emitted to Prometheus, elapsed-time
+  measurement.
+- One-shot scripts and migrations where the operator's local date is the
+  intended input.
+- `clock_timestamp()` vs `NOW()` distinctions inside a transaction — both are
+  server-side and that choice is about statement-versus-transaction time, not
+  clock provenance.
+
+**Review approach:**
+
+1. `grep -n "date.today()\|datetime.now()\|utcnow()\|time.time()"` over the diff.
+2. For each hit, trace whether the value reaches a cursor. If it does not, skip it.
+3. If it does, ask what column or expression it is compared against or used to
+   name. Anything derived from `NOW()` on the server is a finding.
+4. Check the tests for the same construct — a client-clock fixture hides the bug
+   it is meant to catch.
+
+**History:** `ops.py` created write-path partitions from `date.today()` while
+`created_at` came from server `NOW()`, and `partitions.py` did the same in
+scheduled maintenance. Both were invisible on ares and hades because both are
+UTC. Found by review, not by tests — two of the tests asserted the client clock
+and would have kept passing.
+
+---
+
+## transactional-decision-reviewer
+
+**The database is the arbiter.** Existence, uniqueness, ordering, atomicity, the
+current time — these are things Postgres knows authoritatively and this process
+does not. Code that decides them in Python is holding a second opinion that can
+disagree with the only one that counts, and the disagreement is silent.
+
+Review code that **acts on a guess about database state** instead of asking
+inside a transaction. When a decision depends on whether a row, table, or
+partition exists, and the cost of checking is a cheap query on an
+already-open connection, the check belongs in the transaction rather than being
+inferred from an error code or a lock outcome.
+
+The failure this catches is specific: an exception is treated as evidence of
+something it does not actually prove, so the code takes the wrong branch and
+reports success. That reads as defensive programming and behaves as a lie.
+
+**Default severity: P2.** **P1** when the wrong branch is reported as success,
+because the caller then proceeds on a false belief.
+
+**What to flag:**
+
+0. **A decision Postgres could have made, made in Python instead.** A
+   read-modify-write where one statement would do; a uniqueness check racing
+   ahead of a constraint; ordering imposed after the fact rather than by `ORDER
+   BY`; a timestamp or date computed locally (see clock-discipline-reviewer).
+   The test is whether the database could arbitrate authoritatively in one
+   statement — if so, the Python version is a second opinion.
+1. **An error code read as proof of state.** `DuplicateTable` treated as "it
+   exists, therefore fine" — it proves a *name* is taken, not that the object is
+   the thing you wanted. `LockNotAvailable` treated as "someone else is doing my
+   work" — it proves contention, and the holder may be doing something else
+   entirely, including dropping the object you assumed it was creating.
+2. **A guess where a query was already affordable.** The connection is open, the
+   transaction is live, and the check is an indexed catalogue or primary-key
+   lookup. Prefer: attempt, and on ambiguity ask; or check, then act, with the
+   idempotent guard to cover the window.
+3. **Compensating logic built on the guess** — retries, backoff, or "assume it
+   worked" paths that exist only because the code declined to look.
+
+**Where a guess is legitimate — do NOT flag:**
+
+- **When checking would contend.** The point is to avoid guessing, not to add
+  locking. A check that itself takes a heavy lock (`SELECT FOR UPDATE` on a hot
+  row, anything needing `ACCESS EXCLUSIVE`) is worse than the guess it replaces.
+  Catalogue reads, PK lookups and `to_regclass` are cheap and take no such lock;
+  prefer those.
+- **When the check cannot be authoritative.** If the answer can change between
+  the check and the act and the act is not idempotent, checking buys false
+  confidence. Say so rather than adding a check that reads as a guarantee.
+- **Hot paths where the extra round trip is measurable** and the guess is
+  documented as an accepted approximation.
+- **Advisory-lock serialisation** already used to make a decision safe — that is
+  the correct pattern, not a guess.
+
+**Review approach:**
+
+1. Find `except` clauses that set a state variable, return a status, or log
+   success, rather than re-raising or handling a genuine error.
+1b. And find statements whose own result is discarded before success is
+   reported -- a DELETE or UPDATE whose `rowcount` is never read, an INSERT
+   whose RETURNING is ignored. This is the same defect without an exception to
+   notice: the database said how many rows it touched and the code did not
+   listen. Grepping for `except` alone misses it, which is how it survived here.
+2. For each, ask what the exception actually proves, and whether the code's next
+   action assumes more than that.
+3. If more: can the truth be obtained with a cheap query on the open connection?
+   If yes, that is the finding. If the only check would contend or could not be
+   authoritative, leave it and say why.
+4. Check the tests: a mock that always returns the happy answer cannot tell a
+   correct concession from a lucky one.
+
+**History:** the queue's write-path partition self-heal treated both
+`DuplicateTable` and `LockNotAvailable` as "the partition exists". Neither is:
+the first can be a same-named relation that is not a partition of this queue,
+and the second can be `ALTER TABLE` or `DROP TABLE` holding the parent, with a
+longer lock timeout than the self-heal's own. It now asks `pg_inherits` after
+either failure -- a cheap catalogue read on the connection it already holds.
+
+---
+
 ## migration-idempotency-reviewer
 
 Review schema changes for **idempotency**. Cortex applies its schema by running `ensure_schema()` / `ensure_*_schema()` functions on **every service and worker startup** — there is no one-shot migration runner. The same DDL re-executes on every boot and against databases at different starting states, so each statement must be safe to run repeatedly and safe against tables that already hold rows.

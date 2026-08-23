@@ -13,11 +13,14 @@ covering it against a real server.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
+from typing import Any
 from unittest.mock import MagicMock
 
+import psycopg2
 import pytest
 
+from cortex_utils.queue.ops import QueueError
 from cortex_utils.queue.partitions import (
     PartitionError,
     PartitionManager,
@@ -32,10 +35,24 @@ PARENT_OK: Row = ("queue",)
 PARENT_MISSING: Row = (None,)
 
 
+# The date the fake server reports, deliberately not date.today(): partition
+# dates must come from the server clock that produces created_at, so a test
+# using the client clock could not tell a regression from correct behaviour.
+SERVER_TODAY = date(2026, 3, 1)
+
+
 def _is_meta(sql: str) -> bool:
-    """True for the guard's own probe statements, which carry no lookup logic."""
+    """True for probe statements that carry no lookup logic of their own."""
     stripped = sql.strip()
-    return stripped.startswith("SELECT to_regclass") or stripped.startswith("SHOW search_path")
+    return (
+        stripped.startswith("SELECT to_regclass")
+        or stripped.startswith("SHOW search_path")
+        or stripped.startswith("SELECT CURRENT_DATE")
+    )
+
+
+def _name(day: date) -> str:
+    return f"queue_{day.strftime('%Y_%m_%d')}"
 
 
 def _manager_capturing_sql(
@@ -64,6 +81,8 @@ def _manager_capturing_sql(
             answered_meta.append(parent)
         elif sql.strip().startswith("SHOW search_path"):
             answered_meta.append(("public",))
+        elif sql.strip().startswith("SELECT CURRENT_DATE"):
+            answered_meta.append((SERVER_TODAY,))
 
     def _fetchone() -> Row | None:
         if answered_meta:
@@ -204,6 +223,11 @@ def test_partition_errors_share_a_base() -> None:
     """Callers should be able to catch the category without an explicit tuple."""
     assert issubclass(QueueTableNotFoundError, PartitionError)
     assert issubclass(PartitionNotAttachedError, PartitionError)
+    # And one level further up, which is the level that actually matters to a
+    # consumer: enqueue() raises PartitionNotAttachedError, so a worker loop
+    # catching QueueError -- the documented way to catch queue failures -- must
+    # catch it. Pinning only the two leaves leaves this base free to revert.
+    assert issubclass(PartitionError, QueueError)
 
 
 def test_create_future_partitions_raises_the_first_failure() -> None:
@@ -212,8 +236,8 @@ def test_create_future_partitions_raises_the_first_failure() -> None:
     manager, _ = _manager_capturing_sql(rows=[None, None, None, None])
     with pytest.raises(PartitionNotAttachedError) as excinfo:
         manager.create_future_partitions(days_ahead=1)
-    today = date.today()
-    assert f"queue_{today.strftime('%Y_%m_%d')}" in str(excinfo.value)
+    # The server's date, not this process's: the two agree only by coincidence.
+    assert f"queue_{SERVER_TODAY.strftime('%Y_%m_%d')}" in str(excinfo.value)
 
 
 def test_create_future_partitions_returns_count_when_all_succeed() -> None:
@@ -239,3 +263,254 @@ def test_create_future_partitions_does_not_count_existing_partitions() -> None:
     # day 0 already there; day 1 absent, then present after its CREATE.
     manager, _ = _manager_capturing_sql(rows=[(1,), None, (1,)])
     assert manager.create_future_partitions(days_ahead=1) == 1
+
+
+def test_retention_cutoff_uses_the_server_clock() -> None:
+    """The destructive path. A client clock running ahead of the server pushes
+    the cutoff forward and drops a partition still holding live rows."""
+    manager, executed = _manager_capturing_sql(fetchall=[])
+    manager.drop_old_partitions(retention_days=7)
+    assert any("SELECT CURRENT_DATE" in sql for sql in executed), (
+        "the retention cutoff must come from the server, not this process"
+    )
+
+
+def test_retention_drops_only_partitions_older_than_the_window() -> None:
+    """Asserting the clock source alone left the arithmetic free: a sign flip or
+    an off-by-N still drops live partitions, silently and irreversibly.
+
+    SERVER_TODAY is 2026-03-01, so a 7-day window retains 02-23 onward and
+    retires anything older.
+    """
+    parts = [
+        {"name": _name(SERVER_TODAY - timedelta(days=d)), "size": "0", "size_bytes": 0}
+        for d in (10, 8, 7, 6, 0)
+    ]
+    manager, _ = _manager_capturing_sql()
+    manager.list_partitions = lambda: parts  # type: ignore[method-assign]
+    dropped: list[date] = []
+    manager.drop_partition = (  # type: ignore[method-assign]
+        lambda d, **kw: dropped.append(d) or {"dropped_rows": 0, "archived_failed": 0}
+    )
+
+    manager.drop_old_partitions(retention_days=7)
+
+    assert dropped == [SERVER_TODAY - timedelta(days=10), SERVER_TODAY - timedelta(days=8)]
+    assert SERVER_TODAY not in dropped, "today must never be dropped"
+
+
+def test_a_dry_run_drop_does_not_hold_the_partition_lock() -> None:
+    """drop_partition takes SHARE ROW EXCLUSIVE before counting. On the real
+    path the DROP commits and releases it; a preview reaches no commit, so
+    without an explicit rollback drop_old_partitions accumulates one lock per
+    expired partition and holds them for the rest of the connection. claim()'s
+    stale-reset and retirement UPDATEs are not date-qualified, so a *preview*
+    would block the claim path pipeline-wide.
+    """
+    manager, executed = _manager_capturing_sql(rows=[(1,)])  # the partition exists
+
+    manager.drop_partition(SERVER_TODAY - timedelta(days=30), dry_run=True)
+
+    assert any("LOCK TABLE" in sql for sql in executed), "the lock is what needs releasing"
+    assert not any("DROP TABLE" in sql for sql in executed), "a preview drops nothing"
+    manager.conn.commit.assert_not_called()
+    manager.conn.rollback.assert_called_once()
+
+
+def test_skipping_a_partition_with_active_jobs_releases_its_lock() -> None:
+    """The twin of the dry-run leak, and the worse one: it needs no --dry-run
+    flag, and the nightly `partitions maintain` cron is the caller. The comment
+    on the dry-run rollback claims this branch already does the right thing --
+    nothing was asserting that it does."""
+    manager, executed = _manager_capturing_sql(
+        rows=[(1,)],  # the partition exists
+        fetchall=[("pending", 3)],  # ...and still holds live work
+    )
+
+    result = manager.drop_partition(SERVER_TODAY - timedelta(days=30))
+
+    assert result["skipped_active"] == 3
+    assert not any("DROP TABLE" in sql for sql in executed), "live jobs must survive"
+    manager.conn.rollback.assert_called_once()
+    manager.conn.commit.assert_not_called()
+
+
+def test_failed_jobs_are_archived_before_the_partition_is_dropped() -> None:
+    """The whole reason retention is allowed to DROP: failed jobs move to
+    dead_letter first. Nothing was executing this body -- round 4 pinned the two
+    branches that exit *before* it. Disabling the archive leaves the DROP in
+    place and every failed job in that partition permanently gone, on the
+    nightly `partitions maintain` cron, with nothing raised.
+    """
+    manager, executed = _manager_capturing_sql(
+        rows=[(1,)],  # the partition exists
+        fetchall=[("failed", 4), ("completed", 9)],
+    )
+
+    result = manager.drop_partition(SERVER_TODAY - timedelta(days=30))
+
+    archive = [sql for sql in executed if "INSERT INTO dead_letter" in sql]
+    assert archive, "failed jobs must be archived before the drop"
+    drop_at = next(i for i, sql in enumerate(executed) if "DROP TABLE" in sql)
+    assert executed.index(archive[0]) < drop_at, "archive must precede the drop"
+    assert "WHERE status = 'failed'" in archive[0]
+    assert result["dropped_rows"] == 13
+
+
+def test_archiving_can_be_turned_off_but_then_nothing_is_archived() -> None:
+    manager, executed = _manager_capturing_sql(rows=[(1,)], fetchall=[("failed", 4)])
+    manager.drop_partition(SERVER_TODAY - timedelta(days=30), archive_failed=False)
+    assert not [sql for sql in executed if "INSERT INTO dead_letter" in sql]
+
+
+def test_forcing_a_drop_reenqueues_live_jobs_before_dropping() -> None:
+    """force=True is the only way live work survives a drop -- it is re-enqueued
+    with a fresh created_at so it lands in today's partition."""
+    manager, executed = _manager_capturing_sql(
+        rows=[(1,)], fetchall=[("pending", 2), ("processing", 1)]
+    )
+
+    result = manager.drop_partition(SERVER_TODAY - timedelta(days=30), force=True)
+
+    requeue = [sql for sql in executed if "INSERT INTO queue" in sql]
+    assert requeue, "live jobs must be re-enqueued, not dropped"
+    assert "WHERE status IN ('pending', 'processing')" in requeue[0]
+    assert "NOW()" in requeue[0], "fresh created_at, or it lands back in this partition"
+    assert executed.index(requeue[0]) < next(
+        i for i, sql in enumerate(executed) if "DROP TABLE" in sql
+    )
+    assert "skipped_active" not in result
+
+
+def test_a_skipped_partition_is_not_counted_as_dropped() -> None:
+    """The wedged-queue signal: a partition kept back because it still holds
+    live work must show up as skipped, not folded into the dropped count."""
+    manager, _ = _manager_capturing_sql()
+    manager.list_partitions = lambda: [  # type: ignore[method-assign]
+        {"name": _name(SERVER_TODAY - timedelta(days=d)), "size": "0", "size_bytes": 0}
+        for d in (10, 9)
+    ]
+    manager.drop_partition = lambda d, **kw: (  # type: ignore[method-assign]
+        {"skipped_active": 3, "dropped_rows": 0, "archived_failed": 0}
+        if d == SERVER_TODAY - timedelta(days=10)
+        else {"dropped_rows": 5, "archived_failed": 1}
+    )
+
+    totals = manager.drop_old_partitions(retention_days=7)
+
+    assert totals["partitions_skipped"] == 1
+    assert totals["partitions_dropped"] == 1
+    assert totals["rows_dropped"] == 5
+
+
+def test_a_concurrent_creator_does_not_abort_the_maintenance_run() -> None:
+    """IF NOT EXISTS narrows the window between the check and the CREATE but
+    does not close it -- the name check is not atomic with the creation. Two
+    maintenance jobs share this database, and an unhandled DuplicateTable would
+    abort the transaction and take the rest of maintain() down with it.
+    """
+    manager, executed = _manager_capturing_sql(rows=[None, (1,)])
+    raised = {"once": False}
+    plain = manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect
+
+    def execute(sql: str, *args: object) -> None:
+        plain(sql, *args)
+        if "CREATE TABLE" in sql and not raised["once"]:
+            raised["once"] = True
+            raise psycopg2.errors.DuplicateTable("beaten to it")
+
+    manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect = execute
+
+    assert manager.create_partition(date(2026, 8, 6)) is True
+    manager.conn.rollback.assert_called_once()
+    assert [sql for sql in executed if "pg_inherits" in sql], (
+        "losing the race is not proof the partition exists -- ask the catalogue"
+    )
+
+
+def test_a_shadowed_name_still_raises_when_the_create_is_lost() -> None:
+    """Same race, but the winner was not a partition of queue. Conceding on the
+    exception alone would report success for a day with no partition."""
+    manager, _ = _manager_capturing_sql(rows=[None, None])
+    plain = manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect
+
+    def execute(sql: str, *args: object) -> None:
+        plain(sql, *args)
+        if "CREATE TABLE" in sql:
+            raise psycopg2.errors.DuplicateTable("name taken")
+
+    manager.conn.cursor.return_value.__enter__.return_value.execute.side_effect = execute
+
+    with pytest.raises(PartitionNotAttachedError):
+        manager.create_partition(date(2026, 8, 6))
+
+
+def test_maintain_forwards_dry_run_to_both_halves() -> None:
+    """The cron entrypoint, and it had no tests: every mutation in it survived,
+    including flipping this flag on the drop half -- which makes
+    `partitions maintain --dry-run` drop partitions for real. Silent and
+    irreversible, in the one function the nightly job actually calls.
+    """
+    manager, _ = _manager_capturing_sql()
+    seen: dict[str, bool] = {}
+    manager.create_future_partitions = (  # type: ignore[method-assign]
+        lambda days_ahead, dry_run: seen.__setitem__("create", dry_run) or 0
+    )
+    manager.drop_old_partitions = lambda **kw: (  # type: ignore[method-assign]
+        seen.__setitem__("drop", kw["dry_run"]) or {"partitions_dropped": 0}
+    )
+
+    result = manager.maintain(dry_run=True)
+
+    assert seen == {"create": True, "drop": True}, "a preview must preview both halves"
+    assert result["dry_run"] is True, "and must say so, or the log reads as a real run"
+
+
+def test_maintain_creates_before_it_drops() -> None:
+    """Drop-then-create leaves a window with no partition for today: the write
+    path self-heals, but only after an insert has already failed."""
+    manager, _ = _manager_capturing_sql()
+    order: list[str] = []
+    manager.create_future_partitions = lambda **kw: order.append("create") or 2  # type: ignore[method-assign]
+    manager.drop_old_partitions = lambda **kw: order.append("drop") or {}  # type: ignore[method-assign]
+
+    manager.maintain()
+
+    assert order == ["create", "drop"]
+
+
+def test_maintain_reports_both_halves_and_its_own_mode() -> None:
+    """The cron's only output. Losing a key here makes a run that dropped
+    nothing indistinguishable from one that dropped everything."""
+    manager, _ = _manager_capturing_sql()
+    manager.create_future_partitions = lambda **kw: 3  # type: ignore[method-assign]
+    manager.drop_old_partitions = lambda **kw: {  # type: ignore[method-assign]
+        "partitions_dropped": 2,
+        "partitions_skipped": 1,
+        "rows_dropped": 40,
+    }
+
+    result = manager.maintain(retention_days=7, days_ahead=3)
+
+    assert result == {
+        "partitions_created": 3,
+        "partitions_dropped": 2,
+        "partitions_skipped": 1,
+        "rows_dropped": 40,
+        "dry_run": False,
+    }
+
+
+def test_maintain_passes_its_windows_through() -> None:
+    """retention_days and days_ahead swapped would retire three days of live
+    partitions and create a week of empty ones."""
+    manager, _ = _manager_capturing_sql()
+    got: dict[str, Any] = {}
+    manager.create_future_partitions = lambda **kw: got.update(create=kw) or 0  # type: ignore[method-assign]
+    manager.drop_old_partitions = lambda **kw: got.update(drop=kw) or {}  # type: ignore[method-assign]
+
+    manager.maintain(retention_days=14, days_ahead=5)
+
+    assert got["create"]["days_ahead"] == 5
+    assert got["drop"]["retention_days"] == 14
+    assert got["drop"]["archive_failed"] is True, "the cron must not drop failed jobs unarchived"

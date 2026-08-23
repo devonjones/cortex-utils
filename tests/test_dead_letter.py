@@ -9,6 +9,7 @@ refactor.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -135,3 +136,64 @@ def test_a_non_database_error_is_not_swallowed() -> None:
     mgr.retry_job = broken  # type: ignore[method-assign]
     with pytest.raises(ValueError):
         mgr.retry_jobs()
+
+
+def test_a_row_that_vanished_mid_retry_is_not_reported_as_retried() -> None:
+    """A concurrent retry or purge can take it while we work. Claiming success
+    would also leave the re-enqueue above as a duplicate."""
+    mgr, conn = _manager()
+    conn.cur.rowcount = 0
+    assert mgr.retry_job(5) is False
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+
+
+def test_purge_window_is_seconds_on_the_server_clock() -> None:
+    """The only irreversible statement in this module.
+
+    The window used to be a Python datetime, where a unit mistake is a type
+    error. It is now a bare number multiplied by an INTERVAL literal, where a
+    unit mistake silently deletes rows younger than the operator asked for --
+    and a client clock running ahead of the server deletes them early.
+    """
+    mgr, conn = _manager()
+    mgr.purge(timedelta(days=30))
+    sql, params = [(s, p) for s, p in conn.cur.executed if "DELETE FROM dead_letter" in s][0]
+    assert "failed_at < NOW() - (INTERVAL '1 second' * %s)" in sql
+    assert params[0] == 30 * 24 * 3600
+
+
+def test_purge_dry_run_deletes_nothing() -> None:
+    mgr, conn = _manager(fetchone=(7,))
+    assert mgr.purge(timedelta(days=30), dry_run=True) == 7
+    assert not any("DELETE" in s for s, _ in conn.cur.executed)
+    conn.commit.assert_not_called()
+
+
+def test_purge_scoped_to_one_queue_keeps_the_window() -> None:
+    """Dropping the age predicate when a queue filter is present would purge
+    that queue's entire dead-letter history."""
+    mgr, conn = _manager()
+    mgr.purge(timedelta(days=30), queue_name="triage")
+    sql, params = [(s, p) for s, p in conn.cur.executed if "DELETE FROM dead_letter" in s][0]
+    assert "failed_at <" in sql and "queue_name = %s" in sql
+    assert params == [30 * 24 * 3600, "triage"]
+
+
+def test_list_jobs_since_window_is_seconds_on_the_server_clock() -> None:
+    """Not merely a reporting path: `dead-letter retry --since` selects through
+    here with limit=10000, so a one-word 'second'->'hour' widening re-enqueues
+    3600x the intended window rather than just mis-reporting it.
+    """
+    mgr, conn = _manager()
+    mgr.list_jobs(since=timedelta(hours=2))
+    sql, params = [(s, p) for s, p in conn.cur.executed if "FROM dead_letter" in s][0]
+    assert "failed_at > NOW() - (INTERVAL '1 second' * %s)" in sql
+    assert params[0] == 2 * 3600
+
+
+def test_list_jobs_without_a_window_has_no_age_predicate() -> None:
+    mgr, conn = _manager()
+    mgr.list_jobs()
+    sql, _ = [(s, p) for s, p in conn.cur.executed if "FROM dead_letter" in s][0]
+    assert "failed_at >" not in sql and "WHERE" not in sql

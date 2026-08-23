@@ -17,7 +17,7 @@ argued in review and not covered here; ops.py has no live-server coverage today.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,7 +28,11 @@ import pytest
 from cortex_utils.queue.ops import (
     DEFAULT_VISIBILITY_TIMEOUT_MIN,
     MIGRATION_LOCK_TIMEOUT_MS,
+    PARTITION_LOCK_TIMEOUT_MS,
+    PartitionNotAttachedError,
     QueueError,
+    _ensure_partition,
+    _partition_name,
     claim,
     complete,
     enqueue,
@@ -36,13 +40,26 @@ from cortex_utils.queue.ops import (
     fail_or_retry,
     has_claim_token_column,
     release,
+    server_today,
 )
 
 WORKER = "worker-a"
 
 
+# The date the fake server reports. Deliberately not date.today(): a test that
+# used the client clock could not tell the two apart, which is the bug.
+SERVER_TODAY = date(2026, 3, 1)
+# A row's created_at, deliberately not SERVER_TODAY: partitioned rows outlive
+# the day they were made, and the UPDATE must carry the row's own value.
+ROW_CREATED_AT = datetime(2026, 2, 27, 9, 30, tzinfo=UTC)
+
+
 class FakeCursor:
-    """Records (sql, params) and replays canned results."""
+    """Records (sql, params) and replays canned results.
+
+    Answers SELECT CURRENT_DATE itself, so tests do not have to thread the
+    server-date probe through every fetchone sequence.
+    """
 
     def __init__(self, fetchone: Any = None, fetchall: Any = (), rowcount: int = 1):
         self.executed: list[tuple[str, Any]] = []
@@ -51,13 +68,18 @@ class FakeCursor:
         self.rowcount = rowcount
         self.raise_on: str | None = None
         self.error: Exception | None = None
+        self._pending_date = False
 
     def execute(self, sql: str, params: Any = None) -> None:
         self.executed.append((sql, params))
+        self._pending_date = "CURRENT_DATE" in sql
         if self.raise_on and self.raise_on in sql and self.error:
             raise self.error
 
     def fetchone(self) -> Any:
+        if self._pending_date:
+            self._pending_date = False
+            return (SERVER_TODAY,)
         return self._fetchone() if callable(self._fetchone) else self._fetchone
 
     def fetchall(self) -> Any:
@@ -171,7 +193,7 @@ def test_reports_match_the_claim_token(call, needle: str) -> None:
 
 def test_fail_or_retry_matches_the_claim_token() -> None:
     """The report that actually spends the budget must be token-matched too."""
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     sql, params = conn.cur.executed[0]
     assert "SELECT attempts" in sql
@@ -213,7 +235,7 @@ def test_release_defers_and_clears_the_token_without_charging() -> None:
 
 
 def test_fail_or_retry_charges_an_attempt_and_backs_off() -> None:
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     assert fail_or_retry(conn, 7, "boom", WORKER) == "pending"
     params = _params_of(conn, "SET status = 'pending'")
     assert params[0] == 1, "attempts must go 0 -> 1"
@@ -223,14 +245,14 @@ def test_fail_or_retry_charges_an_attempt_and_backs_off() -> None:
 
 
 def test_fail_or_retry_retires_on_the_last_attempt() -> None:
-    conn = _conn(fetchone=(2, 3))
+    conn = _conn(fetchone=(2, 3, ROW_CREATED_AT))
     assert fail_or_retry(conn, 7, "boom", WORKER) == "failed"
     params = _params_of(conn, "SET status = 'failed'")
-    assert params == (3, "boom", 7)
+    assert params == (3, "boom", 7, ROW_CREATED_AT)
 
 
 def test_fail_or_retry_truncates_a_huge_error() -> None:
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "x" * 9000, WORKER)
     assert len(_params_of(conn, "SET status = 'pending'")[1]) == 2000
 
@@ -342,7 +364,8 @@ def test_missing_partition_is_created_and_the_insert_retried_once() -> None:
     conn = _conn_failing_first_insert(_missing_partition())
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
     sql = "\n".join(s for s, _ in conn.cur.executed)
-    assert f"queue_{date.today().strftime('%Y_%m_%d')}" in sql
+    # Dated by the server, not this process - see the dedicated test below.
+    assert _partition_name(SERVER_TODAY) in sql
     assert sql.count("INSERT INTO queue") == 2, "exactly one retry"
     conn.rollback.assert_called()
 
@@ -427,7 +450,7 @@ def test_every_operation_commits(call) -> None:
 
 
 def test_fail_or_retry_commits_its_report() -> None:
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     conn.commit.assert_called()
 
@@ -506,9 +529,9 @@ def test_release_defers_forward_not_backward() -> None:
 
 def test_backoff_grows_with_attempts() -> None:
     """Asserting non-zero allowed a constant; the point is that it backs off."""
-    first = _conn(fetchone=(0, 9))
+    first = _conn(fetchone=(0, 9, ROW_CREATED_AT))
     fail_or_retry(first, 7, "boom", WORKER)
-    later = _conn(fetchone=(5, 9))
+    later = _conn(fetchone=(5, 9, ROW_CREATED_AT))
     fail_or_retry(later, 7, "boom", WORKER)
     assert (
         _params_of(later, "SET status = 'pending'")[2]
@@ -516,12 +539,58 @@ def test_backoff_grows_with_attempts() -> None:
     )
 
 
-def test_partition_covers_exactly_one_day() -> None:
+def test_partitions_are_dated_by_the_server_not_this_process() -> None:
+    """The bug cryo found: created_at is server NOW(), so the partition date has
+    to come from the same clock. A client date.today() only agrees by accident."""
     conn = _conn_failing_first_insert(_missing_partition())
     enqueue(conn, "triage", {"gmail_id": "abc"})
-    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s][0]
-    today = date.today()
-    assert f"FROM ('{today}') TO ('{today + timedelta(days=1)}')" in ddl
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
+    assert any("SELECT CURRENT_DATE" in s for s, _ in conn.cur.executed)
+    assert f"FROM ('{SERVER_TODAY}') TO ('{SERVER_TODAY + timedelta(days=1)}')" in ddl[0]
+
+
+def test_self_heal_creates_tomorrow_too() -> None:
+    """Removes the midnight race rather than narrowing it."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
+    assert len(ddl) == 2
+    tomorrow = SERVER_TODAY + timedelta(days=1)
+    assert _partition_name(tomorrow) in ddl[1]
+
+
+def test_partition_creation_is_lock_bounded() -> None:
+    """It runs on the live producer path and takes ACCESS EXCLUSIVE on the
+    parent, blocking every insert and claim across all queues while held."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
+    timeouts = [p for s, p in conn.cur.executed if "lock_timeout" in s]
+    assert len(timeouts) == len(ddl), "every write-path DDL must be lock-bounded"
+    assert all(t[0] == f"{PARTITION_LOCK_TIMEOUT_MS}ms" for t in timeouts)
+    # A bare SET leaks the bound into the whole session rather than the statement.
+    assert all("SET LOCAL lock_timeout" in s for s, _ in conn.cur.executed if "lock_timeout" in s)
+    assert PARTITION_LOCK_TIMEOUT_MS < MIGRATION_LOCK_TIMEOUT_MS, (
+        "the live producer path must give up sooner than the deploy path"
+    )
+
+
+def test_losing_the_partition_lock_consults_the_catalogue() -> None:
+    """Losing a lock race is evidence of contention, not of creation.
+
+    The holder can be ensure_claim_token_column's ALTER -- whose timeout is
+    longer than this path's, so it outlasts us -- or drop_partition's DROP.
+    Conceding without asking would report success for a partition nobody made.
+    """
+    conn = _conn_failing_first_insert(_missing_partition())
+    conn.cur.raise_on = "CREATE TABLE"
+    conn.cur.error = psycopg2.errors.LockNotAvailable("timeout")
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+    assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
+    probes = [s for s, _ in conn.cur.executed if "pg_inherits" in s]
+    assert probes, "must ask the catalogue rather than infer from the exception"
+    assert "to_regclass('queue')" in probes[0], "and ask about THIS schema's queue"
+    assert "relname = 'queue'" not in probes[0], "the two-schema outage shape"
 
 
 def test_migration_precheck_looks_for_the_right_column() -> None:
@@ -540,7 +609,7 @@ def test_migration_lock_timeout_is_transaction_scoped() -> None:
 
 
 def test_terminal_failure_clears_the_retry_schedule() -> None:
-    conn = _conn(fetchone=(2, 3))
+    conn = _conn(fetchone=(2, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     assert (
         "next_attempt_at = NULL"
@@ -654,7 +723,7 @@ def test_claim_uses_the_documented_default_visibility_timeout() -> None:
 def test_fail_or_retry_defers_forward_in_seconds() -> None:
     """Backwards, a failing job is instantly re-claimable and burns its whole
     attempt budget in seconds during an outage -- the 2026-08-18 shape."""
-    conn = _conn(fetchone=(0, 3))
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
     fail_or_retry(conn, 7, "boom", WORKER)
     sql = [s for s, _ in conn.cur.executed if "SET status = 'pending'" in s][0]
     assert "clock_timestamp() + (INTERVAL '1 second' * %s)" in sql
@@ -696,3 +765,160 @@ def test_default_enqueue_still_commits_and_self_heals() -> None:
     conn = _conn_failing_first_insert(_missing_partition())
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
     conn.commit.assert_called()
+
+
+def test_a_taken_name_that_is_not_our_partition_is_not_counted_as_present() -> None:
+    """DuplicateTable proves a name is taken, not that the partition exists.
+
+    A same-named relation that is not a partition of this queue would otherwise
+    be reported as success and the retry would fail explaining nothing.
+    """
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+    state = {"insert_failed": False}
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        if "CREATE TABLE" in sql:
+            raise psycopg2.errors.DuplicateTable("name taken")
+        if "pg_inherits" in sql:
+            cur._fetchone = None  # not attached to our queue
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    with pytest.raises(psycopg2.errors.DuplicateTable):
+        enqueue(conn, "triage", {"gmail_id": "abc"})
+    assert any("pg_inherits" in s for s, _ in cur.executed), "must ask, not assume"
+
+
+def test_tomorrows_failure_never_fails_the_callers_write() -> None:
+    """Today's partition is what the caller needs; tomorrow is a favour.
+
+    Letting a speculative create take the write down trades a real failure now
+    for a hypothetical one later.
+    """
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+    state = {"insert_failed": False}
+    tomorrow = _partition_name(SERVER_TODAY + timedelta(days=1))
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        if "CREATE TABLE" in sql and tomorrow in sql:
+            raise psycopg2.errors.InsufficientPrivilege("disk full")
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+
+
+def test_conceding_a_partition_still_attempts_tomorrow() -> None:
+    """Breaking out of the loop on a concession silently restores the race."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    conn.cur.raise_on = "CREATE TABLE"
+    conn.cur.error = psycopg2.errors.DuplicateTable("exists")
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
+    assert [s for s, _ in conn.cur.executed if "pg_inherits" in s], (
+        "a concession must be confirmed, not assumed"
+    )
+
+
+def test_server_date_probe_closes_its_transaction() -> None:
+    """psycopg2 opens one even for a SELECT, and callers can finish without
+    ever reaching a write."""
+    conn = _conn(fetchone=(SERVER_TODAY,))
+    server_today(conn)
+    assert conn.commit.called or conn.rollback.called
+
+
+def test_fail_or_retry_updates_by_the_whole_primary_key() -> None:
+    """(id, created_at) is the enforced key, and this function reads then writes:
+    the UPDATE must address the same row the SELECT ... FOR UPDATE locked, by the
+    key the table actually declares. complete() and release() are single
+    statements with no such window, which is why they address by id alone."""
+    for fetchone, marker in ((2, "SET status = 'failed'"), (0, "SET status = 'pending'")):
+        conn = _conn(fetchone=(fetchone, 3, ROW_CREATED_AT))
+        fail_or_retry(conn, 7, "boom", WORKER)
+        sql = [s for s, _ in conn.cur.executed if marker in s][0]
+        assert "WHERE id = %s AND created_at = %s" in sql, marker
+        assert _params_of(conn, marker)[-1] == ROW_CREATED_AT
+
+    # And the value must come from the locked row, not from a fresh clock.
+    conn = _conn(fetchone=(0, 3, ROW_CREATED_AT))
+    fail_or_retry(conn, 7, "boom", WORKER)
+    select = [s for s, _ in conn.cur.executed if "FOR UPDATE" in s][0]
+    assert "created_at" in select, "must read the row's own created_at"
+
+
+def _conn_where_create_silently_skips(shadowed: date = SERVER_TODAY) -> Any:
+    """A connection where CREATE TABLE IF NOT EXISTS returns cleanly but the
+    name belongs to a relation that is not a partition of this queue."""
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+    state = {"insert_failed": False}
+    shadow_name = _partition_name(shadowed)
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        # Only the shadowed date answers "not attached"; every other partition
+        # is healthy, so the test isolates one date at a time. Reset on every
+        # other statement so the probe's answer cannot leak into the retry
+        # INSERT's RETURNING and read as a dedup hit.
+        if "pg_inherits" in sql:
+            cur._fetchone = None if params == (shadow_name,) else (99,)
+        else:
+            cur._fetchone = (99,)
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+    return conn
+
+
+def test_a_create_that_silently_skipped_is_not_reported_as_created() -> None:
+    """CREATE TABLE IF NOT EXISTS ... PARTITION OF raises nothing when the name
+    is already a non-partition relation -- it emits a NOTICE and skips. So the
+    statement returning cleanly is not evidence the partition exists, and
+    migrate.py creates exactly those shadow names (queue_YYYY_MM_DD as
+    partitions of queue_new). Without the post-check the retry INSERT fails
+    again, explaining nothing.
+    """
+    conn = _conn_where_create_silently_skips()
+    with pytest.raises(PartitionNotAttachedError):
+        enqueue(conn, "triage", {"gmail_id": "abc"})
+    probes = [s for s, _ in conn.cur.executed if "pg_inherits" in s]
+    assert probes, "success must be confirmed, not assumed"
+    assert "to_regclass('queue')" in probes[0]
+
+
+def test_a_silently_skipped_create_for_tomorrow_does_not_fail_the_write() -> None:
+    """Tomorrow is a favour; a shadowed name there must not take the write down."""
+    conn = _conn_where_create_silently_skips(SERVER_TODAY + timedelta(days=1))
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+
+
+def test_ensure_partition_does_not_claim_to_have_created_what_was_there() -> None:
+    """CREATE TABLE IF NOT EXISTS succeeds whether or not it created anything,
+    so a 'created' outcome would be a guess. Tomorrow's partition usually
+    exists already, and the self-heal log is read to judge whether maintenance
+    is keeping up -- a wrong verb there is the thing being judged."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    assert _ensure_partition(conn, SERVER_TODAY, required=True) == "present"
