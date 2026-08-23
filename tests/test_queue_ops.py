@@ -541,7 +541,6 @@ def test_partitions_are_dated_by_the_server_not_this_process() -> None:
     ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
     assert any("SELECT CURRENT_DATE" in s for s, _ in conn.cur.executed)
     assert f"FROM ('{SERVER_TODAY}') TO ('{SERVER_TODAY + timedelta(days=1)}')" in ddl[0]
-    assert str(date.today()) not in ddl[0] or date.today() == SERVER_TODAY
 
 
 def test_self_heal_creates_tomorrow_too() -> None:
@@ -559,9 +558,13 @@ def test_partition_creation_is_lock_bounded() -> None:
     parent, blocking every insert and claim across all queues while held."""
     conn = _conn_failing_first_insert(_missing_partition())
     enqueue(conn, "triage", {"gmail_id": "abc"})
+    ddl = [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
     timeouts = [p for s, p in conn.cur.executed if "lock_timeout" in s]
-    assert timeouts, "the write-path DDL must be lock-bounded"
-    assert timeouts[0][0] == f"{PARTITION_LOCK_TIMEOUT_MS}ms"
+    assert len(timeouts) == len(ddl), "every write-path DDL must be lock-bounded"
+    assert all(t[0] == f"{PARTITION_LOCK_TIMEOUT_MS}ms" for t in timeouts)
+    assert PARTITION_LOCK_TIMEOUT_MS < MIGRATION_LOCK_TIMEOUT_MS, (
+        "the live producer path must give up sooner than the deploy path"
+    )
 
 
 def test_losing_the_partition_lock_is_not_fatal() -> None:
@@ -746,3 +749,69 @@ def test_default_enqueue_still_commits_and_self_heals() -> None:
     conn = _conn_failing_first_insert(_missing_partition())
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
     conn.commit.assert_called()
+
+
+def test_a_taken_name_that_is_not_our_partition_is_not_counted_as_present() -> None:
+    """DuplicateTable proves a name is taken, not that the partition exists.
+
+    A same-named relation that is not a partition of this queue would otherwise
+    be reported as success and the retry would fail explaining nothing.
+    """
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+    state = {"insert_failed": False}
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        if "CREATE TABLE" in sql:
+            raise psycopg2.errors.DuplicateTable("name taken")
+        if "pg_inherits" in sql:
+            cur._fetchone = None  # not attached to our queue
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    with pytest.raises(psycopg2.errors.DuplicateTable):
+        enqueue(conn, "triage", {"gmail_id": "abc"})
+    assert any("pg_inherits" in s for s, _ in cur.executed), "must ask, not assume"
+
+
+def test_tomorrows_failure_never_fails_the_callers_write() -> None:
+    """Today's partition is what the caller needs; tomorrow is a favour.
+
+    Letting a speculative create take the write down trades a real failure now
+    for a hypothetical one later.
+    """
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+    state = {"insert_failed": False}
+    tomorrow = _partition_name(SERVER_TODAY + timedelta(days=1))
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "INSERT INTO queue" in sql and not state["insert_failed"]:
+            state["insert_failed"] = True
+            raise _missing_partition()
+        if "CREATE TABLE" in sql and tomorrow in sql:
+            raise psycopg2.errors.InsufficientPrivilege("disk full")
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+
+
+def test_conceding_a_partition_still_attempts_tomorrow() -> None:
+    """Breaking out of the loop on a concession silently restores the race."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    conn.cur.raise_on = "CREATE TABLE"
+    conn.cur.error = psycopg2.errors.DuplicateTable("exists")
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2

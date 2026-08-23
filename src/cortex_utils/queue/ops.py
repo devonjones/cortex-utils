@@ -183,8 +183,66 @@ def server_today(conn: psycopg2.extensions.connection) -> date:
         return cur.fetchone()[0]
 
 
+def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool:
+    """True if `name` is a partition of this schema's queue.
+
+    Bound via to_regclass so it answers about the queue this search_path
+    resolves, not a same-named table in another schema.
+    """
+    with _tx(conn) as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM pg_class c
+            JOIN pg_inherits i ON c.oid = i.inhrelid
+            WHERE i.inhparent = to_regclass('queue') AND c.relname = %s
+            """,
+            (name,),
+        )
+        return cur.fetchone() is not None
+
+
+def _ensure_partition(conn: psycopg2.extensions.connection, target: date, required: bool) -> str:
+    """Make the partition for `target` exist. Returns created/present/absent.
+
+    Neither failure mode proves anything on its own, so neither is interpreted:
+    DuplicateTable can be a same-named relation that is not a partition of this
+    queue, and LockNotAvailable can be ALTER TABLE or DROP TABLE holding the
+    parent rather than another creator -- ensure_claim_token_column's lock
+    timeout is longer than this one, so it can outlast us. Ask the catalogue
+    instead of guessing.
+
+    `required` marks the partition the caller actually needs. A speculative one
+    must never fail the caller's write: its whole purpose is to save a later
+    call, and failing now to save a hypothetical later failure is a bad trade.
+    """
+    name = _partition_name(target)
+    try:
+        with _tx(conn) as cur:
+            cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
+                FOR VALUES FROM ('{target}') TO ('{target + timedelta(days=1)}')
+                """
+            )
+        return "created"
+    except (psycopg2.errors.DuplicateTable, psycopg2.errors.LockNotAvailable):
+        if _partition_attached(conn, name):
+            return "present"
+        if required:
+            raise
+        return "absent"
+    except psycopg2.Error:
+        # Disk, permissions, a deadlock. The caller's own partition must surface
+        # that; a speculative one must not take the write down with it.
+        if required:
+            raise
+        log.warning("Could not pre-create tomorrow's partition", partition=name)
+        return "absent"
+
+
 def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> None:
-    """Create the partitions covering `day` and the day after, in this schema.
+    """Ensure the partitions covering `day` and the day after, in this schema.
 
     `day` must come from the server (see server_today), never from this process.
 
@@ -195,40 +253,22 @@ def _create_partition_for(conn: psycopg2.extensions.connection, day: date) -> No
     coupling forbids.
 
     Reaching here at all means scheduled maintenance is not keeping up, so the
-    outcome is logged either way: a silent self-heal would let that stay true for
-    weeks, which is the failure this whole module exists to prevent.
+    outcome is logged whatever happens: a silent self-heal would let that stay
+    true for weeks, which is the failure this module exists to prevent.
     """
-    created, conceded = [], []
-    for offset in (0, 1):
-        target = day + timedelta(days=offset)
-        name = _partition_name(target)
-        try:
-            with _tx(conn) as cur:
-                cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
-                cur.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
-                    FOR VALUES FROM ('{target}') TO ('{target + timedelta(days=1)}')
-                    """
-                )
-            created.append(name)
-        except psycopg2.errors.DuplicateTable:
-            # IF NOT EXISTS checks the name before taking the lock that
-            # serialises creation, so a concurrent creator can still win in
-            # between. The partition exists either way.
-            conceded.append(name)
-        except psycopg2.errors.LockNotAvailable:
-            # Whoever holds the parent lock is almost certainly creating this
-            # very partition, so losing is success: the retry finds it there.
-            # A distinct error is better operator signal than a generic timeout.
-            conceded.append(name)
-
-    log.warning(
-        "Partitions ensured from the write path",
-        created=created,
-        conceded=conceded,
-        hint="partition maintenance is not keeping up",
-    )
+    outcomes = {}
+    try:
+        for offset in (0, 1):
+            target = day + timedelta(days=offset)
+            outcomes[_partition_name(target)] = _ensure_partition(
+                conn, target, required=(offset == 0)
+            )
+    finally:
+        log.warning(
+            "Partitions ensured from the write path",
+            outcomes=outcomes,
+            hint="partition maintenance is not keeping up",
+        )
 
 
 def _is_missing_partition(exc: psycopg2.Error) -> bool:
@@ -469,6 +509,14 @@ def fail_or_retry(
     Returns "pending", "failed", or "stale" when the claim was no longer ours.
     Call this only when the work was attempted and failed; for "never started",
     use release().
+
+    This reads attempts and then writes, rather than letting one UPDATE with a
+    CASE decide -- which is the shape the database should normally arbitrate.
+    The exception is deliberate: expressing the backoff in SQL would put a second
+    copy of compute_backoff_delay in a second language, and two consumers already
+    share the Python one. FOR UPDATE holds the row for the round trip, so the
+    read-modify-write is atomic; the cost is one round trip to keep the backoff
+    in a single place.
     """
     truncated = str(error)[:ERROR_MAX_CHARS]
     with _tx(conn) as cur:

@@ -251,3 +251,13 @@ def test_create_future_partitions_does_not_count_existing_partitions() -> None:
     # day 0 already there; day 1 absent, then present after its CREATE.
     manager, _ = _manager_capturing_sql(rows=[(1,), None, (1,)])
     assert manager.create_future_partitions(days_ahead=1) == 1
+
+
+def test_retention_cutoff_uses_the_server_clock() -> None:
+    """The destructive path. A client clock running ahead of the server pushes
+    the cutoff forward and drops a partition still holding live rows."""
+    manager, executed = _manager_capturing_sql(fetchall=[])
+    manager.drop_old_partitions(retention_days=7)
+    assert any("SELECT CURRENT_DATE" in sql for sql in executed), (
+        "the retention cutoff must come from the server, not this process"
+    )

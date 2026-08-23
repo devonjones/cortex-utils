@@ -11,11 +11,13 @@ This is a one-time migration that:
 The old table is preserved as queue_old for safety.
 """
 
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import Any
 
 import psycopg2
 import structlog
+
+from cortex_utils.queue.ops import server_today
 
 log = structlog.get_logger()
 
@@ -125,8 +127,9 @@ def migrate_to_partitioned(
     if analysis["total_rows"] == 0:
         log.warning("Queue table is empty")
         # Still proceed - create structure with future partitions
-        analysis["min_date"] = date.today()
-        analysis["max_date"] = date.today()
+        today = server_today(conn)
+        analysis["min_date"] = today
+        analysis["max_date"] = today
 
     if dry_run:
         # Calculate partitions that would be created
