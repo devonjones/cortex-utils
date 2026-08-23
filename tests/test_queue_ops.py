@@ -1,20 +1,25 @@
 """Tests for the shared queue primitives.
 
-Three properties carry the weight here, because they are exactly what drifted
-when cortex and cryo each kept their own copy:
+Three properties carry the weight, because they are exactly what drifted when
+cortex and cryo each kept their own copy:
 
 - expiry never consumes an attempt (cryo's did; it cost four healthy videos)
 - every report is claim-token matched (cortex had no token at all)
 - dedup is success, not failure (callers branch on it)
 
-The suite has no live Postgres, so these drive a mock cursor and assert on the
-SQL and parameters issued. Behaviour against a real server is covered by cryo's
-selfcheck container and, for cortex, by the workers once migrated.
+These assert on the parameters passed to the driver wherever possible rather
+than on SQL substrings. A round of mutation testing found substring assertions
+survived 23 of 35 mutations -- they pin the text of a statement, not what it
+does. The suite has no live Postgres, so the concurrency guarantees themselves
+(advisory-lock serialisation, SKIP LOCKED, the partition-creation race) are
+argued in review and not covered here; ops.py has no live-server coverage today.
 """
 
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import psycopg2
@@ -25,110 +30,206 @@ from cortex_utils.queue.ops import (
     claim,
     complete,
     enqueue,
+    ensure_claim_token_column,
     fail_or_retry,
     release,
 )
 
+WORKER = "worker-a"
 
-def _conn(fetchone=None, fetchall=(), rowcount=1):
-    """Connection whose cursor records SQL and returns canned rows."""
-    executed: list[tuple[str, object]] = []
-    cur = MagicMock()
-    cur.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
-    cur.fetchone.return_value = fetchone
-    cur.fetchall.return_value = list(fetchall)
-    cur.rowcount = rowcount
+
+class FakeCursor:
+    """Records (sql, params) and replays canned results."""
+
+    def __init__(self, fetchone: Any = None, fetchall: Any = (), rowcount: int = 1):
+        self.executed: list[tuple[str, Any]] = []
+        self._fetchone = fetchone
+        self._fetchall = list(fetchall)
+        self.rowcount = rowcount
+        self.raise_on: str | None = None
+        self.error: Exception | None = None
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append((sql, params))
+        if self.raise_on and self.raise_on in sql and self.error:
+            raise self.error
+
+    def fetchone(self) -> Any:
+        return self._fetchone() if callable(self._fetchone) else self._fetchone
+
+    def fetchall(self) -> Any:
+        return self._fetchall
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _conn(**kw: Any):
+    cur = FakeCursor(**kw)
     conn = MagicMock()
-    conn.cursor.return_value.__enter__.return_value = cur
-    conn.executed = executed
+    conn.cursor.return_value = cur
+    conn.cur = cur
     return conn
 
 
-def _sql(conn) -> str:
-    return "\n".join(s for s, _ in conn.executed)
+def _params_of(conn, needle: str) -> Any:
+    """Params of the one executed statement containing `needle`."""
+    hits = [p for s, p in conn.cur.executed if needle in s]
+    assert len(hits) == 1, f"expected exactly one statement matching {needle!r}"
+    return hits[0]
 
 
 # --- expiry must not consume an attempt ------------------------------------
 
 
 def test_stale_recovery_does_not_consume_an_attempt() -> None:
-    """The property cryo lacked: an outage costs latency, never work.
-
-    A worker killed by an expired token has proven nothing about the job.
-    """
+    """The property cryo lacked: an outage costs latency, never work."""
     conn = _conn(fetchall=[])
-    claim(conn, "triage")
-    sql = _sql(conn)
+    claim(conn, "triage", WORKER)
+    sql = conn.cur.executed[0][0]
     reset = sql.split("retire_exhausted")[0]
-    assert "status = 'pending'" in reset
-    assert "attempts" not in reset.split("SET")[1].split("WHERE")[0], (
-        "stale recovery must not touch attempts"
-    )
+    body = reset.split("SET", 1)[1].split("WHERE", 1)[0]
+    assert "attempts" not in body, "stale recovery must not write attempts"
+    assert "status = 'pending'" in body
 
 
-def test_claim_retires_only_rows_that_already_spent_their_attempts() -> None:
+def test_claim_recovers_under_budget_and_retires_only_exhausted() -> None:
     conn = _conn(fetchall=[])
-    claim(conn, "triage")
-    sql = _sql(conn)
-    assert "attempts >= max_attempts" in sql  # retire
-    assert "attempts < max_attempts" in sql  # recover
+    claim(conn, "triage", WORKER)
+    sql = conn.cur.executed[0][0]
+    reset = sql.split("retire_exhausted")[0]
+    retire = sql.split("retire_exhausted")[1].split("claimable")[0]
+    assert "attempts < max_attempts" in reset
+    assert "attempts >= max_attempts" in retire
+    assert "status = 'failed'" in retire, "exhausted rows must be retired, not completed"
 
 
-# --- claim-token matching ---------------------------------------------------
+def test_claim_orders_by_priority_and_skips_locked() -> None:
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    sql = conn.cur.executed[0][0]
+    assert "ORDER BY priority DESC, created_at" in sql
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    # Partitioned tables key on (id, created_at); joining on id alone is wrong.
+    assert "q.created_at = c.created_at" in sql
 
 
-@pytest.mark.parametrize("call", [complete, lambda c, j, w: release(c, j, 30, w)])
-def test_reports_are_claim_token_matched(call) -> None:
-    """A worker that stalled past its timeout must not report on a re-claimed row."""
+def test_claim_returns_the_worker_facing_job_shape() -> None:
+    conn = _conn(fetchall=[(7, "triage", {"gmail_id": "abc"}, 2, 5)])
+    jobs = claim(conn, "triage", WORKER)
+    assert jobs == [
+        {
+            "id": 7,
+            "queue_name": "triage",
+            "payload": {"gmail_id": "abc"},
+            "attempts": 2,
+            "priority": 5,
+        }
+    ]
+
+
+def test_claim_passes_the_worker_as_the_token() -> None:
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER, limit=3, visibility_timeout_min=9)
+    params = _params_of(conn, "reset_stale")
+    assert params["w"] == WORKER
+    assert params["lim"] == 3
+    assert params["vis"] == 9
+
+
+# --- claim tokens -----------------------------------------------------------
+
+
+def test_worker_is_required_on_claim() -> None:
+    """A shared default would make every claimant anonymous and the token moot."""
+    conn = _conn(fetchall=[])
+    with pytest.raises(QueueError):
+        claim(conn, "triage", "")
+
+
+@pytest.mark.parametrize(
+    "call,needle",
+    [
+        (lambda c: complete(c, 7, WORKER), "completed"),
+        (lambda c: release(c, 7, 30, WORKER), "next_attempt_at"),
+    ],
+)
+def test_reports_match_the_claim_token(call, needle: str) -> None:
     conn = _conn(rowcount=1)
-    call(conn, 7, "worker-a")
-    sql = _sql(conn)
-    assert "claimed_by IS NOT DISTINCT FROM" in sql
+    call(conn)
+    sql, params = [(s, p) for s, p in conn.cur.executed if needle in s][0]
+    assert "claimed_by = %s" in sql
+    assert WORKER in params, "the worker token must be bound into the statement"
     assert "status = 'processing'" in sql
 
 
+def test_fail_or_retry_matches_the_claim_token() -> None:
+    """The report that actually spends the budget must be token-matched too."""
+    conn = _conn(fetchone=(0, 3))
+    fail_or_retry(conn, 7, "boom", WORKER)
+    sql, params = conn.cur.executed[0]
+    assert "SELECT attempts" in sql
+    assert "claimed_by = %s" in sql
+    assert params == (7, WORKER)
+
+
 def test_complete_returns_false_when_the_claim_moved_on() -> None:
-    conn = _conn(rowcount=0)
-    assert complete(conn, 7, "worker-a") is False
+    assert complete(_conn(rowcount=0), 7, WORKER) is False
 
 
 def test_release_returns_false_when_the_claim_moved_on() -> None:
-    conn = _conn(rowcount=0)
-    assert release(conn, 7, 30, "worker-a") is False
+    assert release(_conn(rowcount=0), 7, 30, WORKER) is False
+
+
+def test_complete_returns_true_when_the_claim_held() -> None:
+    assert complete(_conn(rowcount=1), 7, WORKER) is True
+
+
+def test_release_returns_true_when_the_claim_held() -> None:
+    assert release(_conn(rowcount=1), 7, 30, WORKER) is True
 
 
 def test_fail_or_retry_reports_stale_rather_than_charging_another_worker() -> None:
     conn = _conn(fetchone=None)
-    assert fail_or_retry(conn, 7, "boom", "worker-a") == "stale"
-    conn.rollback.assert_called_once()
+    assert fail_or_retry(conn, 7, "boom", WORKER) == "stale"
 
 
 # --- release vs fail_or_retry ----------------------------------------------
 
 
-def test_release_defers_without_touching_attempts() -> None:
+def test_release_defers_and_clears_the_token_without_charging() -> None:
     conn = _conn(rowcount=1)
-    release(conn, 7, 120, "worker-a")
-    sql = _sql(conn)
-    assert "next_attempt_at" in sql
+    release(conn, 7, 120, WORKER)
+    sql, params = conn.cur.executed[0]
     assert "attempts" not in sql, "release must not spend the attempt budget"
+    assert "claimed_by = NULL" in sql, "a released row must not keep our token"
+    assert params == (120, 7, WORKER)
 
 
-def test_fail_or_retry_charges_an_attempt_and_reschedules() -> None:
+def test_fail_or_retry_charges_an_attempt_and_backs_off() -> None:
     conn = _conn(fetchone=(0, 3))
-    assert fail_or_retry(conn, 7, "boom", "worker-a") == "pending"
-    update = [(s, p) for s, p in conn.executed if "SET status = 'pending'" in s]
-    assert len(update) == 1
-    sql, params = update[0]
+    assert fail_or_retry(conn, 7, "boom", WORKER) == "pending"
+    params = _params_of(conn, "SET status = 'pending'")
     assert params[0] == 1, "attempts must go 0 -> 1"
-    assert params[-1] == 7, "must update the job it was given"
-    assert "next_attempt_at" in sql
+    assert params[1] == "boom"
+    assert params[2] > 0, "a retry must be delayed"
+    assert params[3] == 7
 
 
 def test_fail_or_retry_retires_on_the_last_attempt() -> None:
     conn = _conn(fetchone=(2, 3))
-    assert fail_or_retry(conn, 7, "boom", "worker-a") == "failed"
-    assert "status = 'failed'" in _sql(conn)
+    assert fail_or_retry(conn, 7, "boom", WORKER) == "failed"
+    params = _params_of(conn, "SET status = 'failed'")
+    assert params == (3, "boom", 7)
+
+
+def test_fail_or_retry_truncates_a_huge_error() -> None:
+    conn = _conn(fetchone=(0, 3))
+    fail_or_retry(conn, 7, "x" * 9000, WORKER)
+    assert len(_params_of(conn, "SET status = 'pending'")[1]) == 2000
 
 
 # --- enqueue ----------------------------------------------------------------
@@ -137,6 +238,7 @@ def test_fail_or_retry_retires_on_the_last_attempt() -> None:
 def test_enqueue_returns_the_new_id() -> None:
     conn = _conn(fetchone=(42,))
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 42
+    assert _params_of(conn, "INSERT INTO queue")[0] == "triage"
 
 
 def test_dedup_returns_none_not_an_error() -> None:
@@ -145,63 +247,153 @@ def test_dedup_returns_none_not_an_error() -> None:
     assert enqueue(conn, "triage", {"gmail_id": "abc"}, dedup_key="gmail_id") is None
 
 
-def test_dedup_serialises_producers_on_an_advisory_lock() -> None:
-    """Unique indexes cannot backstop this: created_at is in every unique key."""
+def test_dedup_checks_the_named_field_for_the_right_value() -> None:
     conn = _conn(fetchone=(42,))
     enqueue(conn, "triage", {"gmail_id": "abc"}, dedup_key="gmail_id")
-    assert "pg_advisory_xact_lock" in _sql(conn)
+    sql, params = [(s, p) for s, p in conn.cur.executed if "NOT EXISTS" in s][0]
+    assert "payload->>%s" in sql, "the field must be bound, not spliced"
+    assert params[-2:] == ("gmail_id", "abc")
+
+
+def test_dedup_lock_key_separates_queues_and_fields() -> None:
+    """Keying on the value alone would serialise unrelated queues."""
+    conn = _conn(fetchone=(42,))
+    enqueue(conn, "triage", {"gmail_id": "abc"}, dedup_key="gmail_id")
+    key = _params_of(conn, "pg_advisory_xact_lock")[0]
+    assert key == "triage:gmail_id:abc"
 
 
 def test_dedup_key_absent_from_payload_is_rejected() -> None:
-    conn = _conn(fetchone=(42,))
     with pytest.raises(QueueError):
-        enqueue(conn, "triage", {"other": 1}, dedup_key="gmail_id")
+        enqueue(_conn(fetchone=(42,)), "triage", {"other": 1}, dedup_key="gmail_id")
+
+
+def test_dedup_key_must_be_an_identifier() -> None:
+    """It reaches the SQL text, so anything else is an injection point."""
+    payload = {"x'; DROP TABLE queue; --": 1}
+    with pytest.raises(QueueError):
+        enqueue(_conn(fetchone=(42,)), "triage", payload, dedup_key="x'; DROP TABLE queue; --")
+
+
+@pytest.mark.parametrize("value", [True, 1.5, {"a": 1}, ["a"], None])
+def test_dedup_value_types_that_would_silently_never_match_are_rejected(value) -> None:
+    """Python str() and Postgres jsonb ->> disagree for these.
+
+    bool gives "True" vs "true"; a mismatch would make dedup never match and
+    double-queue instead of erroring.
+    """
+    with pytest.raises(QueueError):
+        enqueue(_conn(fetchone=(42,)), "triage", {"k": value}, dedup_key="k")
+
+
+def test_dedup_accepts_int_values() -> None:
+    conn = _conn(fetchone=(42,))
+    assert enqueue(conn, "triage", {"k": 7}, dedup_key="k") == 42
+    assert _params_of(conn, "pg_advisory_xact_lock")[0] == "triage:k:7"
 
 
 # --- partition self-heal ----------------------------------------------------
 
 
-def _conn_raising_once(exc: Exception):
+class _Violation(psycopg2.errors.CheckViolation):
+    """A real CheckViolation whose diag we can set.
+
+    psycopg2 exposes Diagnostics.constraint_name read-only, but the except
+    clause under test matches on the exception type, so the double must still
+    genuinely be a CheckViolation.
+    """
+
+    def __init__(self, message: str, constraint_name: str | None):
+        super().__init__(message)
+        self._constraint_name = constraint_name
+
+    @property
+    def diag(self) -> Any:  # type: ignore[override]
+        return SimpleNamespace(constraint_name=self._constraint_name)
+
+
+def _missing_partition() -> _Violation:
+    return _Violation('no partition of relation "queue" found for row', None)
+
+
+def _conn_failing_first_insert(exc: Exception):
     """Raise on the first INSERT, succeed afterwards."""
     state = {"raised": False}
-    executed: list[str] = []
-    cur = MagicMock()
+    cur = FakeCursor(fetchone=(99,))
+    real_execute = cur.execute
 
-    def _execute(sql, params=None):
-        executed.append(sql)
+    def execute(sql: str, params: Any = None) -> None:
+        real_execute(sql, params)
         if "INSERT INTO queue" in sql and not state["raised"]:
             state["raised"] = True
             raise exc
 
-    cur.execute.side_effect = _execute
-    cur.fetchone.return_value = (99,)
-    cur.rowcount = 1
+    cur.execute = execute  # type: ignore[method-assign]
     conn = MagicMock()
-    conn.cursor.return_value.__enter__.return_value = cur
-    conn.executed = executed
+    conn.cursor.return_value = cur
+    conn.cur = cur
     return conn
 
 
 def test_missing_partition_is_created_and_the_insert_retried_once() -> None:
-    exc = psycopg2.errors.CheckViolation('no partition of relation "queue" found for row')
-    conn = _conn_raising_once(exc)
+    conn = _conn_failing_first_insert(_missing_partition())
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
-    sql = "\n".join(conn.executed)
-    assert "CREATE TABLE IF NOT EXISTS" in sql
+    sql = "\n".join(s for s, _ in conn.cur.executed)
     assert f"queue_{date.today().strftime('%Y_%m_%d')}" in sql
     assert sql.count("INSERT INTO queue") == 2, "exactly one retry"
+    conn.rollback.assert_called()
 
 
-def test_other_check_violations_are_not_mistaken_for_a_missing_partition() -> None:
+def test_a_named_check_constraint_is_not_treated_as_a_missing_partition() -> None:
     """queue_new_valid_status raises the same SQLSTATE.
 
-    Creating a partition for a bad status value would invent work and misreport
-    the cause.
+    Creating a partition for a bad status would invent work and misreport the
+    cause. A genuine violation names its constraint; a routing failure does not.
     """
-    exc = psycopg2.errors.CheckViolation(
-        'new row for relation "queue" violates check constraint "queue_new_valid_status"'
-    )
-    conn = _conn_raising_once(exc)
+    exc = _Violation("violates check constraint", "queue_new_valid_status")
+    conn = _conn_failing_first_insert(exc)
     with pytest.raises(psycopg2.errors.CheckViolation):
         enqueue(conn, "triage", {"gmail_id": "abc"})
-    assert "CREATE TABLE" not in "\n".join(conn.executed)
+    assert "CREATE TABLE" not in "\n".join(s for s, _ in conn.cur.executed)
+
+
+# --- transaction hygiene ----------------------------------------------------
+
+
+def test_a_failed_statement_rolls_back_before_raising() -> None:
+    """Otherwise the caller's NEXT statement fails complaining about this one."""
+    conn = _conn(fetchall=[])
+    conn.cur.raise_on = "reset_stale"
+    conn.cur.error = psycopg2.OperationalError("boom")
+    with pytest.raises(psycopg2.OperationalError):
+        claim(conn, "triage", WORKER)
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+
+
+# --- schema migration -------------------------------------------------------
+
+
+def test_claim_token_column_is_not_re_added_when_present() -> None:
+    """The ALTER takes ACCESS EXCLUSIVE on a hot partitioned parent."""
+    conn = _conn(fetchone=(1,))
+    assert ensure_claim_token_column(conn) is False
+    assert not [s for s, _ in conn.cur.executed if "ALTER TABLE" in s]
+
+
+def test_claim_token_column_is_added_when_absent_under_a_lock_timeout() -> None:
+    conn = _conn(fetchone=None)
+    assert ensure_claim_token_column(conn) is True
+    sql = "\n".join(s for s, _ in conn.cur.executed)
+    assert "ADD COLUMN IF NOT EXISTS claimed_by" in sql
+    assert "lock_timeout" in sql, "a boot must fail fast, not wedge the pipeline"
+
+
+# --- package surface --------------------------------------------------------
+
+
+def test_package_fail_or_retry_is_the_claim_token_aware_one() -> None:
+    """Importing claim+fail_or_retry together must not pair new with legacy."""
+    from cortex_utils import queue as pkg
+
+    assert pkg.fail_or_retry is fail_or_retry
