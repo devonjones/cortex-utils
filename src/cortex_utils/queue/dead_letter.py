@@ -181,8 +181,20 @@ class DeadLetterManager:
         retried = 0
 
         for job in jobs:
-            if self.retry_job(job["id"], dry_run=dry_run):
-                retried += 1
+            # Per-job guard: without it one bad row aborts the shared connection
+            # and every remaining job in the batch fails for a reason that has
+            # nothing to do with it, losing the partial progress.
+            try:
+                if self.retry_job(job["id"], dry_run=dry_run):
+                    retried += 1
+            except psycopg2.Error as exc:
+                self.conn.rollback()
+                log.error(
+                    "Dead letter retry failed",
+                    dead_letter_id=job["id"],
+                    queue=job.get("queue_name"),
+                    error=str(exc),
+                )
 
         log.info("Retried dead letter jobs", count=retried, dry_run=dry_run)
         return retried

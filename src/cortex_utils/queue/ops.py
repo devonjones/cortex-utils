@@ -29,6 +29,11 @@ A failure rolls back before re-raising, so a caller never inherits an aborted
 transaction and never sees its next, unrelated statement fail because of this
 one.
 
+The other operations take no such flag: a claim or a report is the caller's whole
+unit of work, so there is nothing to compose it with. Only enqueue is ever one
+half of something larger. Note also that a job id returned under commit=False is
+not durable until the caller's own commit runs.
+
 enqueue() takes commit=False for callers that must land the job atomically with
 their own work -- approving a proposal and queueing its apply job, or moving a
 row out of dead_letter and re-queueing it. Committing those separately would let
@@ -90,9 +95,14 @@ def _tx(
     one. For a long-lived worker that means every later job fails for reasons
     that look unrelated to the job that actually broke.
 
-    commit=False hands both halves to the caller: no commit, and no rollback
-    either, since rolling back here would discard the caller's own pending work
-    on the same connection.
+    commit=False hands both halves to the caller: no commit, and no rollback.
+
+    Not because rollback would lose the caller's work -- Postgres has already
+    aborted the whole transaction by the time we would call it, so that work is
+    gone regardless. It is left alone because the caller may hold a SAVEPOINT and
+    want to recover to it, and rolling back here would take that choice away.
+    Either way the connection is aborted and unusable until the caller rolls
+    back, which is the contract they accepted by owning the transaction.
     """
     if not commit:
         with conn.cursor() as cur:

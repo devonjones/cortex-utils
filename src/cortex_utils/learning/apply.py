@@ -42,13 +42,19 @@ def enqueue_proposal_apply(
     Does not commit — the caller runs this in the same transaction that approves
     the proposal, so the job and the approval land atomically.
     """
-    return enqueue(
+    job_id = enqueue(
         conn,
         APPLY_QUEUE,
         {"proposal_id": proposal_id},
         priority=priority,
         commit=False,
     )
+    # enqueue() returns None only for a deduplicated insert, and this call passes
+    # no dedup_key, so None is unreachable here. Asserted rather than widening
+    # the return type, so adding a dedup_key later fails loudly instead of
+    # handing callers a None they do not expect.
+    assert job_id is not None
+    return job_id
 
 
 def claim_proposal_apply_jobs(
