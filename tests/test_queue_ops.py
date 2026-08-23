@@ -498,7 +498,12 @@ def test_read_only_precheck_does_not_leave_a_transaction_open() -> None:
     """psycopg2 opens a transaction even for a SELECT."""
     conn = _conn(fetchone=(1,))
     has_claim_token_column(conn)
-    assert conn.commit.called or conn.rollback.called
+    # Both transactions: require_queue_table's guard, then the probe's own. An
+    # or-assertion passes on the guard's commit alone, which is exactly the
+    # mutant this test is named for -- the probe opening a SELECT and never
+    # closing it, leaving worker connections idle-in-transaction on the boot
+    # fast path.
+    assert conn.commit.call_count == 2
 
 
 # --- clauses that consume the asserted parameters ---------------------------
