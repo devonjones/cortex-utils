@@ -292,6 +292,47 @@ one up to date. `health()` reads that table, so without it the call fails.
 
 ---
 
+## Open question: dead-letter replay deletes the archive (from cryo)
+
+`DeadLetterManager.retry_job()` re-enqueues the payload and then **deletes** the
+`dead_letter` row, both in one transaction. The atomicity is right — a crash
+between the two would leave the job queued *and* still dead-lettered. The
+question is the delete itself.
+
+That row is the record that a piece of work was given up on, when, after how
+many attempts, and with what error. Replay erases it, so the failure history
+disappears at exactly the moment someone acts on it — and if the same item dies
+again next week, the fact that it already died once is gone.
+
+cryo hit this concretely. Its 2026-08-18 outage looked like it had cost four
+videos; two more were already in `dead_letter` with the identical
+`visibility timeout, attempts exhausted`, invisible to every `queue` query, and
+were only found because someone thought to ask. Replaying them under
+`retry_job()` would have removed the only evidence they had ever failed.
+
+There is also no **terminal state**. `purge(older_than)` is retention, not a
+decision: nothing records "this will never be done". Without one the list only
+grows, genuinely-undoable items accumulate, real failures end up buried in
+noise, and a triage list nobody can clear stops being read.
+
+cryo therefore keeps its own dead-letter layer rather than adopting
+`DeadLetterManager`, which by the shared-library rule means this is a gap
+rather than a boundary. What cryo does, offered as one possible shape:
+
+- **replay leaves the row in place.** Double-replay is handled by `enqueue()`'s
+  dedup returning `None`, not by bookkeeping.
+- **`dismissed_at TIMESTAMPTZ`** is the terminal state: idempotent, so
+  re-dismissing keeps the date it was actually written off, and the row stays
+  in the table as history while leaving the default view.
+- **the depth counter counts undismissed rows only**, so the number on a
+  dashboard and the number in a digest cannot disagree.
+
+Deciding this is yours — the counter-argument (a dead-letter table that only
+grows is its own problem, and `purge` is the answer) is reasonable. Recording
+it because cryo cannot adopt the module until it is settled.
+
+---
+
 ## Known limitations
 
 **No live-Postgres coverage of `ops.py`.** The suite is mock-based and
