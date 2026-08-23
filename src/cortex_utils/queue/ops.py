@@ -134,7 +134,8 @@ def _tx(
             with conn.cursor() as cur:
                 yield cur
         except psycopg2.errors.UndefinedColumn as exc:
-            raise _missing_migration(exc) from exc
+            _reraise_missing_migration(exc)
+            raise
         return
     try:
         with conn.cursor() as cur:
@@ -142,19 +143,21 @@ def _tx(
         conn.commit()
     except psycopg2.errors.UndefinedColumn as exc:
         conn.rollback()
-        raise _missing_migration(exc) from exc
+        _reraise_missing_migration(exc)
+        raise
     except Exception:
         conn.rollback()
         raise
 
 
-def _missing_migration(exc: psycopg2.errors.UndefinedColumn) -> Exception:
+def _reraise_missing_migration(exc: psycopg2.errors.UndefinedColumn) -> None:
     """Turn a raw UndefinedColumn on claimed_by into the remedy.
 
-    All five primitives reference claimed_by, and the only thing protecting them
-    is the convention that a service calls ensure_claim_token_column() on boot.
-    A consumer who forgets gets UndefinedColumn out of claim() -- from the core
-    of the queue, not a side feature -- naming a column they never wrote.
+    claim(), complete(), release() and fail_or_retry() all reference claimed_by,
+    and the only thing protecting them is the convention that a service calls
+    ensure_claim_token_column() on boot. A consumer who forgets gets
+    UndefinedColumn out of claim() -- from the core of the queue, not a side
+    feature -- naming a column they never wrote.
 
     Guarded here rather than at the five call sites because a half-guard reads
     as safe and is not: guard four and the fifth still raises the raw error on
@@ -167,13 +170,24 @@ def _missing_migration(exc: psycopg2.errors.UndefinedColumn) -> Exception:
     re-claimed, so proceeding would silently reintroduce the bug the column
     exists to prevent.
     """
-    if "claimed_by" not in str(exc):
-        return exc
-    return QueueError(
+    # diag.message_primary, NOT str(exc). str() appends the LINE excerpt of our
+    # own SQL and the HINT, so any statement that merely *mentions* claimed_by
+    # matches -- including `SELECT id, claimed_by, attemptz FROM queue`, whose
+    # real error is the typo, and `SELECT claimed_bx`, whose HINT helpfully
+    # suggests claimed_by. Relabelling those would destroy the column name the
+    # caller needs and point them at an idempotent migration they already ran.
+    # Postgres names the offending column in the primary message, quoted
+    # verbatim so the match survives translation.
+    if '"claimed_by"' not in (exc.diag.message_primary or ""):
+        # Not ours. Return so the caller re-raises the original plainly --
+        # `raise exc from exc` would set __cause__ to itself and suppress the
+        # context a reader needs.
+        return
+    raise QueueError(
         "queue.claimed_by is missing on this search_path. Run "
         "cortex_utils.queue.ensure_claim_token_column(conn) once against this "
         "schema before using the queue -- it is idempotent and safe on every boot."
-    )
+    ) from exc
 
 
 def has_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
