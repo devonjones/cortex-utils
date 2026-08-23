@@ -360,6 +360,10 @@ class DeadLetterManager:
             dry_run: If True, only count what would be deleted
 
         Returns count of jobs purged.
+
+        Purges by age alone, dismissed or not. dismiss() is the triage verb and
+        this is the housekeeping one: a row old enough to purge and still not
+        dismissed was never triaged, and keeping it forever would not fix that.
         """
         # Server clock. This one drives a DELETE that cannot be undone: a local
         # clock running ahead of the server would purge rows that are younger
