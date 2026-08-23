@@ -7,16 +7,27 @@ from typing import Any
 import psycopg2
 import structlog
 
+from cortex_utils.queue.ops import require_queue_table
+
 log = structlog.get_logger()
 
 
 def has_next_attempt_at_column(conn: psycopg2.extensions.connection) -> bool:
+    """True if this schema's queue has next_attempt_at.
+
+    to_regclass('queue'), not 'public.queue'::regclass. Two schemas share this
+    database and the rest of the package resolves the parent through
+    search_path; hardcoding public meant a cryo connection was answered about
+    cortex's table, so the migration would report itself already applied and
+    silently skip. Same defect as the bare-relname lookups, one schema narrower.
+    """
+    require_queue_table(conn)
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT 1
             FROM pg_attribute
-            WHERE attrelid = 'public.queue'::regclass
+            WHERE attrelid = to_regclass('queue')
               AND attname = 'next_attempt_at'
               AND NOT attisdropped
             LIMIT 1

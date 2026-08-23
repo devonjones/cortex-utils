@@ -9,6 +9,24 @@ on:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
+
+    # The queue lives in Postgres, and the defects this suite exists to catch --
+    # partition coverage, EXTRACT returning numeric, an inverted FILTER -- are
+    # invisible to a mock, which hands back whatever the code asked for. Tests
+    # that skip everywhere are the same theatre they were written to replace.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +48,16 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Run tests
+        env:
+          CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
         run: uv run pytest -v
+
+      - name: Fail if the live-Postgres tests were skipped
+        env:
+          CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
+        # A misconfigured service would turn this whole layer into silent
+        # skips, which reads as coverage and is not.
+        run: uv run pytest tests/test_inspect_live.py -q --no-header -p no:cacheprovider
 
   build:
     runs-on: ubuntu-latest

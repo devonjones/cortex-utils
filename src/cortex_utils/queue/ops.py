@@ -77,6 +77,12 @@ MIGRATION_LOCK_TIMEOUT_MS = 5000
 # is almost certainly creating this very partition.
 PARTITION_LOCK_TIMEOUT_MS = 2000
 
+# Stamped on partitions the write path had to create. A non-zero count means
+# scheduled maintenance is not running -- a countable signal rather than a log
+# line, because a log line is the channel that already failed to surface a
+# two-day outage. Recorded on the object itself so Postgres holds the fact.
+SELF_HEALED_MARKER = "created by enqueue self-heal"
+
 _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 # Values whose Python str() matches Postgres's jsonb ->> text output. bool gives
@@ -139,11 +145,17 @@ def _tx(
 def has_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
     """True if this schema's queue table already has claimed_by.
 
+    Guarded the same way as the other column probe: to_regclass returns NULL for
+    a missing table and `attrelid = NULL` matches nothing, so an unguarded answer
+    for a misconfigured search_path is False -- "the column is missing" rather
+    than "there is no table", which sends the caller down a migration path.
+
     Goes through _tx like everything else: psycopg2 opens a transaction even for
     a read, and this is the fast path on every service boot, so a bare cursor
     would leave long-lived worker connections idle-in-transaction as the normal
     case rather than the exception.
     """
+    require_queue_table(conn)
     with _tx(conn) as cur:
         cur.execute(
             """
@@ -216,6 +228,33 @@ _ATTACHED_SQL = """
 """
 
 
+def require_queue_table(conn: psycopg2.extensions.connection) -> None:
+    """Fail loudly when search_path resolves no queue table.
+
+    to_regclass() yields NULL rather than raising, so a lookup bound through it
+    reports an ordinary empty result for a connection pointed at the wrong
+    schema -- indistinguishable from a healthy "nothing to do". That is how a
+    migration probe comes back "column missing" for a table that does not exist,
+    and an operator is handed a migration to run that then blows up.
+
+    Every catalogue read that can be reached without one should call this, so
+    the contract does not vary by entry point.
+    """
+    with _tx(conn) as cur:
+        cur.execute("SELECT to_regclass('queue')")
+        if cur.fetchone()[0] is not None:
+            return
+        cur.execute("SHOW search_path")
+        log.error(
+            "No queue table on search_path",
+            search_path=cur.fetchone()[0],
+            hint="check the connection's PGOPTIONS",
+        )
+    raise QueueTableNotFoundError(
+        "no 'queue' table on search_path; check the connection's PGOPTIONS"
+    )
+
+
 def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool:
     """True if `name` is a partition of this schema's queue.
 
@@ -228,11 +267,12 @@ def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool
 
 
 def _ensure_partition(conn: psycopg2.extensions.connection, target: date, required: bool) -> str:
-    """Make the partition for `target` exist. Returns present/absent.
+    """Make the partition for `target` exist. Returns created/present/absent.
 
-    Not created/present: CREATE TABLE IF NOT EXISTS succeeds either way, so
-    distinguishing them would cost a round trip to answer a question nobody
-    asks. The caller logs the outcome and branches on nothing.
+    The distinction is real here, not a guess: the catalogue is consulted before
+    the CREATE, so "created" means this call made it. That costs one round trip
+    on a path that only runs when maintenance has already fallen behind, and it
+    buys a self-heal count that means what it says.
 
     Neither failure mode proves anything on its own, so neither is interpreted:
     DuplicateTable can be a same-named relation that is not a partition of this
@@ -256,6 +296,25 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
     try:
         with _tx(conn) as cur:
             cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
+
+            # Ask before creating, not only after. Two things depend on knowing
+            # whether the partition was already there, and CREATE TABLE IF NOT
+            # EXISTS cannot tell us afterwards -- it succeeds either way:
+            #
+            #  - the self-heal marker. _create_partition_for also ensures
+            #    tomorrow, which usually exists already, so stamping
+            #    unconditionally labels partitions maintenance created as
+            #    self-heals. health() reads that count to decide whether
+            #    maintenance is dead, so a false stamp is a false alarm that
+            #    never clears -- COMMENT is permanent.
+            #  - COMMENT ON TABLE requires ownership. On a healthy partition
+            #    owned by another role, stamping unconditionally raises
+            #    InsufficientPrivilege and fails the caller's write, where
+            #    doing nothing would have succeeded.
+            cur.execute(_ATTACHED_SQL, (name,))
+            if cur.fetchone() is not None:
+                return "present"
+
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
@@ -267,7 +326,9 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
                 raise PartitionNotAttachedError(
                     f"{name} exists but is not a partition of this queue"
                 )
-        return "present"
+            # Only now: this partition is ours and we are the one who made it.
+            cur.execute(f"COMMENT ON TABLE {name} IS %s", (SELF_HEALED_MARKER,))
+        return "created"
     except PartitionNotAttachedError:
         if required:
             raise
