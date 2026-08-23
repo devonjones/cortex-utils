@@ -28,8 +28,14 @@ import pytest
 
 psycopg2 = pytest.importorskip("psycopg2")
 
+from cortex_utils.queue.add_retry_columns import has_next_attempt_at_column  # noqa: E402
 from cortex_utils.queue.inspect import failures, health, resubmit, stuck  # noqa: E402
-from cortex_utils.queue.ops import SELF_HEALED_MARKER, QueueError, enqueue  # noqa: E402
+from cortex_utils.queue.ops import (  # noqa: E402
+    SELF_HEALED_MARKER,
+    QueueError,
+    QueueTableNotFoundError,
+    enqueue,
+)
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
 
@@ -236,6 +242,54 @@ def test_oldest_ready_age_ignores_deferred_rows(conn) -> None:
     assert isinstance(age, float), "arithmetic on this must not raise on a Decimal"
 
 
+def test_oldest_ready_age_is_the_oldest_not_the_newest(conn) -> None:
+    """MIN, not MAX. With MAX a queue backed up for days reports ~1 second the
+    moment one new row arrives -- it collapses to zero exactly when the backlog
+    is worst, and this is the only latency signal health() emits."""
+    today = _server_today(conn)
+    _partition(conn, today)
+    with conn.cursor() as cur:
+        for minutes in (1, 240, 90):
+            cur.execute(
+                "INSERT INTO queue (queue_name, payload, created_at) "
+                "VALUES ('t', '{}'::jsonb, NOW() - (INTERVAL '1 minute' * %s))",
+                (minutes,),
+            )
+    conn.commit()
+
+    age = health(conn).depths[0].oldest_ready_age_s
+    assert 14000 <= age <= 14700, f"reported the newest row's age: {age}"
+
+
+def test_an_unpartitioned_queue_is_not_reported_as_broken(conn) -> None:
+    """A plain queue is a supported state -- this package ships
+    migrate_to_partitioned() -- and its inserts never fail for want of a
+    partition. Reporting it with the same headroom as a queue whose partitions
+    ran out is a monitor that cries forever about something that works."""
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE queue")
+        cur.execute(
+            "CREATE TABLE queue (id BIGSERIAL PRIMARY KEY, queue_name TEXT NOT NULL, "
+            "payload JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'pending', "
+            "priority INT NOT NULL DEFAULT 0, attempts INT NOT NULL DEFAULT 0, "
+            "max_attempts INT NOT NULL DEFAULT 3, last_error TEXT, "
+            "claimed_at TIMESTAMPTZ, claimed_by TEXT, next_attempt_at TIMESTAMPTZ, "
+            "completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+        cur.execute("INSERT INTO queue (queue_name, payload) VALUES ('t', '{}'::jsonb)")
+    conn.commit()
+
+    got = health(conn)
+    assert got.partitioned is False
+    assert got.is_healthy is True, "inserts work; there is no headroom to run out of"
+    assert got.depths[0].ready == 1
+
+
+def test_a_partitioned_queue_says_so(conn) -> None:
+    _partition(conn, _server_today(conn))
+    assert health(conn).partitioned is True
+
+
 def test_an_empty_queue_reports_no_depths_rather_than_failing(conn) -> None:
     _partition(conn, _server_today(conn))
     assert health(conn).depths == []
@@ -420,6 +474,26 @@ def test_resubmit_requeues_and_cancels_in_one_transaction(conn) -> None:
     assert (new_status, payload) == ("pending", {"a": 1})
 
 
+def test_resubmit_keeps_the_original_priority(conn) -> None:
+    """Backfill runs at -100 so a replay never blocks live mail. Silently
+    promoting a resubmitted backfill row to 0 preempts real-time work."""
+    today = _server_today(conn)
+    _partition(conn, today)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, priority) "
+            "VALUES ('t', '{}'::jsonb, 'failed', -100) RETURNING id"
+        )
+        failed_id = cur.fetchone()[0]
+    conn.commit()
+
+    new_id = resubmit(conn, failed_id)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT priority FROM queue WHERE id = %s", (new_id,))
+        assert cur.fetchone()[0] == -100, "a backfill replay must not jump the queue"
+
+
 def test_resubmit_refuses_a_row_that_is_not_failed(conn) -> None:
     """Duplicating a processing job would run it twice and cancel it under a
     live worker."""
@@ -478,3 +552,24 @@ def test_stuck_respects_its_limit(conn) -> None:
 
     rows = stuck(conn, visibility_timeout_min=30, limit=2)
     assert [r.claimed_by for r in rows] == ["w4", "w3"], "the limit must keep the worst"
+
+
+def test_the_retry_migration_probe_refuses_a_missing_queue_table(conn) -> None:
+    """to_regclass returns NULL rather than raising and `attrelid = NULL` matches
+    nothing, so an unguarded probe answers "column missing" for a table that does
+    not exist -- and the CLI prints that as an actionable migration which then
+    fails on --execute. This is the misconfigured-PGOPTIONS case exactly."""
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE queue")
+    conn.commit()
+
+    with pytest.raises(QueueTableNotFoundError, match="PGOPTIONS"):
+        has_next_attempt_at_column(conn)
+
+
+def test_the_retry_migration_probe_answers_normally_when_the_table_exists(conn) -> None:
+    assert has_next_attempt_at_column(conn) is True
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE queue DROP COLUMN next_attempt_at")
+    conn.commit()
+    assert has_next_attempt_at_column(conn) is False, "a real missing column still reads False"

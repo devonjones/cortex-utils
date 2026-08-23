@@ -67,6 +67,7 @@ class QueueHealth:
 
     depths: list[QueueDepth]
     dead_letter: int
+    partitioned: bool
     partition_headroom_days: int | None
     self_healed_partitions: int
     server_time: datetime
@@ -79,7 +80,14 @@ class QueueHealth:
         writes already fail and 1 is the last day anything can be done about it.
         Alerting at 0 would first fire once the write path is broken, which is
         the wrong end of the problem.
+
+        A queue that is not partitioned has no headroom to run out of, and
+        inserts into it never fail for want of a partition. Reporting that as
+        unhealthy forever would be a monitor crying about a supported state --
+        this package ships migrate_to_partitioned(), so pre-migration is one.
         """
+        if not self.partitioned:
+            return self.self_healed_partitions == 0
         return (
             self.partition_headroom_days is not None
             and self.partition_headroom_days >= 1
@@ -177,6 +185,12 @@ SELECT
         '[]'::json
     ),
     (SELECT COUNT(*) FROM dead_letter),
+    -- Whether the table is partitioned at all. Without this, a plain queue --
+    -- a supported pre-migration state, since this package ships
+    -- migrate_to_partitioned() -- has no pg_inherits rows and so reports the
+    -- same headroom as one whose partitions have run out, while its inserts
+    -- work fine forever.
+    (SELECT relkind = 'p' FROM pg_class WHERE oid = to_regclass('queue')),
     (SELECT headroom_days FROM partitions),
     (SELECT self_healed FROM partitions),
     NOW()
@@ -193,7 +207,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
     """
     with _tx(conn) as cur:
         cur.execute(_HEALTH_SQL, {"marker": SELF_HEALED_MARKER})
-        depths, dead_letter, headroom, self_healed, now = cur.fetchone()
+        depths, dead_letter, partitioned, headroom, self_healed, now = cur.fetchone()
 
     return QueueHealth(
         depths=[
@@ -208,6 +222,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
             for d in depths
         ],
         dead_letter=dead_letter,
+        partitioned=bool(partitioned),
         partition_headroom_days=headroom,
         self_healed_partitions=self_healed,
         server_time=now,

@@ -32,6 +32,7 @@ from cortex_utils.queue.ops import (
     SELF_HEALED_MARKER,
     PartitionNotAttachedError,
     QueueError,
+    QueueTableNotFoundError,
     _ensure_partition,
     _partition_name,
     claim,
@@ -78,6 +79,8 @@ class FakeCursor:
         self.error: Exception | None = None
         self._pending_date = False
         self._pending_probe = False
+        self._pending_parent = False
+        self.no_queue_table = False
         self.created: set[str] = set()
         self.preexisting: set[str] = set()
         self.preexisting_after_create = False
@@ -85,6 +88,10 @@ class FakeCursor:
     def execute(self, sql: str, params: Any = None) -> None:
         self.executed.append((sql, params))
         self._pending_date = "CURRENT_DATE" in sql
+        # The queue table exists unless a test says otherwise -- every primitive
+        # now checks, and threading that through each fetchone sequence would
+        # bury the thing each test is actually about.
+        self._pending_parent = "SELECT to_regclass('queue')" in sql
         self._pending_probe = "pg_inherits" in sql
         self._probed = params[0] if (self._pending_probe and params) else None
         if self.preexisting_after_create and sql.strip().startswith("CREATE TABLE"):
@@ -105,6 +112,9 @@ class FakeCursor:
         if self._pending_date:
             self._pending_date = False
             return (SERVER_TODAY,)
+        if self._pending_parent:
+            self._pending_parent = False
+            return (None,) if self.no_queue_table else ("queue",)
         if self._pending_probe:
             self._pending_probe = False
             known = self.created | self.preexisting
@@ -627,7 +637,7 @@ def test_losing_the_partition_lock_consults_the_catalogue() -> None:
 def test_migration_precheck_looks_for_the_right_column() -> None:
     conn = _conn(fetchone=(1,))
     has_claim_token_column(conn)
-    sql = conn.cur.executed[0][0]
+    sql = [s for s, _ in conn.cur.executed if "pg_attribute" in s][0]
     assert "attname = 'claimed_by'" in sql
     assert "to_regclass('queue')" in sql, "must resolve through search_path"
 
@@ -980,3 +990,14 @@ def test_the_catalogue_is_asked_before_the_create_not_only_after() -> None:
     enqueue(conn, "triage", {"gmail_id": "abc"})
     order = [s for s, _ in conn.cur.executed if "pg_inherits" in s or "CREATE TABLE" in s]
     assert "pg_inherits" in order[0], "the first thing asked must be the catalogue"
+
+
+def test_a_missing_queue_table_is_not_reported_as_a_missing_column() -> None:
+    """to_regclass returns NULL rather than raising, and `attrelid = NULL`
+    matches nothing -- so an unguarded probe answers False for a connection
+    pointed at the wrong schema. That reads as "run the migration", and the
+    migration then fails on a table that does not exist."""
+    conn = _conn(fetchone=(1,))
+    conn.cur.no_queue_table = True
+    with pytest.raises(QueueTableNotFoundError, match="PGOPTIONS"):
+        has_claim_token_column(conn)

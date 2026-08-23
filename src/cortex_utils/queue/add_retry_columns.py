@@ -7,6 +7,8 @@ from typing import Any
 import psycopg2
 import structlog
 
+from cortex_utils.queue.ops import require_queue_table
+
 log = structlog.get_logger()
 
 
@@ -19,6 +21,7 @@ def has_next_attempt_at_column(conn: psycopg2.extensions.connection) -> bool:
     cortex's table, so the migration would report itself already applied and
     silently skip. Same defect as the bare-relname lookups, one schema narrower.
     """
+    require_queue_table(conn)
     with conn.cursor() as cur:
         cur.execute(
             """

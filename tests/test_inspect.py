@@ -37,6 +37,7 @@ HEALTH_ROW = (
         }
     ],
     7,
+    True,
     5,
     0,
     NOW,
@@ -140,6 +141,7 @@ def test_is_healthy_covers_both_ways_the_queue_dies(headroom, healed, expected) 
     h = QueueHealth(
         depths=[],
         dead_letter=0,
+        partitioned=True,
         partition_headroom_days=headroom,
         self_healed_partitions=healed,
         server_time=NOW,

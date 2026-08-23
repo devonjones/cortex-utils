@@ -145,11 +145,17 @@ def _tx(
 def has_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
     """True if this schema's queue table already has claimed_by.
 
+    Guarded the same way as the other column probe: to_regclass returns NULL for
+    a missing table and `attrelid = NULL` matches nothing, so an unguarded answer
+    for a misconfigured search_path is False -- "the column is missing" rather
+    than "there is no table", which sends the caller down a migration path.
+
     Goes through _tx like everything else: psycopg2 opens a transaction even for
     a read, and this is the fast path on every service boot, so a bare cursor
     would leave long-lived worker connections idle-in-transaction as the normal
     case rather than the exception.
     """
+    require_queue_table(conn)
     with _tx(conn) as cur:
         cur.execute(
             """
@@ -220,6 +226,33 @@ _ATTACHED_SQL = """
     JOIN pg_inherits i ON c.oid = i.inhrelid
     WHERE i.inhparent = to_regclass('queue') AND c.relname = %s
 """
+
+
+def require_queue_table(conn: psycopg2.extensions.connection) -> None:
+    """Fail loudly when search_path resolves no queue table.
+
+    to_regclass() yields NULL rather than raising, so a lookup bound through it
+    reports an ordinary empty result for a connection pointed at the wrong
+    schema -- indistinguishable from a healthy "nothing to do". That is how a
+    migration probe comes back "column missing" for a table that does not exist,
+    and an operator is handed a migration to run that then blows up.
+
+    Every catalogue read that can be reached without one should call this, so
+    the contract does not vary by entry point.
+    """
+    with _tx(conn) as cur:
+        cur.execute("SELECT to_regclass('queue')")
+        if cur.fetchone()[0] is not None:
+            return
+        cur.execute("SHOW search_path")
+        log.error(
+            "No queue table on search_path",
+            search_path=cur.fetchone()[0],
+            hint="check the connection's PGOPTIONS",
+        )
+    raise QueueTableNotFoundError(
+        "no 'queue' table on search_path; check the connection's PGOPTIONS"
+    )
 
 
 def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool:
