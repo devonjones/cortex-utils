@@ -46,6 +46,7 @@ HEALTH_ROW = (
 class FakeCursor:
     def __init__(self, fetchone: Any = None, fetchall: Any = ()):
         self.executed: list[tuple[str, Any]] = []
+        self.rowcount = 1
         self._fetchone = fetchone
         self._fetchall = list(fetchall)
 
@@ -196,10 +197,18 @@ def test_failures_are_newest_first() -> None:
 # --- resubmit ---------------------------------------------------------------
 
 
+# The failed row's own created_at, deliberately not today's: a partitioned row
+# outlives the day it was made, and the cancel must carry the row's own value.
+ROW_CREATED_AT = datetime(2026, 2, 27, 9, 30, tzinfo=UTC)
+
+
 def _resubmit_conn(new_id: int | None = 99):
     """A failed row exists; the enqueue returns new_id."""
     cur = FakeCursor()
-    answers = [("triage", {"gmail_id": "abc"}, 0), (new_id,) if new_id else None]
+    answers = [
+        ("triage", {"gmail_id": "abc"}, 0, ROW_CREATED_AT),
+        (new_id,) if new_id else None,
+    ]
 
     def fetchone() -> Any:
         return answers.pop(0) if answers else None
@@ -255,3 +264,27 @@ def test_resubmit_records_a_dedup_in_the_original() -> None:
     assert resubmit(conn, 7, dedup_key="gmail_id") is None
     note = [p for s, p in conn.cur.executed if "cancelled" in s][0]
     assert "deduped" in note[0]
+
+
+def test_resubmit_cancels_by_the_whole_primary_key() -> None:
+    """(id, created_at) is the declared key, and this reads then writes -- the
+    same shape fail_or_retry carries created_at for. Addressing by id alone
+    would let a row in another partition take the cancel."""
+    conn = _resubmit_conn()
+    resubmit(conn, 5)
+    sql, params = [(s, p) for s, p in conn.cur.executed if "SET status = 'cancelled'" in s][0]
+    assert "WHERE id = %s AND created_at = %s" in sql
+    assert params[1:] == (5, ROW_CREATED_AT)
+    select = [s for s, _ in conn.cur.executed if "FOR UPDATE" in s][0]
+    assert "created_at" in select, "the value must come from the locked row"
+
+
+def test_a_cancel_that_hit_no_row_rolls_back_the_new_one() -> None:
+    """We hold the row under FOR UPDATE, so a zero here is a bug, not a race --
+    and reporting success would leave the work queued twice."""
+    conn = _resubmit_conn()
+    conn.cur.rowcount = 0
+    with pytest.raises(QueueError, match="rolled back"):
+        resubmit(conn, 5)
+    conn.commit.assert_not_called()
+    conn.rollback.assert_called_once()

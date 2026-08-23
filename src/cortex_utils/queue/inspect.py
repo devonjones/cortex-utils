@@ -262,26 +262,38 @@ def resubmit(
     """
     with _tx(conn) as cur:
         cur.execute(
-            "SELECT queue_name, payload, priority FROM queue "
+            "SELECT queue_name, payload, priority, created_at FROM queue "
             "WHERE id = %s AND status = 'failed' FOR UPDATE",
             (job_id,),
         )
         row = cur.fetchone()
         if row is None:
             raise QueueError(f"job {job_id} is not a failed row")
-        queue_name, payload, priority = row
+        queue_name, payload, priority, created_at = row
 
         # commit=False: the cancel below must land with it or not at all.
         new_id = enqueue(
             conn, queue_name, payload, priority=priority, dedup_key=dedup_key, commit=False
         )
 
+        # The whole key, not just id: (id, created_at) is what the table
+        # declares, and this reads then writes. fail_or_retry addresses rows the
+        # same way for the same reason.
         cur.execute(
             "UPDATE queue SET status = 'cancelled', "
             "last_error = COALESCE(last_error, '') || %s "
-            "WHERE id = %s",
-            (f" [resubmitted as {new_id}]" if new_id else " [resubmit deduped]", job_id),
+            "WHERE id = %s AND created_at = %s",
+            (
+                f" [resubmitted as {new_id}]" if new_id else " [resubmit deduped]",
+                job_id,
+                created_at,
+            ),
         )
+        if cur.rowcount != 1:
+            # The row we locked is the row we just failed to update, so this is
+            # not a race -- it is a bug. Raising rolls back the enqueue above
+            # rather than leaving the work queued twice.
+            raise QueueError(f"resubmit could not cancel job {job_id}; rolled back")
 
     log.info("Resubmitted failed job", original=job_id, new=new_id, queue=queue_name)
     return new_id
