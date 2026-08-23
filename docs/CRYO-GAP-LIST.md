@@ -95,6 +95,84 @@ unnoticed for two days. The query **must** bind `current_schema()` — a bare
 cryo wrote `failures(conn, limit)` — `status='failed'` rows with `last_error`,
 newest first. There is no shared way to ask "what failed and why" without
 hand-writing SQL, so every consumer that wants a dashboard writes it again.
+cryo in fact wrote it *twice*: `jobs/pg_dispatch.py:405 failed_summary()`
+predates today and does the same query for the daily digest.
+
+---
+
+## What "inspect the queue" actually needs
+
+G2 and G3 are easy to under-build, so this is the concrete list — every item is
+a question we asked during a real incident on 2026-08-18/21 and had to answer
+with hand-written SQL.
+
+### The eight questions
+
+1. **What is in the queue?** Counts grouped by `queue_name` × `status`. The
+   top-level "is anything moving" view.
+
+2. **What is ready RIGHT NOW?** `status='pending'` **and** (`next_attempt_at`
+   null or due). This is not the same as `pending`, and conflating them is
+   actively misleading: a panel showing "6 pending" when all six are backing off
+   for another hour reads as a working queue with a backlog, when it is actually
+   a queue in retry storm. Report ready and deferred **separately**.
+
+3. **How far behind are we?** Age of the oldest ready row per queue. Counts
+   alone cannot distinguish "4 items queued in the last minute" from "4 items
+   stuck since Tuesday", and those need different responses.
+
+4. **Is anything stuck in flight?** `status='processing'` with `claimed_at`
+   older than the visibility window, plus `claimed_by`. During the auth outage
+   this was the difference between "a worker is chewing on it" and "a worker
+   died holding it and the row is waiting out its timeout".
+
+5. **What failed and why?** Failed rows with `id`, `queue_name`, `payload`,
+   `attempts`/`max_attempts`, **`last_error`**, `created_at`. `last_error` is
+   the whole point — do not truncate it into a summary. All fourteen rows cryo
+   lost on 2026-08-18 read `visibility timeout, attempts exhausted`, and it was
+   that uniformity, visible only in the raw text, that proved the outage was
+   infrastructure rather than fourteen unrelated content failures.
+
+6. **What has been given up on?** `dead_letter` depth, and ideally the same
+   field set — rows there are invisible to every `queue` query and silently
+   accumulate.
+
+7. **How long until enqueues start failing?** Partition headroom in days.
+   `days_ahead=3` is the entire margin. cryo's partitions lapsed on 2026-08-21
+   and every enqueue raised `CheckViolation` into stderr for two days before a
+   human noticed the inbox was stale. **This must bind `current_schema()`** — a
+   bare `relname` lookup reports healthy off the *other* schema's partitions,
+   which is `cortex-jst7`, the defect that caused the outage the metric exists
+   to catch.
+
+8. **Has the write path been self-healing?** A count of partitions created from
+   `enqueue()` rather than by maintenance. Non-zero means maintenance is dead
+   and the queue is limping. Today that fires a log line, which is the same
+   channel that already failed to surface a two-day outage; a countable number
+   can be alerted on.
+
+### Three properties, not just fields
+
+**One round trip.** A dashboard polling five queries to draw one card will
+either be slow or be written wrong. cryo's `stats()` answers 1, 6 and 7 in a
+single call; the rest belong with it.
+
+**Read-only, and independent of the workers.** This is the property that
+matters most and it is easy to lose. cryo's 2026-08-18 outage ran fourteen hours
+unnoticed because the only failure channel was a digest that itself needed the
+pipeline alive — it died alongside the thing it was meant to report. An
+inspection API that touches **only postgres** keeps working precisely when
+everything else does not. Please do not let it grow a dependency on a worker, a
+scheduler, or a message bus.
+
+**Cheap enough to poll.** These will back a dashboard refreshing every few
+seconds. Counts over a partitioned table with a status index are fine; anything
+requiring a sequential scan of history is not.
+
+### And one write
+
+**Requeue** — see G4. Inspection without a way to act on what you find just
+relocates the shell session.
 
 ---
 
