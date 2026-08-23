@@ -288,3 +288,29 @@ def test_a_cancel_that_hit_no_row_rolls_back_the_new_one() -> None:
         resubmit(conn, 5)
     conn.commit.assert_not_called()
     conn.rollback.assert_called_once()
+
+
+def test_every_scalar_lands_in_its_own_field() -> None:
+    """Three of the five fields were never read off a health() return, so the
+    SELECT-list-to-unpack correspondence was free to drift. HEALTH_ROW already
+    carries distinct values; asserting all of them costs one line."""
+    got = health(_conn(fetchone=HEALTH_ROW))
+    assert (got.dead_letter, got.partition_headroom_days, got.self_healed_partitions) == (
+        7,
+        5,
+        0,
+    )
+    assert got.server_time == NOW
+    assert got.depths[0].queue_name == "triage"
+
+
+def test_resubmit_carries_the_original_priority_and_the_dedup_key() -> None:
+    """Dropping either from the enqueue call is invisible: the job still
+    re-queues, just at the wrong priority or without the duplicate suppression
+    the caller asked for."""
+    conn = _resubmit_conn()
+    resubmit(conn, 5, dedup_key="gmail_id")
+    insert = [(s, p) for s, p in conn.cur.executed if "INSERT INTO queue" in s][0]
+    assert insert[1][0] == "triage"
+    assert 0 in insert[1], "the original priority"
+    assert any("gmail_id" in str(p) for _, p in conn.cur.executed), "the dedup key"

@@ -234,11 +234,12 @@ def _partition_attached(conn: psycopg2.extensions.connection, name: str) -> bool
 
 
 def _ensure_partition(conn: psycopg2.extensions.connection, target: date, required: bool) -> str:
-    """Make the partition for `target` exist. Returns present/absent.
+    """Make the partition for `target` exist. Returns created/present/absent.
 
-    Not created/present: CREATE TABLE IF NOT EXISTS succeeds either way, so
-    distinguishing them would cost a round trip to answer a question nobody
-    asks. The caller logs the outcome and branches on nothing.
+    The distinction is real here, not a guess: the catalogue is consulted before
+    the CREATE, so "created" means this call made it. That costs one round trip
+    on a path that only runs when maintenance has already fallen behind, and it
+    buys a self-heal count that means what it says.
 
     Neither failure mode proves anything on its own, so neither is interpreted:
     DuplicateTable can be a same-named relation that is not a partition of this
@@ -262,6 +263,25 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
     try:
         with _tx(conn) as cur:
             cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
+
+            # Ask before creating, not only after. Two things depend on knowing
+            # whether the partition was already there, and CREATE TABLE IF NOT
+            # EXISTS cannot tell us afterwards -- it succeeds either way:
+            #
+            #  - the self-heal marker. _create_partition_for also ensures
+            #    tomorrow, which usually exists already, so stamping
+            #    unconditionally labels partitions maintenance created as
+            #    self-heals. health() reads that count to decide whether
+            #    maintenance is dead, so a false stamp is a false alarm that
+            #    never clears -- COMMENT is permanent.
+            #  - COMMENT ON TABLE requires ownership. On a healthy partition
+            #    owned by another role, stamping unconditionally raises
+            #    InsufficientPrivilege and fails the caller's write, where
+            #    doing nothing would have succeeded.
+            cur.execute(_ATTACHED_SQL, (name,))
+            if cur.fetchone() is not None:
+                return "present"
+
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {name} PARTITION OF queue
@@ -273,12 +293,9 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
                 raise PartitionNotAttachedError(
                     f"{name} exists but is not a partition of this queue"
                 )
-            # Marks it as made by the write path rather than by maintenance, so
-            # health() can count self-heals without a side table. Set after the
-            # attachment check: commenting on a shadow relation would attribute
-            # the marker to something that is not our partition.
+            # Only now: this partition is ours and we are the one who made it.
             cur.execute(f"COMMENT ON TABLE {name} IS %s", (SELF_HEALED_MARKER,))
-        return "present"
+        return "created"
     except PartitionNotAttachedError:
         if required:
             raise

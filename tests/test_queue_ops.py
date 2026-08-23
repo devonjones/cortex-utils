@@ -29,6 +29,7 @@ from cortex_utils.queue.ops import (
     DEFAULT_VISIBILITY_TIMEOUT_MIN,
     MIGRATION_LOCK_TIMEOUT_MS,
     PARTITION_LOCK_TIMEOUT_MS,
+    SELF_HEALED_MARKER,
     PartitionNotAttachedError,
     QueueError,
     _ensure_partition,
@@ -59,6 +60,13 @@ class FakeCursor:
 
     Answers SELECT CURRENT_DATE itself, so tests do not have to thread the
     server-date probe through every fetchone sequence.
+
+    It also keeps a real catalogue: the pg_inherits probe answers "attached"
+    only for partitions a CREATE in this session actually made. _ensure_partition
+    asks that question twice with different correct answers -- absent before its
+    CREATE, present after -- and a mock that says "present" to both cannot tell
+    a partition this call created from one that was already there. That is the
+    whole distinction the self-heal counter rests on.
     """
 
     def __init__(self, fetchone: Any = None, fetchall: Any = (), rowcount: int = 1):
@@ -69,17 +77,38 @@ class FakeCursor:
         self.raise_on: str | None = None
         self.error: Exception | None = None
         self._pending_date = False
+        self._pending_probe = False
+        self.created: set[str] = set()
+        self.preexisting: set[str] = set()
+        self.preexisting_after_create = False
 
     def execute(self, sql: str, params: Any = None) -> None:
         self.executed.append((sql, params))
         self._pending_date = "CURRENT_DATE" in sql
+        self._pending_probe = "pg_inherits" in sql
+        self._probed = params[0] if (self._pending_probe and params) else None
+        if self.preexisting_after_create and sql.strip().startswith("CREATE TABLE"):
+            # A concurrent creator won the race. Their partition lands whether or
+            # not our own statement then errors, so this happens before the
+            # raise -- which is the situation the concession handler exists for.
+            for token in sql.split():
+                if token.startswith("queue_2"):
+                    self.preexisting.add(token)
         if self.raise_on and self.raise_on in sql and self.error:
             raise self.error
+        if sql.strip().startswith("CREATE TABLE"):
+            for token in sql.split():
+                if token.startswith("queue_2"):
+                    self.created.add(token)
 
     def fetchone(self) -> Any:
         if self._pending_date:
             self._pending_date = False
             return (SERVER_TODAY,)
+        if self._pending_probe:
+            self._pending_probe = False
+            known = self.created | self.preexisting
+            return (1,) if self._probed in known else None
         return self._fetchone() if callable(self._fetchone) else self._fetchone
 
     def fetchall(self) -> Any:
@@ -585,8 +614,10 @@ def test_losing_the_partition_lock_consults_the_catalogue() -> None:
     conn = _conn_failing_first_insert(_missing_partition())
     conn.cur.raise_on = "CREATE TABLE"
     conn.cur.error = psycopg2.errors.LockNotAvailable("timeout")
+    # The lock holder is another creator, so the partition does land -- but only
+    # the catalogue can say so, which is the point of the assertion below.
+    conn.cur.preexisting_after_create = True
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
-    assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
     probes = [s for s, _ in conn.cur.executed if "pg_inherits" in s]
     assert probes, "must ask the catalogue rather than infer from the exception"
     assert "to_regclass('queue')" in probes[0], "and ask about THIS schema's queue"
@@ -773,28 +804,15 @@ def test_a_taken_name_that_is_not_our_partition_is_not_counted_as_present() -> N
     A same-named relation that is not a partition of this queue would otherwise
     be reported as success and the retry would fail explaining nothing.
     """
-    cur = FakeCursor(fetchone=(99,))
-    plain = cur.execute
-    state = {"insert_failed": False}
-
-    def execute(sql: str, params: Any = None) -> None:
-        plain(sql, params)
-        if "INSERT INTO queue" in sql and not state["insert_failed"]:
-            state["insert_failed"] = True
-            raise _missing_partition()
-        if "CREATE TABLE" in sql:
-            raise psycopg2.errors.DuplicateTable("name taken")
-        if "pg_inherits" in sql:
-            cur._fetchone = None  # not attached to our queue
-
-    cur.execute = execute  # type: ignore[method-assign]
-    conn = MagicMock()
-    conn.cursor.return_value = cur
-    conn.cur = cur
+    conn = _conn_failing_first_insert(_missing_partition())
+    conn.cur.raise_on = "CREATE TABLE"
+    conn.cur.error = psycopg2.errors.DuplicateTable("name taken")
+    # preexisting_after_create stays False: the name belongs to something that
+    # is not a partition of our queue, so it never enters the catalogue.
 
     with pytest.raises(psycopg2.errors.DuplicateTable):
         enqueue(conn, "triage", {"gmail_id": "abc"})
-    assert any("pg_inherits" in s for s, _ in cur.executed), "must ask, not assume"
+    assert any("pg_inherits" in s for s, _ in conn.cur.executed), "must ask, not assume"
 
 
 def test_tomorrows_failure_never_fails_the_callers_write() -> None:
@@ -829,6 +847,7 @@ def test_conceding_a_partition_still_attempts_tomorrow() -> None:
     conn = _conn_failing_first_insert(_missing_partition())
     conn.cur.raise_on = "CREATE TABLE"
     conn.cur.error = psycopg2.errors.DuplicateTable("exists")
+    conn.cur.preexisting_after_create = True  # the duplicate is a real partition
     enqueue(conn, "triage", {"gmail_id": "abc"})
     assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
     assert [s for s, _ in conn.cur.executed if "pg_inherits" in s], (
@@ -876,14 +895,10 @@ def _conn_where_create_silently_skips(shadowed: date = SERVER_TODAY) -> Any:
         if "INSERT INTO queue" in sql and not state["insert_failed"]:
             state["insert_failed"] = True
             raise _missing_partition()
-        # Only the shadowed date answers "not attached"; every other partition
-        # is healthy, so the test isolates one date at a time. Reset on every
-        # other statement so the probe's answer cannot leak into the retry
-        # INSERT's RETURNING and read as a dedup hit.
-        if "pg_inherits" in sql:
-            cur._fetchone = None if params == (shadow_name,) else (99,)
-        else:
-            cur._fetchone = (99,)
+        # A shadowed name never enters the catalogue: the relation exists, but
+        # not as a partition of our queue, which is exactly what the probe asks.
+        if sql.strip().startswith("CREATE TABLE") and shadow_name in sql:
+            cur.created.discard(shadow_name)
 
     cur.execute = execute  # type: ignore[method-assign]
     conn = MagicMock()
@@ -922,3 +937,46 @@ def test_ensure_partition_does_not_claim_to_have_created_what_was_there() -> Non
     conn = _conn_failing_first_insert(_missing_partition())
     enqueue(conn, "triage", {"gmail_id": "abc"})
     assert _ensure_partition(conn, SERVER_TODAY, required=True) == "present"
+
+
+def test_only_a_partition_this_call_made_is_marked_self_healed() -> None:
+    """health() reads the marker count to decide whether maintenance is dead,
+    and COMMENT is permanent, so a false stamp is an alarm that never clears.
+
+    _create_partition_for also ensures tomorrow, which usually exists already --
+    stamping unconditionally would label maintenance's own partitions as
+    self-heals on every write-path recovery.
+    """
+    conn = _conn_failing_first_insert(_missing_partition())
+    tomorrow = _partition_name(SERVER_TODAY + timedelta(days=1))
+    conn.cur.preexisting.add(tomorrow)  # maintenance already made this one
+
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+
+    stamped = [p for s, p in conn.cur.executed if "COMMENT ON TABLE" in s]
+    tables = [s.split()[3] for s, _ in conn.cur.executed if "COMMENT ON TABLE" in s]
+    assert tables == [_partition_name(SERVER_TODAY)], f"stamped the wrong set: {tables}"
+    assert all(p == (SELF_HEALED_MARKER,) for p in stamped)
+
+
+def test_an_existing_partition_is_not_recreated_or_commented() -> None:
+    """COMMENT ON TABLE requires ownership. On a healthy partition owned by
+    another role, stamping unconditionally raises InsufficientPrivilege and
+    fails a write that would otherwise have succeeded."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    for offset in (0, 1):
+        conn.cur.preexisting.add(_partition_name(SERVER_TODAY + timedelta(days=offset)))
+
+    assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
+
+    assert not [s for s, _ in conn.cur.executed if "CREATE TABLE" in s]
+    assert not [s for s, _ in conn.cur.executed if "COMMENT ON TABLE" in s]
+
+
+def test_the_catalogue_is_asked_before_the_create_not_only_after() -> None:
+    """CREATE TABLE IF NOT EXISTS succeeds whether or not it created anything,
+    so 'did this call make it' can only be answered by asking first."""
+    conn = _conn_failing_first_insert(_missing_partition())
+    enqueue(conn, "triage", {"gmail_id": "abc"})
+    order = [s for s, _ in conn.cur.executed if "pg_inherits" in s or "CREATE TABLE" in s]
+    assert "pg_inherits" in order[0], "the first thing asked must be the catalogue"

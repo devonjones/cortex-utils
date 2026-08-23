@@ -73,7 +73,13 @@ class QueueHealth:
 
     @property
     def is_healthy(self) -> bool:
-        """A cheap top-level assertion for a monitor to alert on."""
+        """A cheap top-level assertion for a monitor to alert on.
+
+        headroom_days counts days covered AFTER today, so 0 means tomorrow's
+        writes already fail and 1 is the last day anything can be done about it.
+        Alerting at 0 would first fire once the write path is broken, which is
+        the wrong end of the problem.
+        """
         return (
             self.partition_headroom_days is not None
             and self.partition_headroom_days >= 1
@@ -132,21 +138,38 @@ WITH depth AS (
         EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-        ))) AS oldest_ready_age_s
+        )))::float8 AS oldest_ready_age_s
     FROM queue
     GROUP BY queue_name
 ),
-partitions AS (
+partition_days AS (
     SELECT
-        MAX((regexp_match(
-            pg_get_expr(c.relpartbound, c.oid), $re$TO \\('([^']+)'\\)$re$
-        ))[1]::timestamptz::date) - CURRENT_DATE AS headroom_days,
-        COUNT(*) FILTER (
-            WHERE obj_description(c.oid, 'pg_class') = %(marker)s
-        ) AS self_healed
+        (regexp_match(
+            pg_get_expr(c.relpartbound, c.oid), $re$FROM \\('([^']+)'\\)$re$
+        ))[1]::timestamptz::date AS day,
+        obj_description(c.oid, 'pg_class') = %(marker)s AS self_healed
     FROM pg_class c
     JOIN pg_inherits i ON c.oid = i.inhrelid
     WHERE i.inhparent = to_regclass('queue')
+),
+-- Contiguous coverage from today, not MAX(bound). A partition for today and
+-- one for +7 with a gap between is not seven days of headroom: the insert on
+-- the first uncovered day raises CheckViolation, and reporting 7 there
+-- overstates in the direction that lets the queue break unannounced.
+islands AS (
+    SELECT
+        day,
+        (day - DATE '2000-01-01')
+            - (ROW_NUMBER() OVER (ORDER BY day))::int AS island
+    FROM (SELECT DISTINCT day FROM partition_days WHERE day >= CURRENT_DATE) d
+),
+partitions AS (
+    SELECT
+        (
+            SELECT MAX(day) - CURRENT_DATE FROM islands
+            WHERE island = (SELECT island FROM islands WHERE day = CURRENT_DATE)
+        ) AS headroom_days,
+        (SELECT COUNT(*) FILTER (WHERE self_healed) FROM partition_days) AS self_healed
 )
 SELECT
     COALESCE(
@@ -205,7 +228,7 @@ def stuck(
         cur.execute(
             """
             SELECT id, queue_name, claimed_by, claimed_at,
-                   EXTRACT(EPOCH FROM (NOW() - claimed_at)) AS stuck_for_s,
+                   EXTRACT(EPOCH FROM (NOW() - claimed_at))::float8 AS stuck_for_s,
                    attempts
             FROM queue
             WHERE status = 'processing'

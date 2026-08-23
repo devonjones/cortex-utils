@@ -75,7 +75,9 @@ row another worker has since re-claimed. Pass a stable per-process identity;
 hostname + pid is fine. An empty or `NULL` worker makes every caller anonymous
 and defeats this entirely.
 
-Rows past `visibility_timeout_min` are recovered to `pending` as a side effect.
+Rows past `visibility_timeout_min` are reset to `pending` as a side effect, so a
+*later* claim can pick them up. They are not returned by the call that recovers
+them.
 **Recovery does not consume an attempt.** Only `fail_or_retry()` spends the
 budget. This is deliberate: an expired OAuth token kills a worker, the row comes
 back with its budget intact, and the work runs when auth returns — rather than
@@ -108,8 +110,15 @@ hand-copy them.
 > **Migration trap.** `cortex_utils.queue.retry.fail_or_retry` is a different,
 > older function that returns `"retrying"` where this one returns `"pending"`.
 > Swapping the import without updating an `== "retrying"` check yields a
-> comparison that is silently always false. It has no non-test callers and is
-> slated for deletion (cortex-i5jc).
+> comparison that is **silently always false**.
+>
+> It has **five production callers** — `triage`'s `worker.py`, `labeling_worker.py`
+> and `teach_bot.py`, and `postmark`'s `parse_worker.py` and
+> `attachment_worker.py` — all on its older signature, where `max_attempts` is
+> the 4th positional argument rather than `error`. `teach_bot.py` branches on
+> the return value, so it is the one that breaks silently rather than loudly.
+>
+> Do not import it in new code. Migrating those five is tracked as cortex-i5jc.
 
 ---
 
@@ -136,10 +145,17 @@ QueueHealth(
 )
 ```
 
-`.is_healthy` is a single boolean for a monitor to alert on.
+`.is_healthy` is a single boolean for a monitor to alert on. It covers
+**partition health only** — headroom and self-heals. It deliberately says
+nothing about `depths` or `dead_letter`, because there is no queue depth that is
+universally wrong; alert on those with thresholds that suit your workload.
 
-`partition_headroom_days` is how long until enqueues start failing. `None` means
-no partition covers today — already broken.
+`partition_headroom_days` counts days of **contiguous** coverage after today —
+not the furthest partition bound. A partition for today and one for +7 with a
+gap between is `0`, not `7`, because the insert on the first uncovered day
+fails. So `0` means tomorrow's writes already fail, and `None` means today is
+uncovered and writes are failing now. A monitor should be able to tell those
+apart, which is why the second is not reported as `-1` or `0`.
 
 `self_healed_partitions` counts partitions the *write path* had to create
 because scheduled maintenance had stopped. Non-zero means maintenance is dead;
@@ -160,10 +176,15 @@ and the row is waiting out its timeout".
 
 ### `failures(conn, limit=50, queue_name=None) -> list[Failure]`
 
-Failed rows, newest first. **`last_error` is never truncated or summarised.**
-Fourteen rows all reading `visibility timeout, attempts exhausted` is the signal
-that the cause was infrastructure and not fourteen unrelated content failures —
-and that uniformity is visible only in the raw text.
+Failed rows, newest first. **`last_error` is returned whole** — never truncated
+or summarised on the way out. Fourteen rows all reading `visibility timeout,
+attempts exhausted` is the signal that the cause was infrastructure and not
+fourteen unrelated content failures, and that uniformity is visible only in the
+raw text.
+
+(`fail_or_retry()` does cap what it *writes* at `ERROR_MAX_CHARS` = 2000, so a
+stack trace longer than that was already cut before it reached the row. This
+call adds no further loss.)
 
 ### `resubmit(conn, job_id, dedup_key=None) -> int | None`
 
@@ -242,14 +263,19 @@ exception to grep for.
 Run once per schema, before first use:
 
 ```python
-from cortex_utils.queue import ensure_claim_token_column
+from cortex_utils.queue import DeadLetterManager, ensure_claim_token_column
+
 ensure_claim_token_column(conn)
+DeadLetterManager(conn).ensure_table()
 ```
 
-Adds `claimed_by` if the table predates it. Pre-checks `pg_attribute` before the
+`ensure_claim_token_column` adds `claimed_by` if the table predates it. Pre-checks `pg_attribute` before the
 `ALTER` and runs under a 5s `lock_timeout`, so a boot fails fast rather than
 queueing `ACCESS EXCLUSIVE` behind live claim traffic. Idempotent — safe on
 every boot.
+
+`DeadLetterManager.ensure_table()` creates `dead_letter` and brings an existing
+one up to date. `health()` reads that table, so without it the call fails.
 
 ---
 
