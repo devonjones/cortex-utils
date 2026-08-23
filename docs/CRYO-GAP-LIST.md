@@ -134,13 +134,31 @@ Verified on ares today: both are UTC, `date.today() == CURRENT_DATE`, so it is
 UTC, and independent of TZ it is reachable whenever a retry crosses local
 midnight under lock contention.
 
-**Suggested fix:** compute the date server-side, and create **today and
-tomorrow** in one pass. That removes the race rather than narrowing it, and
+**The rule, not a suggestion (Devon, 2026-08-23):** *"we can't trust a local
+`date.today()`, you need to do a query that gets `now()` back from the server."*
+
+The partition key is `created_at TIMESTAMPTZ DEFAULT NOW()` — a value the
+**server** produces. Any date used to route or create a partition for that row
+must come from the same clock. A client-side `date.today()` is a second,
+unsynchronised clock in a different timezone, and it is only correct by
+coincidence when the two happen to agree.
+
+That coincidence is what makes it dangerous: it will test green on every box
+where client and server are both UTC, and fail on the first consumer that is
+not. It is not a race that shows up under load — it is a correctness bug that
+shows up under *deployment*.
+
+Concretely: derive the date inside the SQL (`CURRENT_DATE`, or `SELECT NOW()`
+if you need it in Python first), and create **today and tomorrow** in one pass. That removes the race rather than narrowing it, and
 tomorrow is inside maintenance's normal `+3` horizon so it cannot push one
 schema's partitions past another's — which the shared-image coupling forbids.
 
 cryo's `_ensure_partition_today()` on `cryo-63-partition-selfheal` does both, if
-useful as a reference.
+useful as a reference. Audited cryo's side while writing this: no client-side
+date reaches any queue or partition path there — `CURRENT_DATE`, `NOW()`, and
+`clock_timestamp()` throughout, all server-side. Worth the same grep here
+(`date.today()`, `datetime.now()`, `utcnow()`), since `ops.py:247` may not be
+the only site.
 
 ## D2 — No `lock_timeout` on the write-path partition DDL (P2)
 
