@@ -26,6 +26,7 @@ import psycopg2
 import pytest
 
 from cortex_utils.queue.ops import (
+    DEFAULT_VISIBILITY_TIMEOUT_MIN,
     MIGRATION_LOCK_TIMEOUT_MS,
     QueueError,
     claim,
@@ -454,7 +455,7 @@ def test_claim_writes_the_token_and_honours_its_limits() -> None:
 def test_claim_only_takes_pending_rows_that_are_ready() -> None:
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
-    claimable = conn.cur.executed[0][0].split("claimable AS")[1]
+    claimable = conn.cur.executed[0][0].split("claimable AS")[1].split("UPDATE queue q")[0]
     assert "status = 'pending'" in claimable
     assert "next_attempt_at <= statement_timestamp()" in claimable, "deferral must be honoured"
     assert "FOR UPDATE SKIP LOCKED" in claimable
@@ -585,7 +586,7 @@ def test_stale_sweep_targets_expired_processing_rows_only() -> None:
 def test_claimable_is_scoped_and_budget_bounded() -> None:
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
-    claimable = conn.cur.executed[0][0].split("claimable AS")[1]
+    claimable = conn.cur.executed[0][0].split("claimable AS")[1].split("UPDATE queue q")[0]
     assert "queue_name = %(q)s" in claimable, "must not claim another queue's work"
     assert "attempts < max_attempts" in claimable
     assert "next_attempt_at IS NULL" in claimable, "a never-deferred row must be claimable"
@@ -623,3 +624,37 @@ def test_losing_the_partition_creation_race_counts_as_success() -> None:
 
     assert enqueue(conn, "triage", {"gmail_id": "abc"}) == 99
     assert len([s for s, _ in cur.executed if "INSERT INTO queue" in s]) == 2
+
+
+def test_claim_writes_a_complete_claim() -> None:
+    """The outer UPDATE is the claim itself, and was only asserted for the token.
+
+    Without claimed_at the row sits in 'processing' with a NULL timestamp, which
+    reset_stale's "claimed_at < NOW() - interval" can never match: abandoned work
+    becomes unrecoverable. Leaving status as 'pending' gives unbounded concurrent
+    reprocessing with complete() bouncing every time.
+    """
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    outer = conn.cur.executed[0][0].split("UPDATE queue q")[1]
+    assert "status = 'processing'" in outer
+    assert "claimed_at = NOW()" in outer, "a claim with no timestamp is never recovered"
+    assert "claimed_by = %(w)s" in outer
+
+
+def test_claim_uses_the_documented_default_visibility_timeout() -> None:
+    conn = _conn(fetchall=[])
+    claim(conn, "triage", WORKER)
+    # Asserting against the constant would be tautological: a mutation moves
+    # both sides together. 30 minutes is the documented contract.
+    assert DEFAULT_VISIBILITY_TIMEOUT_MIN == 30
+    assert _params_of(conn, "reset_stale")["vis"] == 30
+
+
+def test_fail_or_retry_defers_forward_in_seconds() -> None:
+    """Backwards, a failing job is instantly re-claimable and burns its whole
+    attempt budget in seconds during an outage -- the 2026-08-18 shape."""
+    conn = _conn(fetchone=(0, 3))
+    fail_or_retry(conn, 7, "boom", WORKER)
+    sql = [s for s, _ in conn.cur.executed if "SET status = 'pending'" in s][0]
+    assert "clock_timestamp() + (INTERVAL '1 second' * %s)" in sql
