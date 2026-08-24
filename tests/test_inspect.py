@@ -41,6 +41,7 @@ HEALTH_ROW = (
     5,
     0,
     3,  # oldest_partition_age_days
+    11,  # partition_count
     NOW,
 )
 
@@ -163,6 +164,7 @@ def test_is_healthy_covers_both_ways_the_queue_dies(headroom, healed, expected) 
         partition_headroom_days=headroom,
         self_healed_partitions=healed,
         oldest_partition_age_days=3,
+        partition_count=11,
         server_time=NOW,
     )
     assert h.is_healthy is expected
@@ -321,7 +323,8 @@ def test_every_scalar_lands_in_its_own_field() -> None:
         got.partition_headroom_days,
         got.self_healed_partitions,
         got.oldest_partition_age_days,
-    ) == (7, 5, 0, 3)
+        got.partition_count,
+    ) == (7, 5, 0, 3, 11)
     assert got.server_time == NOW
     assert got.depths[0].queue_name == "triage"
 

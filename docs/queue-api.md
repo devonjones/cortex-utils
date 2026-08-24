@@ -213,6 +213,7 @@ QueueHealth(
     partitioned: bool,
     partition_headroom_days: int | None,
     self_healed_partitions: int,
+    partition_count: int,
     oldest_partition_age_days: int | None,
     server_time: datetime,
 )
@@ -229,6 +230,14 @@ gap between is `0`, not `7`, because the insert on the first uncovered day
 fails. So `0` means tomorrow's writes already fail, and `None` means today is
 uncovered and writes are failing now. A monitor should be able to tell those
 apart, which is why the second is not reported as `-1` or `0`.
+
+> **Do not read `oldest_partition_age_days` on its own.** `None` means two
+> opposite things: on a non-partitioned queue there is simply nothing to age,
+> and on a **partitioned** one it means *zero partitions attached* — the worst
+> state the queue can be in, because no row can be written at all. The obvious
+> `if age is not None and age > retention` guard goes silent on exactly that
+> case. Check `partition_count` (or `partitioned`) alongside it. `is_healthy` is
+> already False there and remains the thing to alert on.
 
 `oldest_partition_age_days` is how far back the oldest still-attached partition
 goes. Compare it against the `retention_days` your cron runs with: climbing past
@@ -532,6 +541,21 @@ dismissed was never triaged, and keeping it forever would not fix that.
 name: an existing cryo schema satisfies the shared one without a rename.*
 
 ---
+
+### Errors from `resubmit()`
+
+It raises for three different conditions, and a batch caller has to tell them
+apart:
+
+| condition | exception | what to do |
+|---|---|---|
+| both `dedup_key` and `dedup_keys` | `QueueError` | fix the call |
+| the id is not a failed row | **`JobNotFailedError`** | skip it and carry on — someone already handled it, or the id is stale |
+| the cancel could not update the row | `QueueError` | an internal invariant broke; the enqueue is rolled back |
+
+`JobNotFailedError` subclasses `QueueError`, so existing `except QueueError`
+keeps working. Without it the only way to separate the ordinary case from the
+bug was to re-read `failures()` after the raise and infer.
 
 ### Retrying dead letters
 

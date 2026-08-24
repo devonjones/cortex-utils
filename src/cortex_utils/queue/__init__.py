@@ -30,6 +30,7 @@ from cortex_utils.queue.migrate import (
     migrate_to_partitioned as migrate_to_partitioned,
 )
 from cortex_utils.queue.ops import (
+    JobNotFailedError,
     QueueError,
     claim,
     complete,
@@ -121,6 +122,7 @@ __all__ = [
     "DeadLetterManager",
     # Errors.
     "QueueError",
+    "JobNotFailedError",
     "PartitionError",
     "PartitionNotAttachedError",
     "QueueTableNotFoundError",

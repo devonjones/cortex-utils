@@ -38,6 +38,7 @@ import psycopg2
 from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import (
     SELF_HEALED_MARKER,
+    JobNotFailedError,
     QueueError,
     _tx,
     enqueue,
@@ -85,9 +86,26 @@ class QueueHealth:
     partitioned: bool
     partition_headroom_days: int | None
     self_healed_partitions: int
+    partition_count: int
+    """How many partitions are attached to the queue.
+
+    Here so that `oldest_partition_age_days is None` can be read without
+    guessing. On a partitioned table that None means ZERO PARTITIONS -- the
+    worst state the queue can be in, since no row can be written at all -- and
+    the obvious `if age is not None` guard goes silent on exactly that case.
+    Reported directly rather than left to be inferred, because it was inferred
+    wrongly twice: cryo wrote the silent guard, and so did I.
+
+    `is_healthy` already covers it (headroom is None there too), and that
+    remains the signal to alert on. This is for anything reading the age field
+    on its own.
+    """
+
     oldest_partition_age_days: int | None
-    """Days since the oldest still-attached partition's date, or None if there
-    are no partitions.
+    """Days since the oldest still-attached partition's date, or None when there
+    are no partitions -- which is benign on a non-partitioned queue and critical
+    on a partitioned one. Check `partition_count` or `partitioned` to tell them
+    apart; do not read this field alone.
 
     Deliberately not part of is_healthy: what counts as too old is the caller's
     retention window, which this module does not know. Compare it against the
@@ -240,7 +258,8 @@ partitions AS (
         -- watching at 3am. This is the number that goes wrong -- it climbs past
         -- retention_days and keeps climbing -- and it costs nothing to read
         -- here, because partition_days is already materialised above.
-        (SELECT CURRENT_DATE - MIN(day) FROM partition_days) AS oldest_partition_age_days
+        (SELECT CURRENT_DATE - MIN(day) FROM partition_days) AS oldest_partition_age_days,
+        (SELECT COUNT(*) FROM partition_days) AS partition_count
 )
 SELECT
     COALESCE(
@@ -269,6 +288,7 @@ SELECT
     (SELECT headroom_days FROM partitions),
     (SELECT self_healed FROM partitions),
     (SELECT oldest_partition_age_days FROM partitions),
+    (SELECT partition_count FROM partitions),
     NOW()
 """
 
@@ -320,6 +340,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
             headroom,
             self_healed,
             oldest_partition_age_days,
+            partition_count,
             now,
         ) = cur.fetchone()
 
@@ -340,6 +361,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
         partition_headroom_days=headroom,
         self_healed_partitions=self_healed,
         oldest_partition_age_days=oldest_partition_age_days,
+        partition_count=partition_count,
         server_time=now,
     )
 
@@ -438,7 +460,7 @@ def resubmit(
         )
         row = cur.fetchone()
         if row is None:
-            raise QueueError(f"job {job_id} is not a failed row")
+            raise JobNotFailedError(f"job {job_id} is not a failed row")
         queue_name, payload, priority, created_at = row
         if dedup_keys is not None:
             dedup_key = dedup_keys.get(queue_name)
