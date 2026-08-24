@@ -167,8 +167,15 @@ index is already there"*.
 That now runs on every boot of every consumer, forever — `ensure_queue_schema`
 is documented as *"cheap on the steady state — every step pre-checks the
 catalogue before touching anything"*, and this is the step that does not. It is
-also outside any `lock_timeout` the caller set, since `ensure_table` opens its
-own cursor on the connection.
+also outside any `lock_timeout` a caller sets.
+
+CORRECTION to how I first put that: I said it was because `ensure_table` opens
+its own cursor. The cursor is not the reason — `SET LOCAL` is **transaction**
+scoped, and `ensure_queue_schema` runs its steps in their own transactions via
+`_tx`, so a caller's `SET LOCAL lock_timeout` is already gone by the time this
+DDL runs. Same conclusion, different mechanism, and worth stating precisely
+since it changes where the fix goes: bounding it has to happen inside the
+library, not by asking consumers to set a timeout they cannot make reach.
 
 `ensure_lifecycle_columns` is the model: ask `pg_attribute`, return early.
 
