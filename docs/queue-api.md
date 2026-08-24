@@ -533,6 +533,17 @@ name: an existing cryo schema satisfies the shared one without a rename.*
 
 ---
 
+### Retrying dead letters
+
+`retry_job(id, priority=0)` and `retry_jobs(..., priority=0)` re-enqueue and
+stamp the archive row with `retried_at`/`retried_as` rather than deleting it.
+
+**Pass `priority=-100` for any bulk or historical retry.** `dead_letter` does not
+record what the failed job's priority was, so it comes from you, and the default
+of `0` is right only for an operator retrying one recent failure. A few hundred
+archived jobs re-queued at `0` drain level with live traffic — ahead of mail that
+has not arrived yet.
+
 ## Known limitations
 
 **One concurrency branch is still unreached.** `SKIP LOCKED` not

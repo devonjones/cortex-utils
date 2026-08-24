@@ -139,7 +139,7 @@ def test_one_bad_job_does_not_poison_the_rest_of_the_batch() -> None:
     mgr.list_jobs = lambda **kw: [dict(JOB, id=1), dict(JOB, id=2)]  # type: ignore[method-assign]
     calls: list[int] = []
 
-    def flaky(job_id: int, dry_run: bool = False) -> bool:
+    def flaky(job_id: int, dry_run: bool = False, priority: int = 0) -> bool:
         calls.append(job_id)
         if job_id == 1:
             raise psycopg2.errors.UniqueViolation("boom")
@@ -156,7 +156,7 @@ def test_a_non_database_error_is_not_swallowed() -> None:
     mgr, conn = _manager()
     mgr.list_jobs = lambda **kw: [dict(JOB, id=1)]  # type: ignore[method-assign]
 
-    def broken(job_id: int, dry_run: bool = False) -> bool:
+    def broken(job_id: int, dry_run: bool = False, priority: int = 0) -> bool:
         raise ValueError("programming error")
 
     mgr.retry_job = broken  # type: ignore[method-assign]
@@ -413,3 +413,29 @@ def test_the_migration_is_one_transaction_even_under_autocommit() -> None:
 
     assert False in seen, "autocommit must be off while the ALTERs run"
     assert seen[-1] is True, "and the caller's setting restored afterwards"
+
+
+def test_a_bulk_retry_can_ask_for_backfill_priority() -> None:
+    """929 archived jobs re-queued at priority 0 drain level with live traffic,
+    ahead of mail that has not arrived yet. CLAUDE.md's contract is -100 for any
+    re-processing, and dead_letter does not record the failed job's original
+    priority, so it has to come from the caller.
+
+    Pinned at both layers: retry_jobs must pass it through, and retry_job must
+    put it on the enqueue rather than accepting it and dropping it.
+    """
+    seen: list[int] = []
+
+    def capture(job_id: int, dry_run: bool = False, priority: int = 0) -> bool:
+        seen.append(priority)
+        return True
+
+    mgr, _ = _manager(fetchone=(1,))
+    mgr.list_jobs = lambda **kw: [{"id": 1}, {"id": 2}]  # type: ignore[method-assign]
+    mgr.retry_job = capture  # type: ignore[method-assign]
+
+    mgr.retry_jobs(priority=-100)
+    assert seen == [-100, -100], f"priority was not passed through: {seen}"
+
+    mgr.retry_jobs()
+    assert seen[-1] == 0, "the default must stay 0 for a one-off operator retry"
