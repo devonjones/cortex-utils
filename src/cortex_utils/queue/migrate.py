@@ -15,12 +15,12 @@ from datetime import timedelta
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import server_today
 from cortex_utils.queue.schema import queue_ddl
 
-log = structlog.get_logger()
+log = get_logger()
 
 # Built from the canonical definition rather than kept as a second copy. This
 # one had already drifted: it was missing priority, claimed_by and

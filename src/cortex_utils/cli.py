@@ -19,13 +19,14 @@ import structlog
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
 from cortex_utils.config import Config
 from cortex_utils.health.watchdog import Watchdog, parse_peers
+from cortex_utils.log import get_logger
 from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.migrate import drop_old_queue_table, migrate_to_partitioned
 from cortex_utils.queue.partitions import PartitionManager
 from cortex_utils.queue.stats import format_stats_table, get_queue_stats, get_stale_jobs
 
-log = structlog.get_logger()
+log = get_logger()
 
 
 def _configure_cli_logging() -> None:

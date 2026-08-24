@@ -34,8 +34,8 @@ from datetime import datetime
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import (
     SELF_HEALED_MARKER,
     QueueError,
@@ -44,7 +44,7 @@ from cortex_utils.queue.ops import (
     is_dedup_value,
 )
 
-log = structlog.get_logger()
+log = get_logger()
 
 DEFAULT_FAILURE_LIMIT = 50
 
@@ -377,7 +377,13 @@ def resubmit(
     rule is a gap here, not a boundary. Pass `dedup_key` for a single queue, or
     `dedup_keys` and let the row decide.
     """
-    if dedup_key and dedup_keys:
+    # `is not None`, not truthiness: resolution below tests identity, and an
+    # empty map disagreeing with a truthy guard means no raise, then .get()
+    # returns None, the caller's dedup_key is silently discarded, and a
+    # duplicate is enqueued while this returns a new id -- success reported on a
+    # false belief. An empty map is the likely shape, too: cfg.get("dedup_keys",
+    # {}) or a filtered comprehension.
+    if dedup_key is not None and dedup_keys is not None:
         raise QueueError("pass dedup_key or dedup_keys, not both")
     with _tx(conn) as cur:
         cur.execute(

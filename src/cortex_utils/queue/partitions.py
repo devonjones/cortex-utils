@@ -17,8 +17,8 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import (
     PartitionError,
     PartitionNotAttachedError,
@@ -33,7 +33,7 @@ __all__ = [
     "QueueTableNotFoundError",
 ]
 
-log = structlog.get_logger()
+log = get_logger()
 
 
 class PartitionManager:
@@ -372,6 +372,17 @@ class PartitionManager:
         which dates need covering is a property of that clock rather than of any
         one consumer, which is why this lives here.
         """
+        if days_ahead < 0 or days_back < 0:
+            # A negative window silently skips today. days_back=-1 returns 3 and
+            # maintain() reports it as partitions_created, while the write path
+            # then self-heals and logs "partition maintenance is not keeping
+            # up" -- which is false, and points debugging away from the caller
+            # that asked for a window with no today in it.
+            raise PartitionError(
+                f"days_ahead={days_ahead} days_back={days_back}: a negative "
+                "window would skip today's partition"
+            )
+
         created = 0
         # Server clock, not this process: created_at is NOW() on the server, so
         # a partition dated by the client only lines up by coincidence. Same

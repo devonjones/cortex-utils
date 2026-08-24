@@ -7,9 +7,10 @@ import re
 from typing import Literal
 
 import psycopg2
-import structlog
 
-log = structlog.get_logger()
+from cortex_utils.log import get_logger
+
+log = get_logger()
 
 DEFAULT_BASE_SECONDS = 30
 DEFAULT_CAP_SECONDS = 900  # 15 minutes

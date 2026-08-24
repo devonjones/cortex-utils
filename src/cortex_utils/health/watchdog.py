@@ -21,11 +21,10 @@ import socket
 import time
 from dataclasses import dataclass, field
 
-import structlog
-
 from cortex_utils.alerter.discord import DiscordClient
+from cortex_utils.log import get_logger
 
-log = structlog.get_logger()
+log = get_logger()
 
 RED = 0xE74C3C
 GREEN = 0x2ECC71

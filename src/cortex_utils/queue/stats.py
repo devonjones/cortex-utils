@@ -4,9 +4,10 @@ from datetime import datetime
 from typing import Any
 
 import psycopg2
-import structlog
 
-log = structlog.get_logger()
+from cortex_utils.log import get_logger
+
+log = get_logger()
 
 
 def _server_now(conn: psycopg2.extensions.connection) -> datetime:

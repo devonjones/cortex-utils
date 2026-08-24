@@ -51,9 +51,9 @@ from datetime import date, timedelta
 from typing import Any, Literal
 
 import psycopg2
-import structlog
 from psycopg2.extras import Json
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.retry import (
     DEFAULT_BASE_SECONDS,
     DEFAULT_CAP_SECONDS,
@@ -61,7 +61,7 @@ from cortex_utils.queue.retry import (
     compute_backoff_delay,
 )
 
-log = structlog.get_logger()
+log = get_logger()
 
 DEFAULT_VISIBILITY_TIMEOUT_MIN = 30
 ERROR_MAX_CHARS = 2000

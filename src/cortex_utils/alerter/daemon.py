@@ -7,7 +7,8 @@ from datetime import datetime
 
 import docker
 import schedule
-import structlog
+
+from cortex_utils.log import get_logger
 
 from .classifier import Severity, classify, is_error_line
 from .discord import (
@@ -19,7 +20,7 @@ from .discord import (
 )
 from .rate_limiter import RateLimiter
 
-log = structlog.get_logger()
+log = get_logger()
 
 # Default containers to monitor
 DEFAULT_CONTAINERS = [

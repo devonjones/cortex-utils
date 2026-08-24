@@ -30,11 +30,11 @@ from datetime import timedelta
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import enqueue
 
-log = structlog.get_logger()
+log = get_logger()
 
 # SQL to create dead_letter table
 DEAD_LETTER_SCHEMA = """

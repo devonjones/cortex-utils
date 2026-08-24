@@ -25,13 +25,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.ops import QueueError, _tx, ensure_claim_token_column
 
-log = structlog.get_logger()
+log = get_logger()
 
 # What the primitives read and write. The value is the type a fresh table gets;
 # verify_queue_table() checks presence rather than type, because an existing

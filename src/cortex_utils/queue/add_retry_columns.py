@@ -5,11 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import MIGRATION_LOCK_TIMEOUT_MS, _tx, require_queue_table
 
-log = structlog.get_logger()
+log = get_logger()
 
 
 def has_next_attempt_at_column(conn: psycopg2.extensions.connection) -> bool:

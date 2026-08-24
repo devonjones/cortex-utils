@@ -3,13 +3,14 @@
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-import structlog
 from flask import Blueprint, current_app, jsonify
+
+from cortex_utils.log import get_logger
 
 if TYPE_CHECKING:
     from flask import Flask
 
-logger = structlog.get_logger()
+logger = get_logger()
 
 health_bp = Blueprint("health", __name__)
 

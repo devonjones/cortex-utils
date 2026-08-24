@@ -92,9 +92,10 @@ def test_running_the_cli_configures_logging_to_stderr() -> None:
     )
     assert "Cortex operational utilities" in result.stdout
 
-    # A real subcommand, not --help: click short-circuits --help before the
-    # group callback body runs, so it would report "not configured" whether or
-    # not the wiring works.
+    # Assert on the DESTINATION, not on the type of the sink. Checking the
+    # class name passes if _LazyStderr.write is changed to write to stdout --
+    # verified: that mutant leaves the whole suite green while the real CLI goes
+    # back to interleaving log lines into `queue stats` output.
     probe = (
         "import structlog\n"
         "from click.testing import CliRunner\n"
@@ -102,14 +103,16 @@ def test_running_the_cli_configures_logging_to_stderr() -> None:
         "print('before:', structlog.is_configured())\n"
         "CliRunner().invoke(main, ['queue', 'stats'])\n"
         "print('after:', structlog.is_configured())\n"
-        "print('stream:', type(structlog.get_config()['logger_factory']._file).__name__)\n"
+        "from cortex_utils.log import get_logger\n"
+        "get_logger().warning('a-log-line-that-must-not-be-on-stdout')\n"
     )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
-    ).stdout
-    assert "before: False" in out, out
-    assert "after: True" in out, out
-    assert "_LazyStderr" in out, f"logs must go to stderr, not the command's output: {out}"
+    out2, err2 = _run(probe)
+    assert "before: False" in out2, out2
+    assert "after: True" in out2, out2
+    assert "a-log-line-that-must-not-be-on-stdout" not in out2, (
+        f"the CLI put a log line on stdout, where its own output goes: {out2!r}"
+    )
+    assert "a-log-line-that-must-not-be-on-stdout" in err2, err2
 
 
 def test_importing_the_queue_writes_nothing_to_stdout() -> None:
@@ -124,3 +127,64 @@ def test_importing_the_queue_writes_nothing_to_stdout() -> None:
         check=True,
     )
     assert result.stdout == "", f"wrote to stdout on import: {result.stdout!r}"
+
+
+def _run(code: str) -> tuple[str, str]:
+    """A fresh interpreter: structlog config is process-global, so anything
+    this test process already imported would mask the answer."""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    return r.stdout, r.stderr
+
+
+def test_library_logs_never_reach_an_unconfigured_consumers_stdout() -> None:
+    """The bug a downstream consumer reported and we reproduced: their
+    claim-drain stdout is TSV, one claimed row per line, and a library log line
+    was parsed as a claimed row.
+
+    structlog's own default is stdout. That is fine for an application and
+    wrong for a library -- the corruption reads as data rather than as an error.
+    """
+    out, err = _run(
+        "from cortex_utils.log import get_logger\n"
+        "get_logger().info('library message')\n"
+        "print('ROW\\tone\\ttwo')\n"
+    )
+    assert out == "ROW\tone\ttwo\n", f"library log leaked into the protocol: {out!r}"
+    assert "library message" in err
+
+
+def test_a_configured_consumer_keeps_their_own_configuration() -> None:
+    """We do not call structlog.configure() -- that is global state, and a
+    library deciding how its consumer logs is the same mistake one layer up.
+    The stderr default applies only when they have not chosen."""
+    out, _err = _run(
+        "import io, structlog\n"
+        "sink = io.StringIO()\n"
+        "structlog.configure(processors=[structlog.processors.JSONRenderer()],\n"
+        "                    logger_factory=structlog.PrintLoggerFactory(file=sink))\n"
+        "from cortex_utils.log import get_logger\n"
+        "get_logger().info('library message', k=1)\n"
+        "print('SINK:' + sink.getvalue().strip())\n"
+    )
+    assert '"event": "library message"' in out, out
+    assert out.startswith("SINK:{"), f"their renderer was not used: {out!r}"
+
+
+def test_the_choice_is_made_at_log_time_not_import_time() -> None:
+    """Modules bind their logger at import, which is before a consumer has had
+    the chance to configure. Deciding then would lock in the wrong answer for
+    every consumer that configures after importing us -- which is all of them."""
+    out, _err = _run(
+        "import io, structlog\n"
+        "from cortex_utils.log import get_logger\n"
+        "log = get_logger()                      # bound BEFORE configuring\n"
+        "sink = io.StringIO()\n"
+        "structlog.configure(processors=[structlog.processors.JSONRenderer()],\n"
+        "                    logger_factory=structlog.PrintLoggerFactory(file=sink))\n"
+        "log.info('late', k=1)\n"
+        "print('SINK:' + sink.getvalue().strip())\n"
+    )
+    assert '"event": "late"' in out, f"import-time binding ignored later config: {out!r}"

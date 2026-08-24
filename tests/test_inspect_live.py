@@ -639,3 +639,34 @@ def test_partitions_can_cover_yesterday(conn) -> None:
 
     assert manager.create_future_partitions(days_ahead=0, days_back=1) == 1
     assert manager.partition_exists(today - timedelta(days=1)) is True
+
+
+def test_an_empty_dedup_map_does_not_silently_discard_the_key(conn) -> None:
+    """The guard tested truthiness while resolution tested identity, and they
+    disagreed on {}. No raise, then .get() returns None, the caller's dedup_key
+    is discarded, and a duplicate is enqueued while resubmit returns a new id --
+    success reported on a false belief. An empty map is the likely shape:
+    cfg.get("dedup_keys", {}), or a filtered comprehension.
+    """
+    from cortex_utils.queue.inspect import resubmit
+
+    with pytest.raises(QueueError, match="not both"):
+        resubmit(conn, 1, dedup_key="video_id", dedup_keys={})
+    conn.rollback()
+
+
+def test_a_negative_window_is_refused(conn) -> None:
+    """days_back=-1 skips TODAY's partition and returns 3, which maintain()
+    reports as partitions_created -- while the write path then self-heals and
+    logs "maintenance is not keeping up", which is false and points debugging
+    away from the caller that asked for a window with no today in it."""
+    from cortex_utils.queue.partitions import PartitionError, PartitionManager
+
+    manager = PartitionManager(conn)
+    for kwargs in ({"days_back": -1}, {"days_ahead": -1}):
+        with pytest.raises(PartitionError, match="negative window"):
+            manager.create_future_partitions(**kwargs)
+        conn.rollback()
+
+    today = _server_today(conn)
+    assert manager.partition_exists(today) is False, "nothing was created"
