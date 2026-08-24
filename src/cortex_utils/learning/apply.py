@@ -57,6 +57,23 @@ def enqueue_proposal_apply(
     return job_id
 
 
+# cortex_utils hand-writing its own claim is the same rule violation the
+# deprecation exists to flag, and it needs the same port (cortex-xluv) -- it
+# also takes no worker identity, so it cannot set a claim token.
+#
+# Evaluated once at import rather than per call, inside a catch_warnings() that
+# suppressed the deprecation on every poll. catch_warnings() mutates the
+# PROCESS-GLOBAL filter list: each entry and exit bumps the filters version and
+# invalidates __warningregistry__, so teach_bot -- which calls this in a loop
+# and also imports retry.fail_or_retry -- would have had that OTHER deprecation
+# re-fire every iteration instead of once. It is not thread-safe either.
+#
+# The default filters hide DeprecationWarning outside __main__, so importing
+# this module stays quiet without suppressing anything, and the warning keeps
+# meaning "a consumer still needs porting".
+_READY = ready_predicate()
+
+
 def claim_proposal_apply_jobs(
     conn: psycopg2.extensions.connection, *, limit: int = 10
 ) -> list[ApplyJob]:
@@ -73,7 +90,7 @@ def claim_proposal_apply_jobs(
             WITH claimable AS (
                 SELECT id FROM queue
                 WHERE queue_name = %s AND status = 'pending'
-                  AND {ready_predicate()}
+                  AND {_READY}
                 ORDER BY priority DESC, id
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s

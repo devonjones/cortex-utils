@@ -37,7 +37,7 @@ from cortex_utils.queue.ops import (  # noqa: E402
     QueueTableNotFoundError,
     enqueue,
 )
-from cortex_utils.queue.schema import queue_ddl  # noqa: E402
+from cortex_utils.queue.schema import REQUIRED_COLUMNS, queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
 
@@ -670,3 +670,69 @@ def test_a_negative_window_is_refused(conn) -> None:
 
     today = _server_today(conn)
     assert manager.partition_exists(today) is False, "nothing was created"
+
+
+def test_health_survives_a_schema_with_no_dead_letter_table(conn) -> None:
+    """health() is the call an operator makes when things are already wrong, so
+    it has to work on a half-provisioned schema rather than crash on one.
+
+    Reachable without doing anything exotic: ensure_queue_table() is exported
+    alongside ensure_queue_schema() and does not create dead_letter, so a
+    consumer who picks the wrong one gets a working queue and a monitor that
+    raises UndefinedTable. The pre-probe defended against the table missing its
+    lifecycle COLUMNS but not against the table being absent -- it swapped the
+    WHERE clause while the statement still named dead_letter.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS dead_letter")
+    conn.commit()
+
+    result = health(conn)
+
+    assert result.dead_letter == 0, "nowhere to record dead letters means none"
+    assert result.depths is not None, "the rest of the report must still arrive"
+
+
+def test_a_queue_with_no_partitions_reports_no_partition_age(conn) -> None:
+    """What the field's docstring promises, and nothing asserted.
+
+    A monitor writing `age > retention_days` against a pre-migration queue gets
+    a TypeError on None rather than a false alarm. That is the right shape --
+    a plain queue has no partitions to age -- but it is a contract, so it is
+    pinned rather than left to whichever way the SQL happened to fall.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS queue CASCADE")
+        cols = ", ".join(f"{n} {d}" for n, d in REQUIRED_COLUMNS.items())
+        cur.execute(f"CREATE TABLE queue ({cols})")
+    conn.commit()
+
+    result = health(conn)
+    assert result.partitioned is False
+    assert result.oldest_partition_age_days is None
+    conn.rollback()
+
+
+def test_health_counts_dead_letters_on_a_schema_predating_the_lifecycle_columns(
+    conn,
+) -> None:
+    """The third branch of the dead_letter probe, which the fixture never
+    reaches because it always builds the current schema.
+
+    health() runs during upgrade windows, so it has to read a dead_letter that
+    has rows but not yet dismissed_at/retried_at. Naming those columns
+    unconditionally is how the CLI's show and retry broke; this is the branch
+    that stops it happening here.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+            "created_at, failed_at, archived_from_partition) "
+            "VALUES (1, 'q', '{}'::jsonb, 3, NOW(), NOW(), 'queue_2026_01_01')"
+        )
+        for col in ("dismissed_at", "retried_at", "retried_as"):
+            cur.execute(f"ALTER TABLE dead_letter DROP COLUMN IF EXISTS {col}")
+    conn.commit()
+
+    assert health(conn).dead_letter == 1, "every row is open where none can be dismissed"
+    conn.rollback()

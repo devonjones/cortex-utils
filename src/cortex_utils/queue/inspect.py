@@ -85,6 +85,17 @@ class QueueHealth:
     partitioned: bool
     partition_headroom_days: int | None
     self_healed_partitions: int
+    oldest_partition_age_days: int | None
+    """Days since the oldest still-attached partition's date, or None if there
+    are no partitions.
+
+    Deliberately not part of is_healthy: what counts as too old is the caller's
+    retention window, which this module does not know. Compare it against the
+    retention_days the cron runs with -- climbing past that means retention has
+    stopped dropping, which it does silently whenever a partition still holds a
+    stuck row.
+    """
+
     server_time: datetime
 
     @property
@@ -221,7 +232,15 @@ partitions AS (
             SELECT MAX(day) - CURRENT_DATE FROM islands
             WHERE island = (SELECT island FROM islands WHERE day = CURRENT_DATE)
         ) AS headroom_days,
-        (SELECT COUNT(*) FILTER (WHERE self_healed) FROM partition_days) AS self_healed
+        (SELECT COUNT(*) FILTER (WHERE self_healed) FROM partition_days) AS self_healed,
+        -- Age of the oldest partition still attached. Retention skips silently:
+        -- one stuck pending or processing row keeps its whole partition
+        -- forever under the default force=False, and the count of skips is
+        -- reported only in maintain()'s return value and log, which nobody is
+        -- watching at 3am. This is the number that goes wrong -- it climbs past
+        -- retention_days and keeps climbing -- and it costs nothing to read
+        -- here, because partition_days is already materialised above.
+        (SELECT CURRENT_DATE - MIN(day) FROM partition_days) AS oldest_partition_age_days
 )
 SELECT
     COALESCE(
@@ -240,7 +259,7 @@ SELECT
     -- read sargable -- to_jsonb is not, and on a 50k-row archive it turned a
     -- 0.1ms index-only scan into a 118ms sequential one, on a path documented
     -- for polling and over a table this release stops deleting from.
-    (SELECT COUNT(*) FROM dead_letter WHERE {dl_open}),
+    {dl_count},
     -- Whether the table is partitioned at all. Without this, a plain queue --
     -- a supported pre-migration state, since this package ships
     -- migrate_to_partitioned() -- has no pg_inherits rows and so reports the
@@ -249,6 +268,7 @@ SELECT
     (SELECT relkind = 'p' FROM pg_class WHERE oid = to_regclass('queue')),
     (SELECT headroom_days FROM partitions),
     (SELECT self_healed FROM partitions),
+    (SELECT oldest_partition_age_days FROM partitions),
     NOW()
 """
 
@@ -268,16 +288,40 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
         # unconditionally is how the CLI's show and retry broke. Two small round
         # trips beat one that scans the whole archive.
         cur.execute(
-            "SELECT COUNT(*) = 2 FROM pg_attribute "
-            "WHERE attrelid = to_regclass('dead_letter') "
-            "AND attname IN ('dismissed_at', 'retried_at') AND NOT attisdropped"
+            "SELECT to_regclass('dead_letter') IS NOT NULL, "
+            "(SELECT COUNT(*) FROM pg_attribute "
+            " WHERE attrelid = to_regclass('dead_letter') "
+            " AND attname IN ('dismissed_at', 'retried_at') AND NOT attisdropped) = 2"
         )
-        has_lifecycle = bool(cur.fetchone()[0])
-        # Nothing can have been dismissed on a schema with nowhere to record it,
-        # so every row is open there.
-        dl_open = "dismissed_at IS NULL AND retried_at IS NULL" if has_lifecycle else "TRUE"
-        cur.execute(_HEALTH_SQL.format(dl_open=dl_open), {"marker": SELF_HEALED_MARKER})
-        depths, dead_letter, partitioned, headroom, self_healed, now = cur.fetchone()
+        present, has_lifecycle = cur.fetchone()
+        # The whole expression is substituted, not just its predicate. The old
+        # version swapped only the WHERE clause, so a MISSING table left the
+        # statement still naming dead_letter and health() raised UndefinedTable
+        # -- on exactly the half-provisioned deployment it exists to report on,
+        # reachable by booting through ensure_queue_table() rather than
+        # ensure_queue_schema(). A monitor that dies alongside the thing it
+        # monitors is worse than no monitor, because someone is trusting it.
+        if not present:
+            dl_count = "(SELECT 0)"
+        elif has_lifecycle:
+            # Nothing can have been dismissed on a schema with nowhere to record
+            # it, so every row is open there.
+            dl_count = (
+                "(SELECT COUNT(*) FROM dead_letter "
+                "WHERE dismissed_at IS NULL AND retried_at IS NULL)"
+            )
+        else:
+            dl_count = "(SELECT COUNT(*) FROM dead_letter)"
+        cur.execute(_HEALTH_SQL.format(dl_count=dl_count), {"marker": SELF_HEALED_MARKER})
+        (
+            depths,
+            dead_letter,
+            partitioned,
+            headroom,
+            self_healed,
+            oldest_partition_age_days,
+            now,
+        ) = cur.fetchone()
 
     return QueueHealth(
         depths=[
@@ -295,6 +339,7 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
         partitioned=bool(partitioned),
         partition_headroom_days=headroom,
         self_healed_partitions=self_healed,
+        oldest_partition_age_days=oldest_partition_age_days,
         server_time=now,
     )
 
