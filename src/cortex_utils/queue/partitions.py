@@ -193,6 +193,28 @@ class PartitionManager:
             log.warning("Partition does not exist", partition=partition_name)
             return {"archived_failed": 0, "requeued": 0, "dropped_rows": 0}
 
+        try:
+            return self._drop_locked(partition_name, partition_date, archive_failed, force, dry_run)
+        except Exception:
+            # Every exit that is not an exception rolls back or commits
+            # explicitly; this is the one that did not. The LOCK TABLE below is
+            # held for the transaction, so a failure anywhere after it left the
+            # connection in a failed transaction still holding SHARE ROW
+            # EXCLUSIVE -- and drop_old_partitions() loops on that same
+            # connection, so every later partition failed too, for a reason
+            # belonging to the first one.
+            self.conn.rollback()
+            raise
+
+    def _drop_locked(
+        self,
+        partition_name: str,
+        partition_date: date,
+        archive_failed: bool,
+        force: bool,
+        dry_run: bool,
+    ) -> dict[str, int]:
+        """The locked section of drop_partition. See there for the contract."""
         archived_count = 0
         requeued_count = 0
         row_count = 0
