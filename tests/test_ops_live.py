@@ -228,3 +228,80 @@ def test_missing_partition_self_heals_once_under_concurrency(conns):
         assert cur.fetchone()[0] == 1, "exactly one partition, created once"
         cur.execute("SELECT count(*) FROM queue")
         assert cur.fetchone()[0] == 2, "both rows must be readable"
+
+
+class _FailingCursor:
+    """A real cursor that raises OUR exception on one statement.
+
+    A psycopg2 error would abort the transaction server-side and release the
+    lock by itself -- the case that never needed fixing. This raises before the
+    statement reaches the server, which is the case that leaks.
+    """
+
+    def __init__(self, real, trigger: str):
+        self._real = real
+        self._trigger = trigger
+
+    def execute(self, sql, params=None):
+        if self._trigger in sql:
+            raise RuntimeError("a bug in our own code, not the server's")
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return self._real.__exit__(*a)
+
+
+class _FailingConn:
+    def __init__(self, real, trigger: str):
+        self._real = real
+        self._trigger = trigger
+
+    def cursor(self, *a, **k):
+        return _FailingCursor(self._real.cursor(*a, **k), self._trigger)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_drop_partition_releases_the_lock_when_our_own_code_raises(conns):
+    """The behaviour the rollback actually buys, end to end on a real server.
+
+    Without it the backend sits `idle in transaction` holding SHARE ROW
+    EXCLUSIVE on the partition, and the next writer gets LockNotAvailable.
+    """
+    from cortex_utils.queue.partitions import PartitionManager
+
+    a, b = conns
+    with a.cursor() as cur:
+        cur.execute("SELECT CURRENT_DATE")
+        today = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status) VALUES ('q', '{}'::jsonb, 'failed')"
+        )
+    a.commit()
+    partition = f"queue_{today:%Y_%m_%d}"
+
+    # Fail between the LOCK and the commit, in our code rather than the server's.
+    manager = PartitionManager(_FailingConn(a, "INSERT INTO dead_letter"))
+    with pytest.raises(RuntimeError):
+        manager.drop_partition(today)
+
+    # The partition must be free: another session can take ACCESS EXCLUSIVE.
+    with b.cursor() as cur:
+        cur.execute("SET LOCAL lock_timeout = '3s'")
+        cur.execute(f"LOCK TABLE {partition} IN ACCESS EXCLUSIVE MODE")
+    b.rollback()
+
+    with a.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+            "WHERE c.relname = %s AND l.mode = 'ShareRowExclusiveLock'",
+            (partition,),
+        )
+        assert cur.fetchone()[0] == 0, "the lock outlived the failure"

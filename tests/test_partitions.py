@@ -514,3 +514,31 @@ def test_maintain_passes_its_windows_through() -> None:
     assert got["create"]["days_ahead"] == 5
     assert got["drop"]["retention_days"] == 14
     assert got["drop"]["archive_failed"] is True, "the cron must not drop failed jobs unarchived"
+
+
+def test_a_python_side_failure_under_the_lock_rolls_back() -> None:
+    """A mock cannot show the lock being released -- see test_ops_live.py for
+    that. What it can pin is that the handler runs at all, and that it rolls
+    back rather than only re-raising.
+
+    Deliberately a Python-side exception, not a psycopg2 one: a database error
+    aborts the transaction server-side and releases the lock on its own, so
+    simulating one would assert the case that never needed fixing.
+    """
+    manager, executed = _manager_capturing_sql(rows=[(1,)], fetchall=[("failed", 2)])
+    cur = manager.conn.cursor.return_value.__enter__.return_value
+    plain = cur.execute.side_effect
+
+    def boom(sql: str, *args: object) -> None:
+        plain(sql, *args)
+        if "INSERT INTO dead_letter" in sql:
+            raise RuntimeError("a bug in our own code, not the server's")
+
+    cur.execute.side_effect = boom
+
+    with pytest.raises(RuntimeError):
+        manager.drop_partition(SERVER_TODAY - timedelta(days=30))
+
+    assert any("LOCK TABLE" in sql for sql in executed)
+    manager.conn.rollback.assert_called_once()
+    manager.conn.commit.assert_not_called()
