@@ -55,11 +55,17 @@ jobs:
       - name: Fail if the live-Postgres tests were skipped
         env:
           CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
-        # A misconfigured service would turn this whole layer into silent
-        # skips, which reads as coverage and is not.
+        # A misconfigured service would turn this whole layer into silent skips,
+        # which reads as coverage and is not.
+        #
+        # -p no:skipping is the whole point of this step. Without it the step
+        # was decorative: pytest exits 0 when every test skips, so a guard
+        # against silent skipping silently skipped. Measured -- 32 skipped,
+        # exit 0. Disabling the plugin turns each skip into an error, so the
+        # step exits 1 with no DSN and 0 with one.
         run: |
           uv run pytest tests/test_inspect_live.py tests/test_ops_live.py \
-            -q --no-header -p no:cacheprovider
+            -q --no-header -p no:cacheprovider -p no:skipping
 
   build:
     runs-on: ubuntu-latest

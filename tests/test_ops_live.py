@@ -88,10 +88,12 @@ def conns():
     try:
         yield a, b
     finally:
-        # close() before rollback(): rollback() from this thread never returns
-        # while another thread is still inside execute() on that connection --
-        # measured at 25s and counting. A teardown that hangs turns a failing
-        # test into a hung runner, which nobody reads as a test result.
+        # cancel() is what matters, and it is not belt-and-braces: close()
+        # alone hangs just as long as rollback() would -- both wait on a thread
+        # still inside execute() on that connection, measured at >20s. cancel()
+        # returns immediately and the thread gets QueryCanceled. A teardown that
+        # hangs turns a failing test into a hung runner, which nobody reads as a
+        # test result.
         for c in (a, b):
             try:
                 c.cancel()

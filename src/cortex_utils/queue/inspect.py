@@ -36,11 +36,11 @@ import psycopg2
 import structlog
 
 from cortex_utils.queue.ops import (
-    _DEDUP_VALUE_TYPES,
     SELF_HEALED_MARKER,
     QueueError,
     _tx,
     enqueue,
+    is_dedup_value,
 )
 
 log = structlog.get_logger()
@@ -156,17 +156,13 @@ class Failure:
         keep out of it: a caller who passes the wrong key would get more
         exposure, not less, and silently.
 
-        bool is excluded for the reason enqueue() rejects it as a dedup value:
-        str(True) is "True" while Postgres jsonb ->> yields "true", so a bool
-        rendered here would not match the value the queue actually stored.
-        (isinstance(True, int) is True, hence the explicit check.)
+        Shares one predicate with enqueue()'s validation rather than restating
+        the rule, so the promise above cannot drift from what enqueue accepts.
         """
         if not dedup_key:
             return None
         value = (self.payload or {}).get(dedup_key)
-        if isinstance(value, bool) or not isinstance(value, _DEDUP_VALUE_TYPES):
-            return None
-        return str(value)
+        return str(value) if is_dedup_value(value) else None
 
 
 _HEALTH_SQL = """

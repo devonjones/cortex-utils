@@ -390,6 +390,21 @@ def _is_missing_partition(exc: psycopg2.Error) -> bool:
     return not getattr(exc.diag, "constraint_name", None)
 
 
+def is_dedup_value(value: Any) -> bool:
+    """True if the queue can deduplicate on this value.
+
+    One predicate rather than the rule written twice: inspect.Failure.ref()
+    promises to return "exactly the values the queue will let you dedup on", and
+    a promise like that decays the moment the two copies can drift.
+
+    bool is excluded even though isinstance(True, int) is True, because
+    str(True) is "True" while Postgres jsonb ->> yields "true" -- a mismatch
+    that makes dedup silently never fire. Floats and containers diverge the same
+    way; rejecting them loudly beats a comparison that quietly never matches.
+    """
+    return isinstance(value, _DEDUP_VALUE_TYPES) and not isinstance(value, bool)
+
+
 def _validate_dedup(dedup_key: str, payload: dict[str, Any]) -> str:
     """Check the dedup key is a usable identifier and its value is comparable."""
     if not _IDENTIFIER_RE.match(dedup_key):
@@ -397,7 +412,7 @@ def _validate_dedup(dedup_key: str, payload: dict[str, Any]) -> str:
     if dedup_key not in payload:
         raise QueueError(f"dedup_key {dedup_key!r} is absent from the payload")
     value = payload[dedup_key]
-    if not isinstance(value, _DEDUP_VALUE_TYPES) or isinstance(value, bool):
+    if not is_dedup_value(value):
         raise QueueError(
             f"dedup_key {dedup_key!r} holds {type(value).__name__}; "
             "only str and int dedup cleanly against jsonb text output"

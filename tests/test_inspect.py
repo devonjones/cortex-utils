@@ -360,3 +360,19 @@ def test_a_deduped_resubmit_does_not_log_as_a_resubmit() -> None:
         events = [entry["event"] for entry in logs]
         assert any(expected in e for e in events), f"{new_id} -> {events}"
         assert len(events) == 1, "one line, not both"
+
+
+def test_ref_and_enqueue_agree_on_what_a_dedup_value_is() -> None:
+    """ref() promises "exactly the values the queue will let you dedup on".
+    Two copies of that rule would drift; this asserts there is one."""
+    from cortex_utils.queue.ops import _validate_dedup
+
+    for value in ("abc", 42, 0, True, 1.5, None, {"b": 1}, ["x"]):
+        payload = {"vid": value}
+        ref = Failure(1, "q", payload, 3, 3, "boom", NOW).ref("vid")
+        try:
+            _validate_dedup("vid", payload)
+        except QueueError:
+            assert ref is None, f"enqueue rejects {value!r} but ref() rendered {ref!r}"
+        else:
+            assert ref is not None, f"enqueue accepts {value!r} but ref() dropped it"
