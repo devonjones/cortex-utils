@@ -68,6 +68,10 @@ _RELKINDS = {
     "t": "TOAST table",
 }
 
+# The columns ensure_queue_schema() can add to an existing table. Anything else
+# missing is refused rather than half-migrated.
+_MIGRATED_COLUMNS = frozenset({"next_attempt_at", "claimed_by"})
+
 VALID_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
 
 
@@ -334,11 +338,48 @@ def ensure_queue_schema(
     migration would simply have added it. Running them first means an old
     database is brought forward and a new one is created complete.
 
+    Serialised across callers by an advisory lock, because CREATE TABLE / CREATE
+    INDEX IF NOT EXISTS are not atomic against concurrent DDL: with eight
+    services booting together, one succeeded and seven died on DuplicateTable or
+    a UniqueViolation against pg_class. That only happens on a deploy that
+    changes the schema -- which is precisely the deploy this function exists to
+    perform, and a loud crash-loop there is the shape of the incident it is
+    meant to prevent.
+
     Idempotent, and cheap on the steady-state path: every step pre-checks the
-    catalogue before touching anything, so the common case is a handful of reads
-    and no locks at all.
+    catalogue before touching anything, so the common case is the advisory lock,
+    a handful of reads, and no table locks.
     """
-    if _inspect(conn, "queue")[0]:
+    with _tx(conn) as cur:
+        # Session-scoped, not xact-scoped: the steps below commit individually,
+        # and an xact lock would be released by the first one.
+        cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")
+    try:
+        return _ensure_queue_schema_locked(conn, extra_indexes)
+    finally:
+        with _tx(conn) as cur:
+            cur.execute("SELECT pg_advisory_unlock(hashtext('cortex_queue_schema'))")
+
+
+def _ensure_queue_schema_locked(
+    conn: psycopg2.extensions.connection,
+    extra_indexes: Sequence[tuple[str, str]],
+) -> str:
+    exists, _partitioned, missing = _inspect(conn, "queue")
+
+    if exists:
+        # Refuse before altering anything if the shape is wrong in a way the two
+        # additive migrations cannot fix. _inspect already told us, in the same
+        # round trip, and doing the ALTERs first would take ACCESS EXCLUSIVE
+        # twice and build an index before raising about a column neither step
+        # was ever going to add.
+        unfixable = [c for c in missing if c not in _MIGRATED_COLUMNS]
+        if unfixable:
+            raise QueueError(
+                f"queue exists but is missing {', '.join(unfixable)}, which no "
+                "migration here adds. Add them deliberately (ALTER TABLE takes "
+                "ACCESS EXCLUSIVE) before booting a service against this table."
+            )
         # These ALTER an existing table, so they only make sense once there is
         # one. A fresh database gets every column from queue_ddl() instead.
         add_retry_columns(conn, dry_run=False)

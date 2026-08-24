@@ -7,7 +7,10 @@ server can hold both at once.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import threading
+import time
 
 import pytest
 
@@ -650,7 +653,10 @@ def test_an_invalid_index_does_not_count_as_present(conn) -> None:
         cur.execute("CREATE INDEX idx_queue_dedup_video ON ONLY queue ((payload->>'video_id'))")
         cur.execute(
             "SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-            "WHERE c.relname = 'idx_queue_dedup_video'"
+            # Bound to this table: without it the row matches an index of the
+            # same name in any schema, so the test fails on whatever another
+            # test left behind.
+            "WHERE c.relname = 'idx_queue_dedup_video' AND i.indrelid = to_regclass('queue')"
         )
         assert cur.fetchone()[0] is False, "premise: ON ONLY leaves it invalid"
     conn.commit()
@@ -734,3 +740,131 @@ def test_boot_carries_consumer_indexes_too(conn) -> None:
             "WHERE c.relname = 'idx_queue_dedup_video' AND i.indrelid = to_regclass('queue')"
         )
         assert cur.fetchone() is not None
+
+
+def test_eight_services_booting_at_once_all_succeed(conn) -> None:
+    """CREATE TABLE / CREATE INDEX IF NOT EXISTS are not atomic against
+    concurrent DDL: unserialised, one caller succeeded and seven died on
+    DuplicateTable or a UniqueViolation against pg_class.
+
+    That only happens on a deploy that changes the schema -- which is exactly
+    the deploy this function exists to perform. A crash-loop there is the shape
+    of the incident it was written to prevent.
+    """
+    import threading
+
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    gate = threading.Barrier(8)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def boot() -> None:
+        c = psycopg2.connect(DSN)
+        try:
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute("SET search_path = t_schema")
+            c.autocommit = False
+            gate.wait(timeout=10)
+            outcome: object = ensure_queue_schema(c)
+        except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+            outcome = exc
+        finally:
+            with contextlib.suppress(Exception):
+                c.rollback()
+            c.close()
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=boot) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert not failures, f"{len(failures)} of 8 boots failed: {failures[:3]}"
+    assert results.count("created") == 1, f"exactly one creator: {results}"
+    assert results.count("present") == 7
+
+
+def test_a_shape_no_migration_can_fix_is_refused_before_any_alter(conn) -> None:
+    """_inspect already said which columns are missing, in the same round trip.
+    Altering first would take ACCESS EXCLUSIVE twice and build an index before
+    raising about a column neither step was ever going to add."""
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    # Missing BOTH: one the additive migrations fix, one they never could. If
+    # the refusal comes late, next_attempt_at will have been added on the way to
+    # it -- which is the ALTER this check exists to avoid paying for.
+    with conn.cursor() as cur:
+        cur.execute(
+            queue_ddl()
+            .replace("    priority INT NOT NULL DEFAULT 0,\n", "")
+            .replace("    next_attempt_at TIMESTAMPTZ,\n", "")
+        )
+    conn.commit()
+    assert sorted(missing_columns(conn)) == ["next_attempt_at", "priority"]
+
+    with pytest.raises(QueueError, match="priority"):
+        ensure_queue_schema(conn)
+    conn.rollback()
+
+    assert "next_attempt_at" in missing_columns(conn), (
+        "refused too late: the ALTER ran before the check that was never going "
+        "to let this table through"
+    )
+
+
+def test_the_retry_migration_fails_fast_rather_than_wedging_the_queue(conn) -> None:
+    """It runs on every boot now, not as a manual CLI step. An unbounded ALTER
+    queues ACCESS EXCLUSIVE on the parent, which blocks new readers while it
+    waits -- so a slow boot wedges the live queue instead of failing."""
+    from cortex_utils.queue.add_retry_columns import add_retry_columns
+
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl().replace("    next_attempt_at TIMESTAMPTZ,\n", ""))
+    conn.commit()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_schema")
+        other.autocommit = False
+        with other.cursor() as cur:
+            cur.execute("LOCK TABLE queue IN ACCESS EXCLUSIVE MODE")
+
+        # In a thread with a join timeout, because unbounded this HANGS rather
+        # than fails -- and a hung runner is worse than a red one, since nobody
+        # reads it as a test result.
+        outcome: dict[str, object] = {}
+
+        def migrate() -> None:
+            try:
+                add_retry_columns(conn, dry_run=False)
+                outcome["result"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["result"] = exc
+
+        t = threading.Thread(target=migrate, daemon=True)
+        start = time.monotonic()
+        t.start()
+        t.join(timeout=15)
+        elapsed = time.monotonic() - start
+
+        assert not t.is_alive(), (
+            f"still waiting on the lock after {elapsed:.0f}s -- the ALTER is unbounded"
+        )
+        assert isinstance(outcome["result"], psycopg2.errors.LockNotAvailable), outcome
+        assert elapsed < 10, f"failed after {elapsed:.1f}s; the bound is meant to be ~5s"
+    finally:
+        other.rollback()
+        other.close()
+    conn.rollback()
+
+    # And the connection is usable afterwards, not left aborted.
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1")
+        assert cur.fetchone()[0] == 1
