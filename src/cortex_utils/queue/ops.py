@@ -91,6 +91,7 @@ _IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _DEDUP_VALUE_TYPES = (str, int)
 
 Report = Literal["pending", "failed", "stale"]
+_CLAIM_TOKEN_RE = re.compile(r"\bclaimed_by\b")
 
 
 class QueueError(RuntimeError):
@@ -130,6 +131,10 @@ def _tx(
     back, which is the contract they accepted by owning the transaction.
     """
     if not commit:
+        # No claimed_by guard here deliberately: the only caller that reaches
+        # this branch is _insert(), whose statement names no such column. A
+        # guard that cannot fire reads as protection and is not, and it would
+        # have to re-raise anyway since the caller owns the transaction.
         with conn.cursor() as cur:
             yield cur
         return
@@ -137,9 +142,60 @@ def _tx(
         with conn.cursor() as cur:
             yield cur
         conn.commit()
+    except psycopg2.errors.UndefinedColumn as exc:
+        conn.rollback()
+        _reraise_missing_migration(exc)
+        raise
     except Exception:
         conn.rollback()
         raise
+
+
+def _reraise_missing_migration(exc: psycopg2.errors.UndefinedColumn) -> None:
+    """Turn a raw UndefinedColumn on claimed_by into the remedy.
+
+    claim(), complete(), release() and fail_or_retry() all reference claimed_by,
+    and the only thing protecting them is the convention that a service calls
+    ensure_claim_token_column() on boot. A consumer who forgets gets
+    UndefinedColumn out of claim() -- from the core of the queue, not a side
+    feature -- naming a column they never wrote.
+
+    Guarded here rather than at the four call sites because a half-guard reads
+    as safe and is not: guard three and the fourth still raises the raw error on
+    the same schema, which is worse than guarding none. Every primitive routes
+    through this function, so one place covers all of them, and it costs one
+    regex match only on a path that was already failing.
+
+    Not a degraded answer, because there is no useful one: without the claim
+    token, complete() and release() cannot tell your row from one another worker
+    re-claimed, so proceeding would silently reintroduce the bug the column
+    exists to prevent.
+    """
+    # diag.message_primary, NOT str(exc). str() appends the LINE excerpt of our
+    # own SQL and the HINT, so any statement that merely *mentions* claimed_by
+    # matches -- including `SELECT id, claimed_by, attemptz FROM queue`, whose
+    # real error is the typo, and `SELECT claimed_bx`, whose HINT helpfully
+    # suggests claimed_by. Relabelling those would destroy the column name the
+    # caller needs and point them at an idempotent migration they already ran.
+    #
+    # Word boundaries rather than the quoted form: the quotes are not
+    # dependable. A qualified reference drops them entirely
+    # ("column q.claimed_by does not exist"), and a translated server uses its
+    # own -- de emits >>claimed_by<<. The boundaries still exclude a
+    # claimed_by_anything column, since _ is a word character.
+    #
+    # diag.column_name would be better but Postgres does not populate it for
+    # SQLSTATE 42703, so the message is the only thing that identifies it.
+    if not _CLAIM_TOKEN_RE.search(exc.diag.message_primary or ""):
+        # Not ours. Return so the caller re-raises the original plainly --
+        # `raise exc from exc` would set __cause__ to itself and suppress the
+        # context a reader needs.
+        return
+    raise QueueError(
+        "queue.claimed_by is missing on this search_path. Run "
+        "cortex_utils.queue.ensure_claim_token_column(conn) once against this "
+        "schema before using the queue -- it is idempotent and safe on every boot."
+    ) from exc
 
 
 def has_claim_token_column(conn: psycopg2.extensions.connection) -> bool:

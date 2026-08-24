@@ -35,6 +35,7 @@ from cortex_utils.queue.ops import (
     QueueTableNotFoundError,
     _ensure_partition,
     _partition_name,
+    _reraise_missing_migration,
     claim,
     complete,
     enqueue,
@@ -1021,3 +1022,172 @@ def test_a_missing_queue_table_is_not_reported_as_a_missing_column() -> None:
     conn.cur.no_queue_table = True
     with pytest.raises(QueueTableNotFoundError, match="PGOPTIONS"):
         has_claim_token_column(conn)
+
+
+# --- the claimed_by migration guard (cryo D4) --------------------------------
+
+
+def _undefined_column(column: str, sql: str) -> psycopg2.errors.UndefinedColumn:
+    """An UndefinedColumn shaped the way Postgres actually shapes one.
+
+    str() on the real thing is the primary message PLUS the LINE excerpt of the
+    offending SQL PLUS any HINT -- which is why a substring check against str()
+    matched statements that merely mentioned claimed_by. A fake that carries
+    only the primary message cannot show that, so it carries all three.
+    """
+
+    class _Diag:
+        message_primary = f'column "{column}" does not exist'
+
+    class _Undefined(psycopg2.errors.UndefinedColumn):
+        # Diagnostics is read-only on a real exception, so the shape is faked at
+        # the attribute rather than mutated.
+        diag = _Diag()
+
+    return _Undefined(
+        f'column "{column}" does not exist\nLINE 1: {sql[:60]}\n'
+        f'HINT:  Perhaps you meant to reference the column "queue.claimed_by".'
+    )
+
+
+def _conn_without_claimed_by():
+    """A schema where ensure_claim_token_column() was never run."""
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        if "claimed_by" in sql:
+            raise _undefined_column("claimed_by", sql)
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+    return conn
+
+
+def test_every_primitive_that_touches_claimed_by_names_the_remedy() -> None:
+    """All four reference claimed_by and the only protection is a convention.
+    A consumer who forgets gets UndefinedColumn out of the core of the queue,
+    naming a column they never wrote.
+
+    Asserted over all of them at once on purpose: a half-guard reads as safe and
+    is not. Guard three and the fourth still raises the raw error on the same
+    schema, which is worse than guarding none.
+    """
+    for label, call in (
+        ("claim", lambda c: claim(c, "triage", WORKER)),
+        ("complete", lambda c: complete(c, 5, WORKER)),
+        ("release", lambda c: release(c, 5, 60, WORKER)),
+        ("fail_or_retry", lambda c: fail_or_retry(c, 5, "boom", WORKER)),
+    ):
+        with pytest.raises(QueueError, match="ensure_claim_token_column") as excinfo:
+            call(_conn_without_claimed_by())
+        assert "search_path" in str(excinfo.value), label
+
+
+@pytest.mark.parametrize(
+    ("bad_column", "sql"),
+    [
+        # The primary message names the typo, but str(exc) carries the LINE
+        # excerpt of our own SQL -- which mentions claimed_by, because every one
+        # of these statements does. Matching on str() relabelled all of these.
+        ("attemptz", "SELECT id, queue_name, claimed_by, claimed_at, attemptz FROM queue"),
+        ("queue_nmae", "SELECT id, claimed_by FROM queue WHERE queue_nmae = 'triage'"),
+        # And this one is worse: the HINT suggests claimed_by, so even a
+        # statement that never mentions it gets relabelled -- destroying the
+        # real column name and pointing the caller at an idempotent migration
+        # they have already run.
+        ("claimed_bx", "SELECT claimed_bx FROM queue"),
+    ],
+)
+def test_a_typo_in_another_column_is_not_relabelled(bad_column: str, sql: str) -> None:
+    """The guard must not claim every schema problem is this one. All three of
+    these shapes were verified against a real Postgres 16."""
+    cur = FakeCursor(fetchone=(99,))
+    plain = cur.execute
+
+    def execute(statement: str, params: Any = None) -> None:
+        plain(statement, params)
+        raise _undefined_column(bad_column, sql)
+
+    cur.execute = execute  # type: ignore[method-assign]
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    conn.cur = cur
+
+    with pytest.raises(psycopg2.errors.UndefinedColumn) as excinfo:
+        complete(conn, 5, WORKER)
+    assert bad_column in str(excinfo.value), "the real column name must survive"
+    assert not isinstance(excinfo.value, QueueError)
+
+
+def test_the_guard_reads_the_primary_message_not_the_whole_error() -> None:
+    """str(exc) is the primary message plus the LINE excerpt plus the HINT, so
+    a substring check against it matches any statement that merely mentions
+    claimed_by. Postgres names the offending column in the primary message,
+    quoted, which is the only part that identifies it."""
+    exc = _undefined_column("attemptz", "SELECT claimed_by, attemptz FROM queue")
+    assert "claimed_by" in str(exc), "the trap this guard used to fall into"
+    assert '"claimed_by"' not in exc.diag.message_primary
+
+
+def test_the_guard_still_rolls_the_connection_back() -> None:
+    """Relabelling the error must not skip the rollback -- a long-lived worker
+    would then fail every later job for a reason unrelated to this one."""
+    conn = _conn_without_claimed_by()
+    with pytest.raises(QueueError):
+        complete(conn, 5, WORKER)
+    conn.rollback.assert_called_once()
+
+
+def test_a_passed_through_error_keeps_its_original_context() -> None:
+    """`raise exc from exc` sets __cause__ to the exception itself and
+    suppresses the context a reader needs to see where it came from."""
+    conn = _conn(fetchone=(99,))
+    plain = conn.cur.execute
+
+    def execute(sql: str, params: Any = None) -> None:
+        plain(sql, params)
+        raise _undefined_column("widget", "SELECT widget FROM queue")
+
+    conn.cur.execute = execute  # type: ignore[method-assign]
+    with pytest.raises(psycopg2.errors.UndefinedColumn) as excinfo:
+        complete(conn, 5, WORKER)
+    assert excinfo.value.__cause__ is not excinfo.value
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        'column "claimed_by" does not exist',
+        # A qualified reference drops the quotes entirely.
+        "column q.claimed_by does not exist",
+        # And a translated server brings its own: de emits these.
+        "Spalte »claimed_by« existiert nicht",
+    ],
+)
+def test_the_guard_recognises_every_shape_postgres_actually_emits(primary: str) -> None:
+    """Matching the quoted form missed two of these. The first was verified
+    against postgres:16; the third is why quoting is not dependable at all."""
+    exc = psycopg2.errors.UndefinedColumn(primary)
+
+    class _Diag:
+        message_primary = primary
+
+    exc.__class__ = type("_U", (psycopg2.errors.UndefinedColumn,), {"diag": _Diag()})
+    with pytest.raises(QueueError, match="ensure_claim_token_column"):
+        _reraise_missing_migration(exc)
+
+
+def test_a_differently_named_column_is_not_mistaken_for_ours() -> None:
+    """Word boundaries, not a substring: `_` is a word character, so a genuinely
+    missing claimed_by_anything is somebody else's problem."""
+    primary = 'column "claimed_by_at" does not exist'
+
+    class _Diag:
+        message_primary = primary
+
+    exc = type("_U", (psycopg2.errors.UndefinedColumn,), {"diag": _Diag()})(primary)
+    assert _reraise_missing_migration(exc) is None, "must fall through to a plain re-raise"
