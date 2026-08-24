@@ -215,3 +215,72 @@ warning has at least one real instance in the wild.
 G8 (LISTEN/NOTIFY — no support at all; cryo owns the trigger, the channel-bound
 probe, and `LISTEN`) and G9 (`resubmit()` forcing a `SELECT queue_name` to
 derive the dedup key).
+
+---
+
+# Addendum 2, against `80c3e56` (#44, #46, #47)
+
+## Your two flagged items, checked on cryo rather than assumed
+
+**Claim-token corruption: cryo has no affected site.** Grepped every `UPDATE`
+against `queue`. Zero production sites set `status='pending'` — cryo owns no
+stale reset or repair re-enqueue, since `reset_stale` lives in your claim CTE.
+The only two raw UPDATEs are a trust-boundary `refuse()` setting
+`status='failed'`, which is your documented exemption, and it holds for the
+stated reason: cryo's resubmit enqueues a NEW row rather than re-pending in
+place, so no failed row is ever revived. `refuse()` is already token-matched.
+
+One TEST site re-pended without clearing `claimed_by`; fixed, because a test
+that constructs a state production cannot reach validates behaviour that never
+happens.
+
+**Timezone: nothing overrides it.** `TimeZone=UTC` with source
+`configuration file`, no `pg_db_role_setting` rows, no `PGOPTIONS` in host or
+container environment, no `ALTER ROLE ... SET TimeZone`. cryo will not see the
+`server_today()` warning. This was the item you could not check from your side.
+
+Also clear: no `import *`, so the `__all__` 38→20 cut is a non-event; no import
+of the deprecated `retry.fail_or_retry`/`ready_predicate` (cryo binds
+`ops.fail_or_retry` through the package top level); no `== "retrying"`
+comparison; and cryo never hands you an autocommit connection.
+
+## G11 — `QueueError` is overloaded in `resubmit()`
+
+`resubmit()` raises a bare `QueueError` for three semantically different
+conditions:
+
+```
+inspect.py:432  "pass dedup_key or dedup_keys, not both"      caller error
+inspect.py:441  "job N is not a failed row"                    ordinary, expected
+inspect.py:468  "resubmit could not cancel job N; rolled back" YOUR OWN WORDS: a bug
+```
+
+A batch caller has to tell the second from the third, because one is a stale
+click and the other is an internal failure that must reach a human. There is no
+structural way to do it: same type, no subclass, and no id-addressable getter
+for a queue row (`get_job` exists only on `DeadLetterManager`).
+
+cryo's workaround is to ask whether the row is still in `failures()` after the
+raise — if it is, "not a failed row" cannot have been the reason. That works,
+costs a query on the error path, and every consumer will have to invent it
+independently or, more likely, collapse the cases and report an internal bug as
+a stale click. We did exactly that first, and a reviewer caught it.
+
+`JobNotFailedError(QueueError)` would make the distinction free. You already
+subclass for `PartitionError`/`QueueTableNotFoundError`, so the pattern exists —
+this is one more of the same.
+
+## Adopted from this drop
+
+- **G9 is closed.** `dedup_keys` removed cryo's last raw SELECT against `queue`.
+  Confirmed the `not-failed` distinction survives, since `resubmit()` raises
+  rather than returning `None`, and `None` already means deduped.
+- `health().oldest_partition_age_days` now drives a digest tripwire. cryo cannot
+  know its own retention window — it lives in your maintenance pass — so it is
+  deliberately a "nobody is dropping anything" alarm rather than a policy.
+  Live today: 11 partitions, 08-17 → 08-27, oldest 7 days.
+- Note on that field: `None` on a PARTITIONED table means zero partitions
+  attached, which is the most extreme form of the failure, not an absence of
+  information. Worth one line in its docstring, because the obvious
+  `if x is not None` guard goes silent exactly when it matters most. We wrote
+  that guard first.
