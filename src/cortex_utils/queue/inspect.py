@@ -28,6 +28,7 @@ of silently dropped enqueues.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -351,6 +352,7 @@ def resubmit(
     conn: psycopg2.extensions.connection,
     job_id: int,
     dedup_key: str | None = None,
+    dedup_keys: Mapping[str, str] | None = None,
 ) -> int | None:
     """Re-queue a failed job as a new row. Returns the new id, or None if deduped.
 
@@ -366,7 +368,17 @@ def resubmit(
 
     Both halves commit together, so a crash cannot leave the work re-queued and
     the original still showing failed.
+
+    `dedup_keys` maps queue_name -> dedup field, for a caller that resubmits
+    across several queues and would otherwise have to look up which queue the
+    job is on before it could pick the key. This function already reads
+    queue_name to re-enqueue, so making the caller fetch it too meant a raw
+    SELECT against the queue on their side -- which under this package's own
+    rule is a gap here, not a boundary. Pass `dedup_key` for a single queue, or
+    `dedup_keys` and let the row decide.
     """
+    if dedup_key and dedup_keys:
+        raise QueueError("pass dedup_key or dedup_keys, not both")
     with _tx(conn) as cur:
         cur.execute(
             "SELECT queue_name, payload, priority, created_at FROM queue "
@@ -377,6 +389,8 @@ def resubmit(
         if row is None:
             raise QueueError(f"job {job_id} is not a failed row")
         queue_name, payload, priority, created_at = row
+        if dedup_keys is not None:
+            dedup_key = dedup_keys.get(queue_name)
 
         # commit=False: the cancel below must land with it or not at all.
         new_id = enqueue(

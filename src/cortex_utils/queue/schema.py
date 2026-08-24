@@ -210,6 +210,12 @@ def ensure_queue_table(
     a lock and waits on an open writer even when the index is already there, and
     this runs on every boot.
 
+    Your statement is unqualified and resolves through the connection's
+    search_path, same as everything else here. That is what makes composition
+    work -- your index lands in your schema without either side naming it -- but
+    it is worth saying out loud, because when the search_path is wrong the index
+    is built somewhere else and nothing complains.
+
     Passing them here rather than keeping a private migration is the point. A
     consumer that adopts this function and deletes its own DDL otherwise loses
     those indexes silently -- nothing here would put them back, and the absence

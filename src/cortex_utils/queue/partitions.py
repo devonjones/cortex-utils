@@ -347,7 +347,9 @@ class PartitionManager:
             "dropped_rows": row_count,
         }
 
-    def create_future_partitions(self, days_ahead: int = 3, dry_run: bool = False) -> int:
+    def create_future_partitions(
+        self, days_ahead: int = 3, dry_run: bool = False, days_back: int = 0
+    ) -> int:
         """Create partitions for the next N days.
 
         Returns count of partitions created.
@@ -361,6 +363,14 @@ class PartitionManager:
         The caller's retention pass is skipped when this raises. Exposure is bounded
         by the days_ahead window rather than by run count: dates already created stay
         created, and a later run re-creates only what is still missing.
+
+        `days_back` covers dates before today. Zero is right for steady-state
+        maintenance -- retention is about to drop those anyway -- but a row can
+        legitimately carry a created_at in the recent past: a producer whose
+        clock is behind the server's, or a test that rewinds a visibility
+        timestamp across local midnight. created_at is NOW() on the server, so
+        which dates need covering is a property of that clock rather than of any
+        one consumer, which is why this lives here.
         """
         created = 0
         # Server clock, not this process: created_at is NOW() on the server, so
@@ -369,7 +379,7 @@ class PartitionManager:
         today = server_today(self.conn)
         failures: list[PartitionNotAttachedError] = []
 
-        for i in range(days_ahead + 1):  # Include today
+        for i in range(-days_back, days_ahead + 1):  # Include today
             partition_date = today + timedelta(days=i)
             try:
                 if self.create_partition(partition_date, dry_run=dry_run):

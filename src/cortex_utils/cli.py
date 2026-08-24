@@ -8,6 +8,7 @@ Usage:
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -24,19 +25,51 @@ from cortex_utils.queue.migrate import drop_old_queue_table, migrate_to_partitio
 from cortex_utils.queue.partitions import PartitionManager
 from cortex_utils.queue.stats import format_stats_table, get_queue_stats, get_stale_jobs
 
-# Configure structlog for CLI output
-structlog.configure(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.dev.ConsoleRenderer(),
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-)
-
 log = structlog.get_logger()
+
+
+def _configure_cli_logging() -> None:
+    """Set up logging for the CLI, at entry rather than at import.
+
+    Two things were wrong with doing this at module scope. structlog.configure()
+    is global, so merely importing this module reconfigured logging for whatever
+    imported it -- a library deciding how its consumer logs. And
+    PrintLoggerFactory() writes to stdout, which is where this CLI's actual
+    output goes: `queue stats` piped to a parser got log lines interleaved with
+    the data it was meant to read.
+
+    Reported by a downstream consumer who lost a day to the same shape in their
+    own code: a library logging to stdout corrupts any consumer whose stdout is
+    a protocol.
+    """
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        # stderr: stdout belongs to the command's output.
+        logger_factory=structlog.PrintLoggerFactory(file=_LazyStderr()),
+    )
+
+
+class _LazyStderr:
+    """sys.stderr resolved per write, not captured at configure time.
+
+    structlog.configure() is global and outlives whatever set it up. Binding the
+    stream object means a caller that later replaces sys.stderr -- a test
+    harness, a CLI runner, anything capturing output -- leaves this holding a
+    closed file, and every subsequent log raises ValueError. Found immediately:
+    it broke 121 tests, which is a cheaper way to learn it than in production.
+    """
+
+    def write(self, message: str) -> int:
+        return sys.stderr.write(message)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
 
 
 def get_connection(config: Config) -> psycopg2.extensions.connection:
@@ -56,6 +89,7 @@ def get_connection(config: Config) -> psycopg2.extensions.connection:
 @click.pass_context
 def main(ctx: click.Context, config_path: Path, verbose: bool) -> None:
     """Cortex operational utilities."""
+    _configure_cli_logging()
     ctx.ensure_object(dict)
     ctx.obj["config"] = Config.from_file(config_path)
     ctx.obj["verbose"] = verbose
