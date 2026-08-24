@@ -41,6 +41,7 @@ from cortex_utils.queue.retry import (
 )
 from cortex_utils.queue.schema import (
     REQUIRED_COLUMNS,
+    ensure_queue_schema,
     ensure_queue_table,
     missing_columns,
     queue_ddl,
@@ -69,6 +70,7 @@ __all__ = [
     "PartitionNotAttachedError",
     "QueueTableNotFoundError",
     "DeadLetterManager",
+    "ensure_queue_schema",
     "ensure_queue_table",
     "missing_columns",
     "queue_ddl",

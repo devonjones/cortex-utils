@@ -27,7 +27,9 @@ from collections.abc import Sequence
 import psycopg2
 import structlog
 
-from cortex_utils.queue.ops import QueueError, _tx
+from cortex_utils.queue.add_retry_columns import add_retry_columns
+from cortex_utils.queue.dead_letter import DeadLetterManager
+from cortex_utils.queue.ops import QueueError, _tx, ensure_claim_token_column
 
 log = structlog.get_logger()
 
@@ -311,3 +313,40 @@ def _index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bo
         (name, table),
     )
     return cur.fetchone() is not None
+
+
+def ensure_queue_schema(
+    conn: psycopg2.extensions.connection,
+    extra_indexes: Sequence[tuple[str, str]] = (),
+) -> str:
+    """Everything a service needs before it touches the queue. Call on boot.
+
+    One call rather than four, because the order matters and getting it wrong is
+    an incident that has already happened: the exponential-backoff feature was
+    merged months before it first RAN in production, its migration existed as a
+    manual CLI step, the deploy flow never ran it, and two workers crash-looped
+    on `column "next_attempt_at" does not exist`. Nothing was wrong with the
+    migration. Nothing called it.
+
+    Additive migrations first, then the shape check -- that order is the whole
+    point. ensure_queue_table() refuses to ALTER a live table, so on a
+    deployment that predates a column it would raise where the column's own
+    migration would simply have added it. Running them first means an old
+    database is brought forward and a new one is created complete.
+
+    Idempotent, and cheap on the steady-state path: every step pre-checks the
+    catalogue before touching anything, so the common case is a handful of reads
+    and no locks at all.
+    """
+    if _inspect(conn, "queue")[0]:
+        # These ALTER an existing table, so they only make sense once there is
+        # one. A fresh database gets every column from queue_ddl() instead.
+        add_retry_columns(conn, dry_run=False)
+        ensure_claim_token_column(conn)
+
+    result = ensure_queue_table(conn, extra_indexes=extra_indexes)
+
+    # health() reads dead_letter, and drop_partition() archives into it, so a
+    # service that never dead-letters anything itself still needs it to exist.
+    DeadLetterManager(conn).ensure_table()
+    return result

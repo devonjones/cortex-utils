@@ -660,3 +660,77 @@ def test_an_invalid_index_does_not_count_as_present(conn) -> None:
     with pytest.raises((QueueError, psycopg2.Error)):
         ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
     conn.rollback()
+
+
+# --- the boot entry point ----------------------------------------------------
+
+
+def test_ensure_queue_schema_brings_a_pre_migration_database_forward(conn) -> None:
+    """The rgmk incident: a column added in code months before it first ran in
+    production, its migration a manual CLI step the deploy flow never invoked,
+    two workers crash-looping on `column "next_attempt_at" does not exist`.
+
+    Nothing was wrong with the migration. Nothing called it.
+    """
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    with conn.cursor() as cur:
+        cur.execute(
+            queue_ddl()
+            .replace("    next_attempt_at TIMESTAMPTZ,\n", "")
+            .replace("    claimed_by TEXT,\n", "")
+        )
+    conn.commit()
+    assert sorted(missing_columns(conn)) == ["claimed_by", "next_attempt_at"]
+
+    assert ensure_queue_schema(conn) == "present"
+    assert missing_columns(conn) == [], "boot must bring an old database forward"
+
+
+def test_ensure_queue_schema_creates_a_fresh_database_complete(conn) -> None:
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    assert ensure_queue_schema(conn) == "created"
+    assert missing_columns(conn) == []
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('dead_letter')")
+        assert cur.fetchone()[0] is not None, "health() and drop_partition() need it"
+
+
+def test_ensure_queue_schema_is_safe_on_every_boot(conn) -> None:
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    assert ensure_queue_schema(conn) == "created"
+    assert ensure_queue_schema(conn) == "present"
+    assert ensure_queue_schema(conn) == "present"
+
+
+def test_the_additive_migrations_run_before_the_shape_check(conn) -> None:
+    """Order is the whole point. ensure_queue_table() refuses to ALTER a live
+    table, so reversed it would raise on exactly the deployments the additive
+    migrations exist to bring forward."""
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl().replace("    claimed_by TEXT,\n", ""))
+    conn.commit()
+
+    # The shape check alone refuses.
+    with pytest.raises(QueueError, match="claimed_by"):
+        ensure_queue_table(conn)
+    conn.rollback()
+
+    # Boot does not, because it migrates first.
+    assert ensure_queue_schema(conn) == "present"
+
+
+def test_boot_carries_consumer_indexes_too(conn) -> None:
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    ensure_queue_schema(conn, extra_indexes=[CRYO_DEDUP])
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video' AND i.indrelid = to_regclass('queue')"
+        )
+        assert cur.fetchone() is not None

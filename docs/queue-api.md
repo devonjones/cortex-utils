@@ -395,6 +395,33 @@ Pick names of your own that collide with neither set.
 
 ## Setup
 
+```python
+from cortex_utils.queue import ensure_queue_schema
+
+ensure_queue_schema(conn)     # on boot, before anything touches the queue
+```
+
+One call, idempotent, cheap on the steady-state path — every step pre-checks the
+catalogue before touching anything, so a normal boot is a handful of reads and
+no locks.
+
+It runs the additive migrations first (`next_attempt_at`, `claimed_by`), then
+the shape check, then ensures `dead_letter`. **That order is the point.**
+`ensure_queue_table()` refuses to `ALTER` a live table, so reversed it would
+raise on exactly the deployments the additive migrations exist to bring
+forward. An old database is migrated; a new one is created complete.
+
+Pass `extra_indexes=[...]` here the same way as to `ensure_queue_table()`.
+
+> **Why one call rather than four.** A backoff feature was merged months before
+> it first *ran* in production. Its migration existed and was correct — as a
+> manual CLI step the deploy flow never invoked. Two workers crash-looped on
+> `column "next_attempt_at" does not exist`. Nothing was wrong with the
+> migration; nothing called it. Six services each remembering four calls in the
+> right order is that incident waiting to recur.
+
+
+
 Run once per schema, before first use:
 
 ```python
@@ -403,6 +430,9 @@ from cortex_utils.queue import DeadLetterManager, ensure_claim_token_column
 ensure_claim_token_column(conn)
 DeadLetterManager(conn).ensure_table()
 ```
+
+(These are what `ensure_queue_schema()` calls for you. Reach for them
+individually only if you have a reason to run one without the others.)
 
 `ensure_claim_token_column` adds `claimed_by` if the table predates it. Pre-checks `pg_attribute` before the
 `ALTER` and runs under a 5s `lock_timeout`, so a boot fails fast rather than
