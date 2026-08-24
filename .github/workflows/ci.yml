@@ -57,7 +57,9 @@ jobs:
           CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
         # A misconfigured service would turn this whole layer into silent
         # skips, which reads as coverage and is not.
-        run: uv run pytest tests/test_inspect_live.py -q --no-header -p no:cacheprovider
+        run: |
+          uv run pytest tests/test_inspect_live.py tests/test_ops_live.py \
+            -q --no-header -p no:cacheprovider
 
   build:
     runs-on: ubuntu-latest

@@ -561,9 +561,20 @@ def claim(
                 # the CTE already joins on it and the row is already in hand.
                 # Without it a consumer that needs the age of the work -- to
                 # route it, to report it, to decide it is too old to bother
-                # with -- must issue a second query per claimed row. cryo does
-                # exactly that today (_row_created_at), which is an N+1 the
-                # library can retire for every consumer at no cost.
+                # with -- must issue a second query per claimed row. Verified
+                # against PG16: EXPLAIN is byte-identical with and without it.
+                #
+                # It is for READING. Together with `id` it is the whole primary
+                # key, which makes a partition-pruned UPDATE easy to write and
+                # tempting -- and any such UPDATE bypasses the claim token,
+                # which is the one thing standing between a stalled worker and
+                # reporting on a row somebody else has since claimed. Report
+                # through complete()/release()/fail_or_retry(); they match on
+                # claimed_by and tell you when you have lost the row.
+                #
+                # It is also a SERVER timestamp. Comparing it to a local
+                # datetime.now() is two clocks; ask the server for the
+                # comparison, as everything else in this package does.
                 "created_at": r[5],
             }
             for r in cur.fetchall()

@@ -35,7 +35,13 @@ from typing import Any
 import psycopg2
 import structlog
 
-from cortex_utils.queue.ops import SELF_HEALED_MARKER, QueueError, _tx, enqueue
+from cortex_utils.queue.ops import (
+    _DEDUP_VALUE_TYPES,
+    SELF_HEALED_MARKER,
+    QueueError,
+    _tx,
+    enqueue,
+)
 
 log = structlog.get_logger()
 
@@ -142,11 +148,25 @@ class Failure:
         Offering the identifying value directly makes the minimal thing the
         easy thing. Consumers that genuinely need the payload still have it;
         those that only need a label no longer have to remember to strip it.
+
+        Returns exactly the values the queue will let you dedup on, and None for
+        anything else -- including a key that is absent, or one whose value is a
+        container. str() on a container yields its Python repr, which would hand
+        the renderer a stringified blob of the very thing this method exists to
+        keep out of it: a caller who passes the wrong key would get more
+        exposure, not less, and silently.
+
+        bool is excluded for the reason enqueue() rejects it as a dedup value:
+        str(True) is "True" while Postgres jsonb ->> yields "true", so a bool
+        rendered here would not match the value the queue actually stored.
+        (isinstance(True, int) is True, hence the explicit check.)
         """
         if not dedup_key:
             return None
         value = (self.payload or {}).get(dedup_key)
-        return str(value) if value is not None else None
+        if isinstance(value, bool) or not isinstance(value, _DEDUP_VALUE_TYPES):
+            return None
+        return str(value)
 
 
 _HEALTH_SQL = """
@@ -364,7 +384,5 @@ def resubmit(
             queue=queue_name,
         )
     else:
-        log.info(
-            "Resubmitted failed job", original=job_id, new=new_id, queue=queue_name
-        )
+        log.info("Resubmitted failed job", original=job_id, new=new_id, queue=queue_name)
     return new_id

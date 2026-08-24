@@ -22,7 +22,7 @@ Contributed from cryo's integration (cryo-64); cryo runs an equivalent suite as
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 
@@ -88,9 +88,16 @@ def conns():
     try:
         yield a, b
     finally:
+        # close() before rollback(): rollback() from this thread never returns
+        # while another thread is still inside execute() on that connection --
+        # measured at 25s and counting. A teardown that hangs turns a failing
+        # test into a hung runner, which nobody reads as a test result.
         for c in (a, b):
-            c.rollback()
-            c.close()
+            try:
+                c.cancel()
+                c.close()
+            except Exception:  # noqa: BLE001 -- teardown must not mask the failure
+                pass
         with setup.cursor() as cur:
             cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
         setup.close()
@@ -115,8 +122,7 @@ def test_skip_locked_never_double_claims(conns):
 
     with a.cursor() as cur:  # held open, deliberately, for the whole test
         cur.execute(
-            "SELECT id FROM queue WHERE id = ANY(%s) ORDER BY id "
-            "LIMIT 3 FOR UPDATE",
+            "SELECT id FROM queue WHERE id = ANY(%s) ORDER BY id LIMIT 3 FOR UPDATE",
             (ids,),
         )
         locked = {r[0] for r in cur.fetchall()}
@@ -163,14 +169,20 @@ def test_advisory_lock_serialises_same_key_producers(conns):
         except Exception as exc:  # noqa: BLE001 — reported, not swallowed
             result["error"] = exc
 
-    t = threading.Thread(target=producer_b)
+    with b.cursor() as cur:
+        # Without this, a regression where the lock is gone and B instead blocks
+        # on something else hangs the suite rather than failing it -- the same
+        # guard the SKIP LOCKED test above already has.
+        cur.execute("SET LOCAL statement_timeout = '10s'")
+
+    t = threading.Thread(target=producer_b, daemon=True)
     t.start()
     t.join(timeout=2)
     # B must still be blocked on the advisory lock A holds. If it finished, it
     # never waited — which is what happens when the lock is gone.
     assert t.is_alive(), "B did not block on the advisory lock A holds"
 
-    a.commit()          # releases the xact lock; B proceeds and sees the row
+    a.commit()  # releases the xact lock; B proceeds and sees the row
     t.join(timeout=10)
     assert not t.is_alive(), "B never completed after A committed"
     assert "error" not in result, f"B failed: {result.get('error')}"
@@ -184,10 +196,17 @@ def test_advisory_lock_serialises_same_key_producers(conns):
 def test_missing_partition_self_heals_once_under_concurrency(conns):
     """Two producers hitting a missing partition: both land, one partition.
 
-    CREATE TABLE IF NOT EXISTS checks the name before taking the lock that
-    serialises creation, so a concurrent creator can still win in between —
-    which is why the code catches DuplicateTable. That interleaving is a
-    database behaviour and cannot be reproduced against a mock.
+    This does NOT reproduce the DuplicateTable interleaving, and saying so
+    matters more than the test. Two attempts failed: forcing it with an
+    uncommitted CREATE on A blocks B on the parent's ACCESS EXCLUSIVE at the
+    INSERT, before it can reach CheckViolation at all; and four producers behind
+    a barrier came back clean 12 times out of 12, with one reporting `created`
+    and the rest `present` because _ensure_partition's pre-check had already
+    seen the winner's committed partition.
+
+    What it does cover is still un-mockable and worth having: two real
+    connections, a missing partition, both rows landing, exactly one partition
+    created. See Known Limitations for the branch that remains unreached.
     """
     a, b = conns
     with a.cursor() as cur:

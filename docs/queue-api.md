@@ -81,6 +81,18 @@ forfeit the partition self-heal below, because it needs to commit DDL.
 
 `FOR UPDATE SKIP LOCKED`, so N workers polling the same queue never collide.
 
+Each dict has `id`, `queue_name`, `payload`, `attempts`, `priority`,
+`created_at`.
+
+`created_at` is there so you do not have to ask a second time — it is half the
+primary key, so the claim already had it. **It is for reading.** Together with
+`id` it is the whole key, which makes a partition-pruned `UPDATE` easy to write
+and tempting; any such write bypasses the claim token, which is the one thing
+standing between a stalled worker and reporting on a row somebody else has since
+claimed. Report through `complete()` / `release()` / `fail_or_retry()`. It is
+also a *server* timestamp, so compare it server-side rather than against a local
+`datetime.now()`.
+
 **`worker` is required and must be non-empty** — `QueueError` otherwise. It is
 the claim token, and it is the whole point: `complete()` and `release()` match
 on it, so a worker that stalled past its visibility timeout cannot report on a
@@ -319,8 +331,12 @@ cryo therefore keeps its own dead-letter layer rather than adopting
 `DeadLetterManager`, which by the shared-library rule means this is a gap
 rather than a boundary. What cryo does, offered as one possible shape:
 
-- **replay leaves the row in place.** Double-replay is handled by `enqueue()`'s
-  dedup returning `None`, not by bookkeeping.
+- **replay leaves the row in place**, and the row's own state is what stops a
+  second replay. `enqueue()`'s dedup does *not* cover this: dedup is opt-in via
+  `dedup_key` and `retry_job()` passes none, so with the delete gone and nothing
+  else added, a second sweep re-enqueues everything the first put back and
+  overwrites the record of where it went. (Verified against live Postgres: three
+  dead letters, two sweeps, six queue rows.)
 - **`dismissed_at TIMESTAMPTZ`** is the terminal state: idempotent, so
   re-dismissing keeps the date it was actually written off, and the row stays
   in the table as history while leaving the default view.
@@ -335,19 +351,31 @@ it because cryo cannot adopt the module until it is settled.
 
 ## Known limitations
 
-**No live-Postgres coverage of `ops.py`.** The suite is mock-based and
-mutation-tested, but `SKIP LOCKED` not double-claiming, advisory-lock
-serialisation, and the partition-creation race cannot be asserted against a
-mock. They were argued in review and, for the `DuplicateTable`-vs-
-`UniqueViolation` question, settled by racing a throwaway Postgres 16 by hand.
-A container-based selfcheck is the single most valuable contribution back.
+**One concurrency branch is still unreached.** `SKIP LOCKED` not
+double-claiming and advisory-lock serialisation now have live-Postgres
+coverage — `tests/test_ops_live.py`, contributed by cryo, two real connections
+genuinely raced, and CI fails if that layer silently skips.
+
+What remains uncovered is `_ensure_partition`'s `DuplicateTable` handler.
+Nothing reaches it: the mock tests synthesise the exception, and it could not be
+provoked through `enqueue()` at all — an uncommitted `CREATE` on one connection
+blocks the other on the parent's `ACCESS EXCLUSIVE` before it can reach
+`CheckViolation`, and four producers behind a barrier came back clean 12 times
+out of 12, one reporting `created` and the rest `present` because the pre-check
+had already seen the winner's partition. Two sessions issuing the raw
+`CREATE TABLE IF NOT EXISTS ... PARTITION OF` simultaneously *does* raise it
+(40/40 `42P07`), so the branch is right — it is just not reachable from here.
 
 **Claim-loss is encoded two ways** — `False` from `complete()`/`release()`,
 `"stale"` from `fail_or_retry()` — so a worker loop cannot share a branch.
 Unification is tracked as cortex-i5jc.
 
-**`claim()` returns `list[dict[str, Any]]`,** not a `TypedDict`. Worth doing
-once the field set settles.
+**`claim()` returns `list[dict[str, Any]]`,** not a `TypedDict`. The fields are
+`id`, `queue_name`, `payload`, `attempts`, `priority`, `created_at` — that last
+one is free, because partitioning forces it into the primary key so the CTE has
+the row in hand anyway, and without it a consumer needing the age of the work
+runs a second query per claimed row. Worth a `TypedDict` now the set has
+settled.
 
 **No LISTEN/NOTIFY.** Cortex polls. Keep any notify trigger consumer-side for
 now; when it moves here it moves with a validated `channel` parameter.
