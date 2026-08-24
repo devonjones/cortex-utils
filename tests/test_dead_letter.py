@@ -308,8 +308,10 @@ def test_a_fully_migrated_table_touches_nothing_on_boot() -> None:
 
 def test_columns_present_but_index_missing_still_gets_the_index() -> None:
     """A table migrated before the index existed must still acquire it."""
-    # Three column probes say present; the index probe returns a row saying False.
-    answers = [(1,), (1,), (1,), (False,)]
+    # Three column probes say present; the index probe finds no row. (It used to
+    # be a boolean-returning SELECT; it now joins pg_index, so absence is no row
+    # rather than a row containing False.)
+    answers = [(1,), (1,), (1,), None]
     mgr, conn = _manager(fetchone=lambda: answers.pop(0) if answers else None)
     assert mgr.ensure_lifecycle_columns() is False
     assert [s for s, _ in conn.cur.executed if "CREATE INDEX" in s]

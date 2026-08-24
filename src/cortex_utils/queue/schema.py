@@ -29,7 +29,12 @@ import psycopg2
 from cortex_utils.log import get_logger
 from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
-from cortex_utils.queue.ops import QueueError, _tx, ensure_claim_token_column
+from cortex_utils.queue.ops import (
+    QueueError,
+    _tx,
+    ensure_claim_token_column,
+    index_present,
+)
 
 log = get_logger()
 
@@ -298,31 +303,8 @@ def _ensure_indexes(
 
 
 def _index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bool:
-    """True if `name` is an index ON `table`.
-
-    Not to_regclass(name): that proves a name is taken, which is the thing this
-    module refuses to accept as proof elsewhere. A table, a sequence, or an
-    index on some other relation all resolve, and reading any of them as "the
-    index is there" means the CREATE is skipped forever and the index silently
-    never exists. Opening the name space to consumers is what makes that
-    collision realistic rather than theoretical.
-
-    indisvalid for the same reason one step further in: CREATE INDEX ON ONLY a
-    partitioned parent leaves an invalid index, which resolves and joins and
-    would otherwise pass this check forever while indexing nothing.
-
-    Takes a cursor rather than a connection so it shares the caller's
-    transaction. The post-CREATE probe has to see the uncommitted index; opening
-    its own would commit the CREATE before checking it, which is the difference
-    between a mismatch rolling back cleanly and leaving an orphan index under a
-    name no later boot will look for.
-    """
-    cur.execute(
-        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s) AND i.indisvalid",
-        (name, table),
-    )
-    return cur.fetchone() is not None
+    """Delegates to ops.index_present -- one implementation, because two drifted."""
+    return index_present(cur, table, name)
 
 
 def ensure_queue_schema(

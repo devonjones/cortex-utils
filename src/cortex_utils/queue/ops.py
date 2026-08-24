@@ -284,6 +284,31 @@ _ATTACHED_SQL = """
 """
 
 
+def index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bool:
+    """True if `name` is a VALID index ON `table`.
+
+    One implementation, because two drifted. schema.py had this shape and
+    dead_letter.py had `to_regclass(name) IS NOT NULL` -- which proves a name
+    resolves somewhere on the search_path, not that the index is on this table.
+    Under `search_path = app, shared`, an unrelated index of that name in
+    `shared` made the gate answer "present" and the index was never created, on
+    any boot, forever, while the caller logged success. Multi-schema is this
+    package's normal deployment; every live test runs under a SET search_path.
+
+    indisvalid too: an interrupted CREATE INDEX CONCURRENTLY leaves an invalid
+    index that resolves and joins and indexes nothing.
+
+    Takes a cursor rather than a connection so it shares the caller's
+    transaction -- a post-CREATE probe has to see the uncommitted index.
+    """
+    cur.execute(
+        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s) AND i.indisvalid",
+        (name, table),
+    )
+    return cur.fetchone() is not None
+
+
 def require_queue_table(conn: psycopg2.extensions.connection) -> None:
     """Fail loudly when search_path resolves no queue table.
 

@@ -590,10 +590,16 @@ def test_ensure_table_works_on_an_autocommit_connection(conn) -> None:
         # commits, and restoring autocommit inside a transaction raises.
         mgr.ensure_table()
         mgr.ensure_table()
+        # Read it BEFORE the cleanup below writes it. Asserting after the
+        # finally re-reads a value this test just set, so it cannot fail --
+        # verified: adding a silent `self.conn.autocommit = False` at the end
+        # of ensure_table left the whole suite green while it stole a
+        # consumer's connection setting, which is the exact damage this is for.
+        survived = conn.autocommit
     finally:
         conn.autocommit = False
 
-    assert conn.autocommit is False, "the caller's connection setting was altered"
+    assert survived is True, "ensure_table kept the caller's connection non-autocommit"
 
     assert _indexes(conn) >= {"idx_dead_letter_queue", "idx_dead_letter_created"}
 
@@ -660,3 +666,36 @@ def test_a_view_named_dead_letter_is_not_mistaken_for_the_table(legacy_conn) -> 
     with pytest.raises(QueueError, match="not a table"):
         DeadLetterManager(legacy_conn).ensure_table()
     legacy_conn.rollback()
+
+
+def test_an_index_of_that_name_in_another_schema_is_not_ours(conn) -> None:
+    """to_regclass(name) proves a name resolves somewhere on the search_path,
+    not that the index is on THIS table.
+
+    Under `search_path = app, shared`, an unrelated index of the same name in
+    `shared` made the gate answer "present" and the index was never created --
+    on any boot, forever, while ensure_table() logged success. Multi-schema is
+    this package's normal deployment: every test in this file runs under a SET
+    search_path.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP SCHEMA IF EXISTS neighbour CASCADE")
+        cur.execute("CREATE SCHEMA neighbour")
+        cur.execute("CREATE TABLE neighbour.other (x int)")
+        cur.execute("CREATE INDEX idx_dead_letter_queue ON neighbour.other (x)")
+        cur.execute("DROP INDEX idx_dead_letter_queue")  # ours, so it is missing
+        cur.execute("SET search_path = t_dl, neighbour")
+    conn.commit()
+
+    DeadLetterManager(conn).ensure_table()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_dead_letter_queue' "
+            "AND i.indrelid = to_regclass('t_dl.dead_letter')"
+        )
+        assert cur.fetchone()[0] == 1, "the neighbour's index was mistaken for ours"
+        cur.execute("SET search_path = t_dl")
+        cur.execute("DROP SCHEMA neighbour CASCADE")
+    conn.commit()

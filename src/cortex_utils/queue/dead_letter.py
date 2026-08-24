@@ -32,7 +32,7 @@ from typing import Any
 import psycopg2
 
 from cortex_utils.log import get_logger
-from cortex_utils.queue.ops import QueueError, enqueue
+from cortex_utils.queue.ops import QueueError, enqueue, index_present
 
 log = get_logger()
 
@@ -237,10 +237,9 @@ class DeadLetterManager:
         return True
 
     def _has_index(self, name: str) -> bool:
-        """Bound through to_regclass, and cheap under a writer's lock."""
+        """Is `name` a valid index ON dead_letter? Shared with schema.py."""
         with self.conn.cursor() as cur:
-            cur.execute("SELECT to_regclass(%s) IS NOT NULL", (name,))
-            return bool(cur.fetchone()[0])
+            return index_present(cur, "dead_letter", name)
 
     def _has_column(self, name: str) -> bool:
         """Bound through to_regclass so it answers about THIS schema's table."""
