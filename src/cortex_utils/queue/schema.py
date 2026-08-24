@@ -363,6 +363,17 @@ def ensure_queue_schema(
     try:
         return _ensure_queue_schema_locked(conn, extra_indexes)
     finally:
+        # The transaction may be aborted -- a step above may have failed
+        # mid-DDL -- and the unlock would then raise InFailedSqlTransaction,
+        # replacing the real error with a confusing one AND leaving a
+        # SESSION-scoped lock held for the life of the connection, which
+        # serialises every later boot on it behind a lock nobody holds
+        # deliberately. Clear the transaction first, and never let this
+        # displace the exception that sent us here.
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 -- a dead connection releases it anyway
+            log.warning("Could not clear the transaction before unlocking")
         with _tx(conn) as cur:
             cur.execute("SELECT pg_advisory_unlock(hashtext('cortex_queue_schema'))")
             if not cur.fetchone()[0]:

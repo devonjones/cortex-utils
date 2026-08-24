@@ -32,7 +32,7 @@ from typing import Any
 import psycopg2
 
 from cortex_utils.log import get_logger
-from cortex_utils.queue.ops import enqueue
+from cortex_utils.queue.ops import QueueError, enqueue
 
 log = get_logger()
 
@@ -52,12 +52,24 @@ CREATE TABLE IF NOT EXISTS dead_letter (
     retried_as BIGINT,
     dismissed_at TIMESTAMPTZ
 );
-
-CREATE INDEX IF NOT EXISTS idx_dead_letter_queue
-    ON dead_letter(queue_name, failed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_dead_letter_created
-    ON dead_letter(created_at);
 """
+
+# Each index separately, so each can be ASKED about separately. They used to
+# ride along in the script above, which meant the table's existence stood in for
+# theirs: drop idx_dead_letter_queue and it never came back, on any later boot,
+# because nothing else in the package creates it. A gate answering one question
+# must not be used to skip three.
+BASE_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "idx_dead_letter_queue",
+        "CREATE INDEX IF NOT EXISTS idx_dead_letter_queue "
+        "ON dead_letter(queue_name, failed_at DESC)",
+    ),
+    (
+        "idx_dead_letter_created",
+        "CREATE INDEX IF NOT EXISTS idx_dead_letter_created ON dead_letter(created_at)",
+    ),
+)
 
 # Deliberately NOT in the script above. CREATE TABLE IF NOT EXISTS no-ops on an
 # existing table, and IF NOT EXISTS on an index guards the NAME, not the
@@ -100,22 +112,64 @@ class DeadLetterManager:
         own cursor. ensure_queue_schema() advertises "every step pre-checks the
         catalogue"; this was the step that made that false.
         """
-        if not self._has_table():
-            with self.conn.cursor() as cur:
-                cur.execute("SET LOCAL lock_timeout = '5000ms'")
-                cur.execute(DEAD_LETTER_SCHEMA)
-            self.conn.commit()
+        # SET LOCAL is a silent no-op under autocommit -- there is no
+        # transaction for it to be local to -- so the bound would not apply on
+        # exactly the connection shape a consumer is most likely to hand us.
+        # ensure_lifecycle_columns() fifty lines down already does this; this
+        # method did not.
+        was_autocommit = self.conn.autocommit
+        if was_autocommit:
+            self.conn.autocommit = False
+        try:
+            if not self._has_table():
+                with self.conn.cursor() as cur:
+                    cur.execute("SET LOCAL lock_timeout = '5000ms'")
+                    cur.execute(DEAD_LETTER_SCHEMA)
+                self.conn.commit()
+
+            # Each index asked about on its own. The table existing is not
+            # evidence that its indexes do.
+            for name, statement in BASE_INDEXES:
+                if self._has_index(name):
+                    continue
+                with self.conn.cursor() as cur:
+                    cur.execute("SET LOCAL lock_timeout = '5000ms'")
+                    cur.execute(statement)
+                self.conn.commit()
+                log.info("Created dead_letter index", index=name)
+        except Exception:
+            # Without this a DDL failure leaves the transaction aborted, and
+            # ensure_queue_schema()'s finally-unlock then raises
+            # InFailedSqlTransaction -- replacing the real error and leaving a
+            # SESSION-scoped advisory lock held for the life of the connection.
+            self.conn.rollback()
+            raise
+        finally:
+            if was_autocommit:
+                self.conn.autocommit = True
+
         self.ensure_lifecycle_columns()
         log.debug("Ensured dead_letter table exists")
 
     def _has_table(self) -> bool:
         """Bound through to_regclass, so it answers about this schema's table."""
         with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM pg_class WHERE oid = to_regclass('dead_letter') "
-                "AND relkind IN ('r', 'p')"
+            cur.execute("SELECT relkind FROM pg_class WHERE oid = to_regclass('dead_letter')")
+            row = cur.fetchone()
+        if row is None:
+            return False
+        if row[0] not in ("r", "p"):
+            # to_regclass resolving proves a name is taken, not that it is the
+            # table. Returning False here would send us into CREATE TABLE IF
+            # NOT EXISTS, which skips on any same-named relation, and the
+            # failure would surface several statements later as an index error
+            # about a view. Say what was actually found -- the same answer
+            # schema._inspect gives for queue.
+            raise QueueError(
+                f"dead_letter exists but is a {row[0]!r} relation, not a table. "
+                "Check the connection's search_path."
             )
-            return cur.fetchone() is not None
+        return True
 
     def ensure_lifecycle_columns(self) -> bool:
         """Add retried_at/retried_as/dismissed_at if this schema predates them.
