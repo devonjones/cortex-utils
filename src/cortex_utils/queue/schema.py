@@ -359,6 +359,16 @@ def ensure_queue_schema(
     finally:
         with _tx(conn) as cur:
             cur.execute("SELECT pg_advisory_unlock(hashtext('cortex_queue_schema'))")
+            if not cur.fetchone()[0]:
+                # False means this session did not hold it, so the lock/unlock
+                # pairing broke -- someone unlocked underneath us, or the lock
+                # was never taken. Logged rather than raised: this runs in a
+                # finally, and raising here would replace whatever real error
+                # sent us into it.
+                log.warning(
+                    "Released a schema lock this session did not hold",
+                    hint="lock/unlock pairing in ensure_queue_schema",
+                )
 
 
 def _ensure_queue_schema_locked(

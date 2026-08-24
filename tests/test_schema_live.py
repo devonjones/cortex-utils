@@ -868,3 +868,34 @@ def test_the_retry_migration_fails_fast_rather_than_wedging_the_queue(conn) -> N
     with conn.cursor() as cur:
         cur.execute("SELECT 1")
         assert cur.fetchone()[0] == 1
+
+
+def test_a_crashed_boot_does_not_wedge_the_next_one(conn) -> None:
+    """The lock is session-scoped, so the finally is belt-and-braces: Postgres
+    releases it when the connection dies. Verified here because the alternative
+    -- a lock surviving a crashed boot -- would turn one bad deploy into a
+    permanent outage of every later one."""
+    other = psycopg2.connect(DSN)
+    other.autocommit = True
+    with other.cursor() as cur:
+        cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")
+    other.close()  # the boot process dies holding it
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext('cortex_queue_schema'))")
+        assert cur.fetchone()[0] is True, "a dead boot left the lock held"
+        cur.execute("SELECT pg_advisory_unlock(hashtext('cortex_queue_schema'))")
+    conn.commit()
+
+
+def test_boot_releases_the_lock_it_took(conn) -> None:
+    """Leaking it would serialise every later boot behind a lock nobody holds."""
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    ensure_queue_schema(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+        assert cur.fetchone()[0] == 0, "boot kept the schema lock"
+    conn.commit()
