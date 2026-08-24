@@ -146,6 +146,15 @@ class DeadLetterManager:
             raise
         finally:
             if was_autocommit:
+                # Clear the transaction first. psycopg2 refuses to change the
+                # session mode inside one, and the catalogue probes above open
+                # a transaction whether or not any DDL follows -- so on the
+                # steady-state path, where everything already exists and
+                # nothing commits, restoring autocommit raised
+                # ProgrammingError and left the caller's connection silently
+                # flipped to non-autocommit on the way out. Every redeploy, on
+                # the connection shape this guard was added for.
+                self.conn.rollback()
                 self.conn.autocommit = True
 
         self.ensure_lifecycle_columns()

@@ -581,9 +581,19 @@ def test_ensure_table_works_on_an_autocommit_connection(conn) -> None:
 
     conn.autocommit = True
     try:
-        DeadLetterManager(conn).ensure_table()
+        mgr = DeadLetterManager(conn)
+        mgr.ensure_table()
+        # Boot twice. The first call does DDL, and its incidental commit closes
+        # the transaction the catalogue probes opened -- so "repeated boot" and
+        # "autocommit connection" were each covered while their intersection,
+        # which is production, was not. On the steady-state path nothing
+        # commits, and restoring autocommit inside a transaction raises.
+        mgr.ensure_table()
+        mgr.ensure_table()
     finally:
         conn.autocommit = False
+
+    assert conn.autocommit is False, "the caller's connection setting was altered"
 
     assert _indexes(conn) >= {"idx_dead_letter_queue", "idx_dead_letter_created"}
 

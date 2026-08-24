@@ -224,3 +224,24 @@ def test_library_logs_carry_their_own_namespace_not_root() -> None:
     assert "should-be-silenced" not in combined, (
         "silencing the cortex_utils namespace did not silence us -- we are logging as root"
     )
+
+
+def test_the_log_stream_is_resolved_per_write_not_at_import() -> None:
+    """_LazyStderr exists because binding sys.stderr when the logger is built
+    leaves a harness that replaces the stream holding a closed file -- it broke
+    121 tests the first time. Asserting only that logs reach stderr does not
+    show that: an import-time binding passes too, right up until something
+    redirects."""
+    import contextlib
+    import io
+
+    from cortex_utils.log import get_logger
+
+    log = get_logger()
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        log.warning("redirected-marker")
+
+    assert "redirected-marker" in captured.getvalue(), (
+        "the stream was captured when the logger was built, not resolved per write"
+    )

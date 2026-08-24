@@ -899,3 +899,67 @@ def test_boot_releases_the_lock_it_took(conn) -> None:
         )
         assert cur.fetchone()[0] == 0, "boot kept the schema lock"
     conn.commit()
+
+
+def test_a_boot_that_fails_mid_ddl_keeps_its_error_and_its_lock_release(conn) -> None:
+    """The finally-unlock runs on a possibly-ABORTED transaction.
+
+    A clean refusal is not the case -- those happen before any DDL, so the
+    transaction is fine and the unlock works either way. What matters is a
+    failure that reaches the server: psycopg2 then refuses every later
+    statement, so the unlock itself raises InFailedSqlTransaction, replacing
+    the real error with a confusing one AND leaving a SESSION-scoped advisory
+    lock held for the life of the connection -- which serialises every later
+    boot on it behind a lock nobody holds deliberately.
+
+    Measured both directions: without the rollback, DivisionByZero becomes
+    InFailedSqlTransaction and pg_locks shows 1; with it, the original error
+    propagates and the count is 0.
+    """
+    import cortex_utils.queue.schema as sch
+
+    def fails_at_the_server(c, table="queue", extra_indexes=()):
+        with c.cursor() as cur:
+            cur.execute("SELECT 1 / 0")
+
+    original = sch.ensure_queue_table
+    sch.ensure_queue_table = fails_at_the_server
+    try:
+        with pytest.raises(psycopg2.errors.DivisionByZero):
+            sch.ensure_queue_schema(conn)
+    finally:
+        sch.ensure_queue_table = original
+    conn.rollback()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+        assert cur.fetchone()[0] == 0, "the schema lock outlived a failed boot"
+    conn.commit()
+
+
+def test_a_refused_boot_does_not_leak_the_schema_lock(conn) -> None:
+    """The finally-unlock runs on a possibly-aborted transaction. Without a
+    rollback first it raises InFailedSqlTransaction -- replacing the real error
+    with a confusing one AND leaving a SESSION-scoped advisory lock held for
+    the life of the connection, which serialises every later boot on it behind
+    a lock nobody holds deliberately.
+    """
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    # A shape ensure_queue_schema refuses, so it raises partway through.
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl().replace("    priority INT NOT NULL DEFAULT 0,\n", ""))
+    conn.commit()
+
+    with pytest.raises(QueueError):
+        ensure_queue_schema(conn)
+    conn.rollback()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+        assert cur.fetchone()[0] == 0, "the schema lock outlived a failed boot"
+    conn.commit()
