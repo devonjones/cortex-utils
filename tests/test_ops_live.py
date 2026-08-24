@@ -22,7 +22,7 @@ Contributed from cryo's integration (cryo-64); cryo runs an equivalent suite as
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -136,6 +136,19 @@ def test_skip_locked_never_double_claims(conns):
     got = claim(b, "q", "worker-b", limit=6)
     b.commit()
     a.rollback()
+
+    # The mock tests feed the RETURNING tuple in themselves, in the code's own
+    # expected order, and the SQL-grep test only proves a column is requested --
+    # neither can see a POSITION swap. Swapping attempts and created_at in the
+    # RETURNING list passes all 348 while putting a datetime in `attempts`,
+    # which fail_or_retry does arithmetic on. Only a real cursor can catch it.
+    for row in got:
+        assert isinstance(row["id"], int)
+        assert isinstance(row["attempts"], int), f"attempts is {type(row['attempts'])}"
+        assert isinstance(row["priority"], int)
+        assert isinstance(row["created_at"], datetime)
+        assert isinstance(row["payload"], dict)
+        assert row["queue_name"] == "q"
 
     claimed = {r["id"] for r in got}
     assert claimed, "B must claim the rows A is not holding"
