@@ -635,3 +635,28 @@ def test_the_same_index_name_in_another_schema_is_not_ours(conn) -> None:
             "AND i.indrelid = to_regclass('t_schema.queue')"
         )
         assert cur.fetchone()[0] == 1, "our schema must get its own index"
+
+
+def test_an_invalid_index_does_not_count_as_present(conn) -> None:
+    """CREATE INDEX ON ONLY a partitioned parent leaves an invalid index. It
+    resolves, it joins, and without the indisvalid check it would pass the
+    probe forever while indexing nothing."""
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl())
+        cur.execute(
+            "CREATE TABLE queue_today PARTITION OF queue "
+            "FOR VALUES FROM (CURRENT_DATE) TO (CURRENT_DATE + 1)"
+        )
+        cur.execute("CREATE INDEX idx_queue_dedup_video ON ONLY queue ((payload->>'video_id'))")
+        cur.execute(
+            "SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video'"
+        )
+        assert cur.fetchone()[0] is False, "premise: ON ONLY leaves it invalid"
+    conn.commit()
+
+    # The name is taken by an invalid index, so ours cannot be created under it
+    # -- but the failure must be loud rather than a silent skip.
+    with pytest.raises((QueueError, psycopg2.Error)):
+        ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    conn.rollback()

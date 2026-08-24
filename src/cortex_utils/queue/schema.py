@@ -91,11 +91,12 @@ CREATE TABLE IF NOT EXISTS {table} (
 
 # Names, deliberately not idx_queue_pending / idx_queue_processing. migrate.py
 # already creates indexes under both of those on any migrated deployment, with
-# different column lists -- and _ensure_indexes treats a name that resolves as
-# "the index is there". Reusing either name would mean the canonical index is
-# silently never created on exactly the deployments that have been around
-# longest. That is this module's own subject matter: two definitions sharing an
-# identifier, with the difference invisible until a query is slow.
+# different column lists, and renames them onto queue -- so they are indexes on
+# this table and _index_present finds them. Reusing either name would mean the
+# canonical index is silently never created on exactly the deployments that have
+# been around longest, and a claim() that quietly stopped having an index. That
+# is this module's own subject matter: two definitions sharing an identifier,
+# with the difference invisible until a query is slow.
 CLAIM_INDEX = "idx_{table}_claim"
 STALE_INDEX = "idx_{table}_stale"
 
@@ -293,10 +294,20 @@ def _index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bo
     index is there" means the CREATE is skipped forever and the index silently
     never exists. Opening the name space to consumers is what makes that
     collision realistic rather than theoretical.
+
+    indisvalid for the same reason one step further in: CREATE INDEX ON ONLY a
+    partitioned parent leaves an invalid index, which resolves and joins and
+    would otherwise pass this check forever while indexing nothing.
+
+    Takes a cursor rather than a connection so it shares the caller's
+    transaction. The post-CREATE probe has to see the uncommitted index; opening
+    its own would commit the CREATE before checking it, which is the difference
+    between a mismatch rolling back cleanly and leaving an orphan index under a
+    name no later boot will look for.
     """
     cur.execute(
         "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s)",
+        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s) AND i.indisvalid",
         (name, table),
     )
     return cur.fetchone() is not None

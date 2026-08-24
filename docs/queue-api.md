@@ -384,9 +384,11 @@ Canonical indexes are applied first, so an extra that collides with
 
 The canonical indexes are deliberately **not** `idx_queue_pending` or
 `idx_queue_processing`. `migrate.py` already creates indexes under both of those
-names with different column lists, and the boot path reads a name that resolves
-as "the index is there" — so reusing either would mean the canonical index is
-silently never created on exactly the deployments that have been around longest.
+names with different column lists, and renames them onto `queue` — so they are
+indexes on this table and the probe finds them. Reusing either name would mean
+the canonical index is silently never created on exactly the deployments that
+have been around longest, and a `claim()` that has quietly stopped having an
+index to use.
 Pick names of your own that collide with neither set.
 
 ---
