@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import re
+import warnings
 from typing import Literal
 
 import psycopg2
@@ -55,6 +56,13 @@ def ready_predicate(column: str = "next_attempt_at") -> str:
     Splice into the `claimable` CTE of a consumer's claim query.
     `column` must be a SQL identifier (alphanumeric/underscore only).
     """
+    warnings.warn(
+        "ready_predicate() splices SQL into a claim query the caller writes, "
+        "which is the library subsidising violations of its own rule that "
+        "cortex_utils owns the SQL touching the queue. Call claim() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not _COLUMN_NAME_RE.match(column):
         raise ValueError(f"Invalid column name: {column!r}")
     return f"({column} IS NULL OR {column} <= statement_timestamp())"
@@ -89,6 +97,15 @@ def fail_or_retry(
     The caller owns the transaction and is responsible for committing
     or rolling back.
     """
+    warnings.warn(
+        "cortex_utils.queue.retry.fail_or_retry is superseded by "
+        "cortex_utils.queue.ops.fail_or_retry, which matches the claim token so "
+        "a worker that stalled past its visibility timeout cannot report on a "
+        "row another worker has since re-claimed. Note the return value differs: "
+        'this returns "retrying" where ops returns "pending".',
+        DeprecationWarning,
+        stacklevel=2,
+    )
     truncated_error = str(error)[:error_max_chars]
 
     with conn.cursor() as cur:

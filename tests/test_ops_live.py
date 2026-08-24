@@ -305,3 +305,79 @@ def test_drop_partition_releases_the_lock_when_our_own_code_raises(conns):
             (partition,),
         )
         assert cur.fetchone()[0] == 0, "the lock outlived the failure"
+
+
+def test_a_worker_that_dies_on_the_last_attempt_is_retired_not_left_processing(
+    conns,
+) -> None:
+    """claim()'s recovery branch retires a row whose attempts are spent instead
+    of handing it back out. Nothing pinned that branch, and disabling it left
+    all 470 other tests green.
+
+    The cost of it not firing is not one stuck row. The row stays 'processing'
+    forever, so: it never becomes 'failed', so failures() never lists it and no
+    operator sees it; it is never archived to dead_letter, so the payload is
+    only in the partition; and drop_partition skips any partition holding a
+    processing row, so retention stops dropping that day -- permanently, and
+    silently. One dead branch, three modules of consequence.
+
+    Recovery only runs when someone claims on that queue, so a paused or dead
+    queue never self-heals either.
+    """
+    a, _ = conns
+    with a.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, claimed_at, attempts, "
+            "max_attempts) VALUES ('q', '{}'::jsonb, 'processing', "
+            "NOW() - INTERVAL '40 minutes', 3, 3) RETURNING id"
+        )
+        job_id = cur.fetchone()[0]
+    a.commit()
+
+    # The claim finds nothing to hand out -- the point is what it did on the way.
+    assert claim(a, "q", worker="w1") == []
+
+    with a.cursor() as cur:
+        cur.execute("SELECT status, last_error FROM queue WHERE id = %s", (job_id,))
+        status, last_error = cur.fetchone()
+    a.commit()
+    assert status == "failed", (
+        f"row left {status!r} with its attempts spent -- it will never surface in "
+        "failures(), never reach dead_letter, and will pin its partition against "
+        "retention for good"
+    )
+    assert last_error, "retired without saying why"
+
+
+def test_a_per_connection_timezone_override_is_reported(conns, capsys) -> None:
+    """Partition routing rests on every connection agreeing about what day it
+    is. CURRENT_DATE and the FROM/TO bounds on a TIMESTAMPTZ column are both
+    TimeZone-dependent, so two connections that disagree put each day's boundary
+    rows in the wrong partition -- and drop_old_partitions compares a
+    name-derived date against a differently-framed cutoff, so it drops silently
+    rather than failing loudly.
+
+    PGOPTIONS is already the schema-selection knob here (`-c search_path=cryo`)
+    and carries `-c timezone=` too, so this is one env var away. The invariant
+    used to live only in a docstring.
+
+    A warning rather than an error: a deployment where every connection sets the
+    same zone this way is consistent. What one connection cannot check is
+    whether the others agree, so this reports the thing that makes disagreement
+    possible and leaves the judgement to whoever set it.
+    """
+    from cortex_utils.queue.ops import server_today
+
+    # capsys, not caplog: this package logs through its own stderr logger rather
+    # than the stdlib root, precisely so importing it does not reconfigure a
+    # consumer's logging. caplog would see nothing and the test would pass while
+    # asserting nothing.
+    a, _ = conns
+    server_today(a)
+    assert "TimeZone" not in capsys.readouterr().err, "a server-inherited zone is not a finding"
+
+    with a.cursor() as cur:
+        cur.execute("SET TIME ZONE 'America/New_York'")
+    server_today(a)
+    assert "TimeZone is overridden per connection" in capsys.readouterr().err
+    a.rollback()

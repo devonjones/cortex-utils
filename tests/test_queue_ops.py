@@ -114,7 +114,7 @@ class FakeCursor:
     def fetchone(self) -> Any:
         if self._pending_date:
             self._pending_date = False
-            return (SERVER_TODAY,)
+            return (SERVER_TODAY, "UTC", "default")
         if self._pending_parent:
             self._pending_parent = False
             return None if self.no_queue_table else (1,)

@@ -210,8 +210,10 @@ The whole overview in **one round trip**, cheap enough to poll.
 QueueHealth(
     depths: list[QueueDepth],
     dead_letter: int,
+    partitioned: bool,
     partition_headroom_days: int | None,
     self_healed_partitions: int,
+    oldest_partition_age_days: int | None,
     server_time: datetime,
 )
 ```
@@ -227,6 +229,14 @@ gap between is `0`, not `7`, because the insert on the first uncovered day
 fails. So `0` means tomorrow's writes already fail, and `None` means today is
 uncovered and writes are failing now. A monitor should be able to tell those
 apart, which is why the second is not reported as `-1` or `0`.
+
+`oldest_partition_age_days` is how far back the oldest still-attached partition
+goes. Compare it against the `retention_days` your cron runs with: climbing past
+that means retention has stopped dropping. It does that **silently** — one stuck
+`pending` or `processing` row keeps its whole partition indefinitely under the
+default `force=False`, and the skip count appears only in `maintain()`'s return
+value. It is deliberately *not* part of `.is_healthy`, because what counts as
+too old is your retention window, which this library does not know.
 
 `self_healed_partitions` counts partitions the *write path* had to create
 because scheduled maintenance had stopped. Non-zero means maintenance is dead;
@@ -550,6 +560,28 @@ one is free, because partitioning forces it into the primary key so the CTE has
 the row in hand anyway, and without it a consumer needing the age of the work
 runs a second query per claimed row. Worth a `TypedDict` now the set has
 settled.
+
+**Two entry points are deprecated as of this release.**
+`cortex_utils.queue.retry.fail_or_retry` and `ready_predicate` now raise
+`DeprecationWarning`. Use `ops.fail_or_retry` (it matches the claim token) and
+`claim()`. Note the return values differ: the legacy one says `"retrying"` where
+`ops` says `"pending"`, so swapping the import without updating an
+`== "retrying"` check gives you a comparison that is silently always false.
+
+`__all__` now lists only the surface you should reach for — boot, work, watch,
+operate. Everything else stays importable by name from `cortex_utils.queue`;
+nothing was removed. It is simply no longer advertised, because the package had
+accumulated two inspection APIs, two ways to create the schema, and every
+migration internal at top level, which invited callers to run the pieces that
+`ensure_queue_schema()` exists to sequence.
+
+**A forced partition drop is not free.** `drop_partition(force=True)`
+re-enqueues live rows into today's partition, carrying `priority` and
+`next_attempt_at` but resetting `attempts` — the job is being relocated, not
+retried. Rows in `processing` get a *second, pending copy* while the original
+worker is still running, so the work may execute twice and that worker's report
+then bounces against a row that no longer exists. It is for unwedging retention,
+not routine maintenance.
 
 **No LISTEN/NOTIFY.** Cortex polls. Keep any notify trigger consumer-side for
 now; when it moves here it moves with a validated `channel` parameter.

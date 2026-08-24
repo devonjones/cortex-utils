@@ -323,8 +323,32 @@ def server_today(conn: psycopg2.extensions.connection) -> date:
     against a differently-framed cutoff and would drop silently.
     """
     with _tx(conn) as cur:
-        cur.execute("SELECT CURRENT_DATE")
-        return cur.fetchone()[0]
+        # Folded into the same round trip the date already costs. pg_settings
+        # reports where the value came from; 'client' or 'session' means this
+        # connection was handed its own TimeZone rather than inheriting the
+        # server's, which is exactly how two connections on one queue end up
+        # framing day boundaries differently.
+        cur.execute(
+            "SELECT CURRENT_DATE, current_setting('TimeZone'), "
+            "(SELECT source FROM pg_settings WHERE name = 'TimeZone')"
+        )
+        today, zone, source = cur.fetchone()
+    if source in ("client", "session"):
+        # A warning, not an error: a deployment where every connection sets the
+        # same zone this way is consistent and fine. What cannot be checked from
+        # one connection is whether the OTHER ones agree -- so this reports the
+        # thing that makes disagreement possible, and leaves the judgement to
+        # whoever set it.
+        log.warning(
+            "Session TimeZone is overridden per connection, not inherited from "
+            "the server. Every connection operating this queue must agree: "
+            "CURRENT_DATE and the partition bounds are both TimeZone-dependent, "
+            "and drop_old_partitions compares a name-derived date against a "
+            "differently-framed cutoff -- it would drop silently, not loudly.",
+            timezone=zone,
+            source=source,
+        )
+    return today
 
 
 _ATTACHED_SQL = """

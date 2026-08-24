@@ -82,7 +82,9 @@ def _manager_capturing_sql(
         elif sql.strip().startswith("SHOW search_path"):
             answered_meta.append(("public",))
         elif sql.strip().startswith("SELECT CURRENT_DATE"):
-            answered_meta.append((SERVER_TODAY,))
+            # (date, zone, source) -- server_today() reads all three in one
+            # round trip so the TimeZone-override check costs no extra trip.
+            answered_meta.append((SERVER_TODAY, "UTC", "default"))
 
     def _fetchone() -> Row | None:
         if answered_meta:
@@ -96,6 +98,31 @@ def _manager_capturing_sql(
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
     return PartitionManager(conn), executed
+
+
+@pytest.fixture
+def stub_dead_letter_ddl(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """maintain() ensures dead_letter before archiving into it. That is real DDL
+    and belongs in the live suite (test_partitions_live.py proves it against a
+    schema whose table has been dropped); driving it against a MagicMock only
+    tests the mock. Stubbed so these stay focused on create/drop ordering and
+    the window arithmetic -- via monkeypatch, so the module global is restored.
+
+    Returns the call log, so a test can still assert the call happened.
+    """
+    import cortex_utils.queue.partitions as mod
+
+    calls: list[str] = []
+
+    class _Stub:
+        def __init__(self, conn: Any) -> None:
+            pass
+
+        def ensure_table(self) -> None:
+            calls.append("ensure_table")
+
+    monkeypatch.setattr(mod, "DeadLetterManager", _Stub)
+    return calls
 
 
 def test_lookups_bind_parent_by_search_path_not_bare_name() -> None:
@@ -466,7 +493,7 @@ def test_maintain_forwards_dry_run_to_both_halves() -> None:
     assert result["dry_run"] is True, "and must say so, or the log reads as a real run"
 
 
-def test_maintain_creates_before_it_drops() -> None:
+def test_maintain_creates_before_it_drops(stub_dead_letter_ddl: list[str]) -> None:
     """Drop-then-create leaves a window with no partition for today: the write
     path self-heals, but only after an insert has already failed."""
     manager, _ = _manager_capturing_sql()
@@ -477,9 +504,13 @@ def test_maintain_creates_before_it_drops() -> None:
     manager.maintain()
 
     assert order == ["create", "drop"]
+    assert stub_dead_letter_ddl == ["ensure_table"], (
+        "maintain() must ensure dead_letter before archiving into it -- it runs "
+        "from cron on a host that may never boot a service"
+    )
 
 
-def test_maintain_reports_both_halves_and_its_own_mode() -> None:
+def test_maintain_reports_both_halves_and_its_own_mode(stub_dead_letter_ddl: list[str]) -> None:
     """The cron's only output. Losing a key here makes a run that dropped
     nothing indistinguishable from one that dropped everything."""
     manager, _ = _manager_capturing_sql()
@@ -501,7 +532,7 @@ def test_maintain_reports_both_halves_and_its_own_mode() -> None:
     }
 
 
-def test_maintain_passes_its_windows_through() -> None:
+def test_maintain_passes_its_windows_through(stub_dead_letter_ddl: list[str]) -> None:
     """retention_days and days_ahead swapped would retire three days of live
     partitions and create a week of empty ones."""
     manager, _ = _manager_capturing_sql()

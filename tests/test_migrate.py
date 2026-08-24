@@ -41,7 +41,7 @@ class FakeCursor:
         self.executed.append((sql, params))
         self._next = None
         if "CURRENT_DATE" in sql:
-            self._next = (SERVER_TODAY,)
+            self._next = (SERVER_TODAY, "UTC", "default")
             return
         if "to_regclass('queue_old')" in sql and "to_regclass('queue_old')" not in self.answers:
             self._next = (1,)
