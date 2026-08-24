@@ -87,14 +87,22 @@ class QueueHealth:
     partition_headroom_days: int | None
     self_healed_partitions: int
     partition_count: int
-    """How many partitions are attached to the queue.
+    """How many DATED partitions are attached to the queue.
+
+    A DEFAULT partition is not counted: it has no date, so retention cannot
+    reason about it and `oldest_partition_age_days` cannot include it. Counting
+    it would break the invariant this field exists for -- that a non-zero count
+    means the age is meaningful.
 
     Here so that `oldest_partition_age_days is None` can be read without
-    guessing. On a partitioned table that None means ZERO PARTITIONS -- the
-    worst state the queue can be in, since no row can be written at all -- and
-    the obvious `if age is not None` guard goes silent on exactly that case.
-    Reported directly rather than left to be inferred, because it was inferred
-    wrongly twice: cryo wrote the silent guard, and so did I.
+    guessing: with this at 0 on a partitioned table, there is nothing retention
+    can drop and nothing the age can describe. The obvious `if age is not None`
+    guard goes silent on that case, which is why it is reported directly rather
+    than left to be inferred -- it was inferred wrongly twice, by cryo and by me.
+
+    `partitioned` alone already separates a plain queue from a partitioned one
+    with no partitions; what this adds is the count itself, and the guarantee
+    that a non-zero value means the age field is real.
 
     `is_healthy` already covers it (headroom is None there too), and that
     remains the signal to alert on. This is for anything reading the age field
@@ -259,7 +267,13 @@ partitions AS (
         -- retention_days and keeps climbing -- and it costs nothing to read
         -- here, because partition_days is already materialised above.
         (SELECT CURRENT_DATE - MIN(day) FROM partition_days) AS oldest_partition_age_days,
-        (SELECT COUNT(*) FROM partition_days) AS partition_count
+        -- COUNT(day), not COUNT(*). A DEFAULT partition's bound is the literal
+        -- DEFAULT, so the regexp above yields a NULL day: COUNT(*) counted it
+        -- while MIN(day) ignored it, which broke the one invariant this field
+        -- exists to provide -- a table with only a DEFAULT partition reported
+        -- count=1 with age=None, so "count > 0 means the age is meaningful" was
+        -- false exactly where a caller would rely on it.
+        (SELECT COUNT(day) FROM partition_days) AS partition_count
 )
 SELECT
     COALESCE(

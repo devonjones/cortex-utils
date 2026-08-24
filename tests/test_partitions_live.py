@@ -235,3 +235,44 @@ def test_a_broken_dead_letter_does_not_cost_the_write_path_its_headroom(conn) ->
         f"partitions {before} -> {after}: the horizon was not extended, so a "
         "broken dead_letter now breaks the write path too"
     )
+
+
+def test_partition_count_counts_real_partitions_and_ignores_the_default(conn) -> None:
+    """The field was shipped with no assertion that it is ever non-zero.
+
+    Replacing its SQL with a constant `0` left all 493 tests green -- the mock
+    test asserts a number it supplies itself, and the only live assertion was
+    `== 0`, which a hardcoded zero satisfies. So the one thing the field exists
+    to say ("count > 0, therefore the age is meaningful") was never checked.
+
+    Also pins the DEFAULT-partition case. A DEFAULT partition has no date, so
+    the age cannot include it; counting it made `count=1, age=None` reachable
+    and broke that invariant on exactly the table an operator creates when they
+    are trying to stop a missing-partition outage.
+    """
+    from cortex_utils.queue.inspect import health
+
+    mgr = PartitionManager(conn)
+    mgr.create_future_partitions(days_ahead=3)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('queue')")
+        attached = cur.fetchone()[0]
+    conn.commit()
+
+    h = health(conn)
+    assert h.partition_count == attached > 0, (
+        f"partition_count={h.partition_count} but {attached} partitions are attached"
+    )
+    assert h.oldest_partition_age_days is not None, "a non-zero count must mean a real age"
+
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE queue_default PARTITION OF queue DEFAULT")
+    conn.commit()
+
+    h2 = health(conn)
+    assert h2.partition_count == attached, (
+        "a DEFAULT partition has no date and must not be counted -- counting it "
+        "makes count > 0 stop implying that the age is meaningful"
+    )
+    assert h2.oldest_partition_age_days == h.oldest_partition_age_days
+    conn.rollback()
