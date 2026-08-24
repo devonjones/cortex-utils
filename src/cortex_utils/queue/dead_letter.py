@@ -343,11 +343,18 @@ class DeadLetterManager:
             "dismissed_at": row[11],
         }
 
-    def retry_job(self, dead_letter_id: int, dry_run: bool = False) -> bool:
+    def retry_job(self, dead_letter_id: int, dry_run: bool = False, priority: int = 0) -> bool:
         """Re-enqueue a dead letter job, keeping the archive row.
 
         `dead_letter_id` is an id in THIS table, not a queue id -- both number
         from 1, so passing the wrong one would resurrect an unrelated payload.
+
+        `priority` is the re-enqueued job's priority, NOT the failed job's --
+        dead_letter does not record what that was. It defaults to 0, which is
+        right for an operator retrying one recent failure. Pass -100 for any
+        bulk or historical retry: that is the documented backfill priority, and
+        without it a few hundred archived jobs are re-queued level with live
+        traffic and drain ahead of mail that has not arrived yet.
 
         The row is stamped with retried_at/retried_as rather than deleted. It
         used to be deleted, which erased the only evidence the item had ever
@@ -391,7 +398,9 @@ class DeadLetterManager:
         # commit=False so the re-enqueue and the stamp land in one transaction:
         # committing separately would let a crash between them leave the job
         # queued with no record of where it came from.
-        new_id = enqueue(self.conn, job["queue_name"], job["payload"], commit=False)
+        new_id = enqueue(
+            self.conn, job["queue_name"], job["payload"], priority=priority, commit=False
+        )
 
         with self.conn.cursor() as cur:
             # The guards above read through get_job() and decided in Python;
@@ -476,8 +485,12 @@ class DeadLetterManager:
         queue_name: str | None = None,
         since: timedelta | None = None,
         dry_run: bool = False,
+        priority: int = 0,
     ) -> int:
         """Retry multiple dead letter jobs matching criteria.
+
+        `priority` is passed through to each re-enqueue. This is the bulk entry
+        point, so -100 is almost always what you want here -- see retry_job.
 
         Returns count of jobs retried.
         """
@@ -489,7 +502,7 @@ class DeadLetterManager:
             # and every remaining job in the batch fails for a reason that has
             # nothing to do with it, losing the partial progress.
             try:
-                if self.retry_job(job["id"], dry_run=dry_run):
+                if self.retry_job(job["id"], dry_run=dry_run, priority=priority):
                     retried += 1
             except psycopg2.Error as exc:
                 self.conn.rollback()

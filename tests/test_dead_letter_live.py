@@ -883,3 +883,33 @@ def test_the_migration_branch_also_proves_its_index(legacy_conn) -> None:
     with pytest.raises(QueueError, match="did not create an index named"):
         DeadLetterManager(legacy_conn).ensure_lifecycle_columns()
     legacy_conn.rollback()
+
+
+def test_a_retried_job_lands_at_the_priority_the_caller_asked_for(conn) -> None:
+    """The half a mock cannot see: that the priority reaches the queue ROW.
+
+    retry_jobs could pass it through faithfully and retry_job could still drop
+    it on the way to enqueue(), and every mock-level assertion would still pass.
+    This reads it back off the re-queued job.
+    """
+    mgr = DeadLetterManager(conn)
+    mgr.ensure_table()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+            "created_at, failed_at, archived_from_partition) VALUES "
+            "(1, 'q', %s::jsonb, 3, NOW(), NOW(), 'queue_2026_01_01') RETURNING id",
+            ('{"n": 1}',),
+        )
+        dl_id = cur.fetchone()[0]
+    conn.commit()
+
+    assert mgr.retry_job(dl_id, priority=-100) is True
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT priority FROM queue WHERE queue_name = 'q'")
+        assert cur.fetchone()[0] == -100, (
+            "the re-queued job did not get the backfill priority -- it will "
+            "drain level with real-time traffic"
+        )
+    conn.commit()
