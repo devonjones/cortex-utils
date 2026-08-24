@@ -400,6 +400,14 @@ def dead_letter_show(ctx: click.Context, job_id: int) -> None:
 @click.option("--queue", "queue_name", help="Retry all jobs from queue")
 @click.option("--since", help="Only jobs failed within duration")
 @click.option("--dry-run", is_flag=True, help="Show what would be done")
+@click.option(
+    "--priority",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Priority for the re-queued jobs. Use -100 for a bulk or historical "
+    "retry so it drains behind live traffic.",
+)
 @click.pass_context
 def dead_letter_retry(
     ctx: click.Context,
@@ -407,8 +415,17 @@ def dead_letter_retry(
     queue_name: str | None,
     since: str | None,
     dry_run: bool,
+    priority: int,
 ) -> None:
-    """Retry dead letter jobs."""
+    """Retry dead letter jobs.
+
+    \b
+    --priority exists because this is the command that does bulk re-processing,
+    and the library default of 0 puts re-queued work level with real-time mail.
+    Without the flag the operator-facing tool could not do the thing the
+    priority parameter was added for: a 929-row retry went in at -100 only by
+    bypassing this command entirely.
+    """
     config = ctx.obj["config"]
     conn = get_connection(config)
 
@@ -423,7 +440,7 @@ def dead_letter_retry(
         dlm.ensure_table()
 
         if job_id:
-            if dlm.retry_job(job_id, dry_run=dry_run):
+            if dlm.retry_job(job_id, dry_run=dry_run, priority=priority):
                 click.echo(f"Retried job {job_id}")
             else:
                 # "not found" for a row the operator can see in the list, with
@@ -431,7 +448,12 @@ def dead_letter_retry(
                 click.echo(f"Did not retry job {job_id}: {dlm.why_not_retryable(job_id)}", err=True)
                 ctx.exit(1)
         else:
-            count = dlm.retry_jobs(queue_name=queue_name, since=since_delta, dry_run=dry_run)
+            count = dlm.retry_jobs(
+                queue_name=queue_name,
+                since=since_delta,
+                dry_run=dry_run,
+                priority=priority,
+            )
             click.echo(f"Retried {count} jobs")
     finally:
         conn.close()

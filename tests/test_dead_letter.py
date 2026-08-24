@@ -439,3 +439,50 @@ def test_a_bulk_retry_can_ask_for_backfill_priority() -> None:
 
     mgr.retry_jobs()
     assert seen[-1] == 0, "the default must stay 0 for a one-off operator retry"
+
+
+def test_the_cli_can_ask_for_backfill_priority() -> None:
+    """The flag, not just the parameter.
+
+    #48 added `priority` so a bulk dead-letter retry could go in at -100. The
+    operator-facing command never got the flag, so the documented tool for that
+    job still could not do it -- the 929-row production retry went in at -100
+    only by bypassing the CLI. A parameter no interface exposes is not shipped.
+    """
+    from click.testing import CliRunner
+
+    from cortex_utils.cli import main
+
+    help_text = CliRunner().invoke(main, ["dead-letter", "retry", "--help"]).output
+    assert "--priority" in help_text, "the flag is missing from the command"
+    assert "-100" in help_text, "the help must say which value a bulk retry wants"
+
+    # And that it actually reaches the manager. Asserting only on --help passes
+    # while the value is parsed and dropped -- deleting the parameter from the
+    # function signature left the help text intact and the suite green.
+    seen: dict[str, int] = {}
+
+    class _Manager:
+        def __init__(self, conn: object) -> None:
+            pass
+
+        def ensure_table(self) -> None:
+            pass
+
+        def retry_jobs(self, *, priority: int, **kw: object) -> int:
+            seen["priority"] = priority
+            return 0
+
+    import cortex_utils.cli as cli_mod
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cli_mod, "DeadLetterManager", _Manager)
+    monkey.setattr(cli_mod, "get_connection", lambda config: MagicMock())
+    try:
+        result = CliRunner().invoke(
+            main, ["dead-letter", "retry", "--queue", "q", "--priority", "-100", "--dry-run"]
+        )
+    finally:
+        monkey.undo()
+    assert result.exit_code == 0, result.output
+    assert seen.get("priority") == -100, f"the flag never reached retry_jobs: {seen}"

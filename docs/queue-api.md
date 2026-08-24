@@ -233,11 +233,17 @@ apart, which is why the second is not reported as `-1` or `0`.
 
 > **Do not read `oldest_partition_age_days` on its own.** `None` means two
 > opposite things: on a non-partitioned queue there is simply nothing to age,
-> and on a **partitioned** one it means *zero partitions attached* — the worst
-> state the queue can be in, because no row can be written at all. The obvious
+> and on a **partitioned** one it means no dated partition exists — so retention
+> has nothing to drop and the queue cannot be written to by date. The obvious
 > `if age is not None and age > retention` guard goes silent on exactly that
-> case. Check `partition_count` (or `partitioned`) alongside it. `is_healthy` is
+> case. Pair it with `partition_count`, which counts **dated** partitions only:
+> a non-zero count is the guarantee that the age is meaningful. `is_healthy` is
 > already False there and remains the thing to alert on.
+>
+> The field can also go **negative** — a queue whose only partitions are in the
+> future reports the days until the earliest one. `partitioned` on its own
+> already separates a plain queue from a partitioned one with no partitions;
+> what `partition_count` adds is the count and that guarantee.
 
 `oldest_partition_age_days` is how far back the oldest still-attached partition
 goes. Compare it against the `retention_days` your cron runs with: climbing past

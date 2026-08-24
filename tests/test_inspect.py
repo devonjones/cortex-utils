@@ -21,7 +21,7 @@ from cortex_utils.queue.inspect import (
     resubmit,
     stuck,
 )
-from cortex_utils.queue.ops import SELF_HEALED_MARKER, QueueError
+from cortex_utils.queue.ops import SELF_HEALED_MARKER, JobNotFailedError, QueueError
 
 NOW = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 
@@ -307,8 +307,17 @@ def test_a_cancel_that_hit_no_row_rolls_back_the_new_one() -> None:
     and reporting success would leave the work queued twice."""
     conn = _resubmit_conn()
     conn.cur.rowcount = 0
-    with pytest.raises(QueueError, match="rolled back"):
+    with pytest.raises(QueueError, match="rolled back") as caught:
         resubmit(conn, 5)
+    # And specifically NOT the skippable one. JobNotFailedError is a QueueError,
+    # so `pytest.raises(QueueError)` above passes either way -- collapsing this
+    # path into it left the whole suite green, and a batch caller doing
+    # `except JobNotFailedError: continue` would then swallow a broken internal
+    # invariant and report it as a stale click. That is the exact outcome the
+    # subclass was added to prevent, so it is asserted where it happens.
+    assert not isinstance(caught.value, JobNotFailedError), (
+        "the cancel-rollback path is a bug, not a row to skip"
+    )
     conn.commit.assert_not_called()
     conn.rollback.assert_called_once()
 
