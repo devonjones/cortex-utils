@@ -22,6 +22,8 @@ its absence.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import psycopg2
 import structlog
 
@@ -181,11 +183,28 @@ def missing_columns(conn: psycopg2.extensions.connection, table: str = "queue") 
     return _inspect(conn, table)[2]
 
 
-def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue") -> str:
+def ensure_queue_table(
+    conn: psycopg2.extensions.connection,
+    table: str = "queue",
+    extra_indexes: Sequence[tuple[str, str]] = (),
+) -> str:
     """Make `table` exist with the canonical shape. Safe on every boot.
 
     Returns "created" if this call made it, "present" if it was already there
     and compatible.
+
+    `extra_indexes` is (name, CREATE INDEX statement) pairs a consumer needs on
+    top of the canonical ones -- per-queue partial unique indexes for dedup, a
+    payload expression index. They are applied with the same discipline as ours:
+    the catalogue is asked first, because CREATE INDEX IF NOT EXISTS still takes
+    a lock and waits on an open writer even when the index is already there, and
+    this runs on every boot.
+
+    Passing them here rather than keeping a private migration is the point. A
+    consumer that adopts this function and deletes its own DDL otherwise loses
+    those indexes silently -- nothing here would put them back, and the absence
+    shows up as a slow query or a constraint that has quietly stopped
+    constraining. Hand them over instead.
 
     Raises QueueError if it exists but is missing columns the primitives need.
     Adding them here is not safe to do silently: this package cannot know
@@ -208,7 +227,7 @@ def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue
                 table=table,
                 hint="run migrate-queue to partition it; retention needs partitions",
             )
-        _ensure_indexes(conn, table)
+        _ensure_indexes(conn, table, extra_indexes)
         return "present"
 
     if exists:
@@ -223,19 +242,23 @@ def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue
 
     with _tx(conn) as cur:
         cur.execute(queue_ddl(table))
-    _ensure_indexes(conn, table)
+    _ensure_indexes(conn, table, extra_indexes)
     log.info("Created queue table", table=table)
     return "created"
 
 
-def _ensure_indexes(conn: psycopg2.extensions.connection, table: str) -> None:
+def _ensure_indexes(
+    conn: psycopg2.extensions.connection,
+    table: str,
+    extra: Sequence[tuple[str, str]] = (),
+) -> None:
     """Create any missing index, asking first.
 
     CREATE INDEX IF NOT EXISTS still takes a lock and waits on an open writer
     even when the index is already there, and its queued ShareLock times out
     inserts behind it. This runs on every boot, so it asks the catalogue.
     """
-    for name, statement in queue_indexes(table):
+    for name, statement in [*queue_indexes(table), *extra]:
         with _tx(conn) as cur:
             cur.execute("SELECT to_regclass(%s)", (name,))
             if cur.fetchone()[0] is not None:

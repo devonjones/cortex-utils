@@ -430,3 +430,119 @@ def test_both_entry_points_agree_about_what_a_queue_is(conn) -> None:
     with pytest.raises(QueueTableNotFoundError):
         has_claim_token_column(conn)
     conn.rollback()
+
+
+# --- indexes a consumer hands over -------------------------------------------
+
+CRYO_DEDUP = (
+    "idx_queue_dedup_video",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup_video ON queue "
+    "((payload->>'video_id'), created_at) WHERE queue_name = 'drain'",
+)
+
+
+def test_a_consumer_index_is_created_alongside_the_canonical_ones(conn) -> None:
+    """The point of taking these: a consumer that adopts ensure_queue_table and
+    deletes its own DDL otherwise loses them silently -- nothing here would put
+    them back, and the absence shows up as a slow query or a constraint that has
+    quietly stopped constraining."""
+    assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "created"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 't_schema' AND tablename = 'queue'"
+        )
+        names = {r[0] for r in cur.fetchall()}
+    assert {"idx_queue_claim", "idx_queue_stale", "idx_queue_dedup_video"} <= names
+
+
+def test_a_partial_unique_index_dedups_within_a_transaction_only(conn) -> None:
+    """Recorded because a consumer relies on one as a "dedup backstop".
+
+    The truth is narrower than either "it works" or "it does nothing". A unique
+    index on a partitioned table must include the partition key, so the key is
+    (payload->>'video_id', created_at). NOW() is transaction_timestamp(), so two
+    inserts in ONE transaction share a created_at and the index catches the
+    second. Two producers in SEPARATE transactions get different timestamps and
+    both rows satisfy it.
+
+    Concurrent producers are the case dedup exists for, so as a backstop it is
+    not one. That is why enqueue() takes a transaction-scoped advisory lock.
+    Handing the index over is still right -- it serves lookups -- it just must
+    not be mistaken for the thing keeping duplicates out.
+    """
+    ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    _today_partition(conn)
+    row = "INSERT INTO queue (queue_name, payload) VALUES ('drain', %s::jsonb)"
+    payload = '{"video_id": "v1"}'
+
+    # Same transaction: caught.
+    with pytest.raises(psycopg2.errors.UniqueViolation):
+        with conn.cursor() as cur:
+            cur.execute(row, (payload,))
+            cur.execute(row, (payload,))
+    conn.rollback()
+
+    # Separate transactions, which is what two producers actually are: not caught.
+    other = psycopg2.connect(DSN)
+    try:
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_schema")
+            cur.execute(row, (payload,))
+        other.commit()
+        with conn.cursor() as cur:
+            cur.execute(row, (payload,))
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM queue WHERE payload->>'video_id' = 'v1'")
+            assert cur.fetchone()[0] == 2, (
+                "if this is ever 1 the index started backstopping and this note is stale"
+            )
+    finally:
+        other.rollback()
+        other.close()
+
+    # The thing that does hold across producers.
+    assert enqueue(conn, "drain", {"video_id": "v2"}, dedup_key="video_id") is not None
+    assert enqueue(conn, "drain", {"video_id": "v2"}, dedup_key="video_id") is None
+
+
+def test_consumer_indexes_are_asked_about_before_being_created(conn) -> None:
+    """Same discipline as the canonical ones: CREATE INDEX IF NOT EXISTS still
+    takes a lock and waits on an open writer even when the index exists, and
+    this runs on every boot."""
+    ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    _today_partition(conn)
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_schema")
+        other.autocommit = False
+        with other.cursor() as cur:
+            cur.execute("INSERT INTO queue (queue_name, payload) VALUES ('t', '{}'::jsonb)")
+
+        conn.rollback()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '2000ms'")
+        conn.autocommit = False
+
+        assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "present"
+    finally:
+        other.rollback()
+        other.close()
+
+
+def test_a_boot_without_them_does_not_remove_them(conn) -> None:
+    """ensure_queue_table only ever creates. A caller that forgets to pass its
+    indexes on one boot must not lose them -- the failure should be that they
+    were never made, not that they were taken away."""
+    ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    assert ensure_queue_table(conn) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('idx_queue_dedup_video')")
+        assert cur.fetchone()[0] is not None

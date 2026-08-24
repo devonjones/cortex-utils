@@ -283,6 +283,77 @@ exception to grep for.
 
 ---
 
+## The table
+
+```python
+from cortex_utils.queue import ensure_queue_table, missing_columns, queue_ddl
+
+ensure_queue_table(conn)     # on boot; idempotent. "created" or "present"
+missing_columns(conn)        # [] means the shape is compatible
+```
+
+The table shape **is** the contract — every primitive compiles assumptions
+about the status values, `attempts`/`max_attempts`, `next_attempt_at`,
+`claimed_by` and the partition key. Maintaining your own copy means maintaining
+half of an interface whose other half lives here, and the two drift silently.
+
+`ensure_queue_table()` **only ever creates.** It contains no `DROP` and no
+`ALTER`. If the table exists and is missing columns the primitives need, it
+raises and names them, along with the migration for each — adding them silently
+would take `ACCESS EXCLUSIVE` on a live queue, and this package cannot tell a
+table that predates a column from one you shape deliberately.
+
+### What it owns, and what stays yours
+
+It owns the columns in `REQUIRED_COLUMNS`, the status `CHECK`, the partition
+key, and exactly two indexes: `idx_queue_claim` and `idx_queue_stale`, which
+`claim()`'s own queries need.
+
+**Hand your own indexes over rather than keeping a private migration.** If you
+need more — a per-queue partial index, a payload expression index — pass them:
+
+```python
+ensure_queue_table(conn, extra_indexes=[
+    ("idx_queue_dedup_video",
+     "CREATE INDEX IF NOT EXISTS idx_queue_dedup_video ON queue "
+     "((payload->>'video_id')) WHERE queue_name = 'drain'"),
+])
+```
+
+They get the same discipline as the canonical ones: the catalogue is asked
+before each `CREATE INDEX`, because `IF NOT EXISTS` still takes a lock and waits
+on an open writer even when the index is already there, and this runs on every
+boot.
+
+This matters at the moment of adoption. `ensure_queue_table()` only ever
+creates — it will not remove an index you made — but a consumer that adopts it
+and *deletes its own DDL* loses those indexes on any fresh deployment, and the
+absence is silent until the query they served turns slow.
+
+`missing_columns()` treats extra columns as fine. Composing on top is the point;
+only absence is a problem.
+
+> **A partial unique index is not a dedup backstop.** Worth stating because it
+> reads like one. A unique index on a partitioned table must include the
+> partition key, so the key becomes `(your_field, created_at)`. `NOW()` is
+> `transaction_timestamp()`, so two inserts in *one* transaction share a
+> timestamp and the second is rejected — but two producers in *separate*
+> transactions get different ones and both rows satisfy the index. Concurrent
+> producers are the case dedup exists for. Use `dedup_key`, which takes a
+> transaction-scoped advisory lock; keep the index for lookups if it earns its
+> place.
+
+### Naming
+
+The canonical indexes are deliberately **not** `idx_queue_pending` or
+`idx_queue_processing`. `migrate.py` already creates indexes under both of those
+names with different column lists, and the boot path reads a name that resolves
+as "the index is there" — so reusing either would mean the canonical index is
+silently never created on exactly the deployments that have been around longest.
+Pick names of your own that collide with neither set.
+
+---
+
 ## Setup
 
 Run once per schema, before first use:
