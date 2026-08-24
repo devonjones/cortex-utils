@@ -321,9 +321,11 @@ about the status values, `attempts`/`max_attempts`, `next_attempt_at`,
 `claimed_by` and the partition key. Maintaining your own copy means maintaining
 half of an interface whose other half lives here, and the two drift silently.
 
-`ensure_queue_table()` **only ever creates.** It contains no `DROP` and no
-`ALTER`. If the table exists and is missing columns the primitives need, it
-raises and names them, along with the migration for each — adding them silently
+`ensure_queue_table()` **only ever creates.** None of the SQL this package
+emits for it is a `DROP` or an `ALTER`. (Statements you pass in `extra_indexes`
+run verbatim — it does not inspect them, so that guarantee covers our half, not
+yours.) If the table exists and is missing columns the primitives need, it
+raises and names them, plus the migration for the two that have one — adding them silently
 would take `ACCESS EXCLUSIVE` on a live queue, and this package cannot tell a
 table that predates a column from one you shape deliberately.
 
@@ -368,6 +370,17 @@ only absence is a problem.
 > place.
 
 ### Naming
+
+Names are checked against `pg_index` bound to this table, not against
+`to_regclass`. A name that resolves to a table, a sequence, or an index on some
+*other* relation does not count as your index being present — otherwise the
+`CREATE` is skipped forever and the index silently never exists. The statement
+is also re-probed immediately after it runs, so a name that disagrees with what
+the statement actually creates is refused at the one moment that is provable
+rather than becoming a lock on every boot.
+
+Canonical indexes are applied first, so an extra that collides with
+`idx_queue_claim` is discarded rather than taking it over.
 
 The canonical indexes are deliberately **not** `idx_queue_pending` or
 `idx_queue_processing`. `migrate.py` already creates indexes under both of those

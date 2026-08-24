@@ -546,3 +546,92 @@ def test_a_boot_without_them_does_not_remove_them(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass('idx_queue_dedup_video')")
         assert cur.fetchone()[0] is not None
+
+
+def test_a_name_taken_by_something_that_is_not_an_index_does_not_count(conn) -> None:
+    """to_regclass resolving proves a name is taken, not that the index exists.
+    Reading it as proof means the CREATE is skipped forever and the index
+    silently never exists -- and opening the name space to consumers is what
+    makes that collision realistic rather than theoretical."""
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl())
+        cur.execute("CREATE TABLE idx_queue_dedup_video (x int)")  # squats the name
+    conn.commit()
+
+    with pytest.raises(QueueError, match="did not create an index"):
+        ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    conn.rollback()
+
+
+def test_a_statement_that_does_not_create_the_promised_name_is_refused(conn) -> None:
+    """A mismatch is not a one-off: with IF NOT EXISTS the statement runs on
+    every boot, taking exactly the lock the probe exists to avoid; without it,
+    the second boot raises DuplicateTable and the service gets no queue."""
+    mismatched = (
+        "idx_queue_promised",
+        "CREATE INDEX IF NOT EXISTS idx_queue_actual ON queue (queue_name)",
+    )
+    with pytest.raises(QueueError, match="idx_queue_promised"):
+        ensure_queue_table(conn, extra_indexes=[mismatched])
+    conn.rollback()
+
+
+def test_an_extra_cannot_take_over_a_canonical_index(conn) -> None:
+    """Canonical first. Reversed, a consumer silently replaces the index
+    claim() depends on -- this module's subject matter from the other side."""
+    hijack = (
+        "idx_queue_claim",
+        "CREATE INDEX IF NOT EXISTS idx_queue_claim ON queue (last_error)",
+    )
+    assert ensure_queue_table(conn, extra_indexes=[hijack]) == "created"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_claim' AND i.indrelid = to_regclass('queue')"
+        )
+        definition = cur.fetchone()[0]
+    assert "priority" in definition, f"the consumer took it over: {definition}"
+    assert "last_error" not in definition
+
+
+def test_an_index_added_later_arrives_on_the_present_path(conn) -> None:
+    """`present` is every boot after the first, and is how a consumer adds an
+    index once the table already exists -- the common case, not the rare one."""
+    assert ensure_queue_table(conn) == "created"
+    assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video' AND i.indrelid = to_regclass('queue')"
+        )
+        assert cur.fetchone() is not None
+
+
+def test_the_same_index_name_in_another_schema_is_not_ours(conn) -> None:
+    """The probe matches relname, which is schema-blind, so the binding to
+    THIS table's oid is what makes the answer mean anything. Without it, a
+    neighbouring schema that named an index the same thing makes our CREATE be
+    skipped forever -- the bare-relname shape that cost cortex 4.8 days, one
+    relation kind over.
+    """
+    with conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA other")
+        cur.execute("SET search_path = other")
+        cur.execute(queue_ddl())
+        cur.execute("CREATE INDEX idx_queue_dedup_video ON queue ((payload->>'video_id'))")
+        cur.execute("SET search_path = t_schema")
+    conn.commit()
+
+    assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "created"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video' "
+            "AND i.indrelid = to_regclass('t_schema.queue')"
+        )
+        assert cur.fetchone()[0] == 1, "our schema must get its own index"
