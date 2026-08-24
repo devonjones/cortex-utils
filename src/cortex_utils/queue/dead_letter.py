@@ -32,7 +32,7 @@ from typing import Any
 import psycopg2
 
 from cortex_utils.log import get_logger
-from cortex_utils.queue.ops import QueueError, enqueue, index_present
+from cortex_utils.queue.ops import QueueError, _tx, enqueue, index_present
 
 log = get_logger()
 
@@ -77,6 +77,10 @@ BASE_INDEXES: tuple[tuple[str, str], ...] = (
 # shape and raised UndefinedColumn, taking ensure_table() down before the
 # migration it was supposed to reach. Every deployment that already had the
 # table, which is every deployment this feature exists for.
+# Bound on every DDL statement in this module: fail fast rather than queue
+# ACCESS EXCLUSIVE behind a long read and time out the inserts stacked behind it.
+DDL_LOCK_TIMEOUT_MS = 5000
+
 LIFECYCLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_dead_letter_open
     ON dead_letter(failed_at DESC) WHERE dismissed_at IS NULL AND retried_at IS NULL
@@ -113,42 +117,12 @@ class DeadLetterManager:
         own cursor. ensure_queue_schema() advertises "every step pre-checks the
         catalogue"; this was the step that made that false.
         """
-        # SET LOCAL is a silent no-op under autocommit -- there is no
-        # transaction for it to be local to -- so the bound would not apply on
-        # exactly the connection shape a consumer is most likely to hand us.
-        # ensure_lifecycle_columns() fifty lines down already does this; this
-        # method did not.
-        was_autocommit = self.conn.autocommit
-        if was_autocommit:
-            self.conn.autocommit = False
-        try:
-            if not self._has_table():
-                with self.conn.cursor() as cur:
-                    cur.execute("SET LOCAL lock_timeout = '5000ms'")
-                    cur.execute(DEAD_LETTER_SCHEMA)
-                self.conn.commit()
+        if not self._has_table():
+            with _tx(self.conn, lock_timeout_ms=DDL_LOCK_TIMEOUT_MS) as cur:
+                cur.execute(DEAD_LETTER_SCHEMA)
 
-            for name, statement in BASE_INDEXES:
-                self._ensure_index(name, statement)
-        except Exception:
-            # Without this a DDL failure leaves the transaction aborted, and
-            # ensure_queue_schema()'s finally-unlock then raises
-            # InFailedSqlTransaction -- replacing the real error and leaving a
-            # SESSION-scoped advisory lock held for the life of the connection.
-            self.conn.rollback()
-            raise
-        finally:
-            if was_autocommit:
-                # Clear the transaction first. psycopg2 refuses to change the
-                # session mode inside one, and the catalogue probes above open
-                # a transaction whether or not any DDL follows -- so on the
-                # steady-state path, where everything already exists and
-                # nothing commits, restoring autocommit raised
-                # ProgrammingError and left the caller's connection silently
-                # flipped to non-autocommit on the way out. Every redeploy, on
-                # the connection shape this guard was added for.
-                self.conn.rollback()
-                self.conn.autocommit = True
+        for name, statement in BASE_INDEXES:
+            self._ensure_index(name, statement)
 
         self.ensure_lifecycle_columns()
         log.debug("Ensured dead_letter table exists")
@@ -170,29 +144,14 @@ class DeadLetterManager:
         """
         if self._has_index(name):
             return
-        # SET LOCAL is a silent no-op under autocommit, and this is reachable
-        # from ensure_lifecycle_columns() after ensure_table() has restored it.
-        was_autocommit = self.conn.autocommit
-        if was_autocommit:
-            self.conn.autocommit = False
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute("SET LOCAL lock_timeout = '5000ms'")
-                cur.execute(statement)
-            self.conn.commit()
-            if not self._has_index(name):
-                raise QueueError(
-                    f"{statement.strip()[:60]}... did not create an index named "
-                    f"{name!r} on dead_letter. Something else holds that name; "
-                    "the name is what every later boot checks."
-                )
-        except Exception:
-            self.conn.rollback()
-            raise
-        finally:
-            if was_autocommit:
-                self.conn.rollback()
-                self.conn.autocommit = True
+        with _tx(self.conn, lock_timeout_ms=DDL_LOCK_TIMEOUT_MS) as cur:
+            cur.execute(statement)
+        if not self._has_index(name):
+            raise QueueError(
+                f"{statement.strip()[:60]}... did not create an index named "
+                f"{name!r} on dead_letter. Something else holds that name; "
+                "the name is what every later boot checks."
+            )
         log.info("Created dead_letter index", index=name)
 
     def _has_table(self) -> bool:
@@ -230,34 +189,16 @@ class DeadLetterManager:
             self._ensure_index("idx_dead_letter_open", LIFECYCLE_INDEX)
             return False
 
-        # SET LOCAL is a silent no-op under autocommit -- there is no
-        # transaction for it to be local to -- and each ALTER would then commit
-        # on its own, so both the lock bound and the all-or-nothing property
-        # would be false exactly where this class does not own the connection.
-        # Only when it is actually on: psycopg2 refuses to change the session
-        # mode inside a transaction, and on a normal connection the probe above
-        # has already opened one -- where the commit below covers the ALTERs
-        # anyway, so there is nothing to fix.
-        was_autocommit = self.conn.autocommit
-        if was_autocommit:
-            self.conn.autocommit = False
-        try:
-            with self.conn.cursor() as cur:
-                # Fail fast rather than queue ACCESS EXCLUSIVE behind a long read.
-                cur.execute("SET LOCAL lock_timeout = '5000ms'")
-                for name in missing:
-                    cur.execute(
-                        f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
-                        f"{LIFECYCLE_COLUMNS[name]}"
-                    )
-                cur.execute(LIFECYCLE_INDEX)
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        finally:
-            if was_autocommit:
-                self.conn.autocommit = True
+        # All in one _tx: the bound and the all-or-nothing property both come
+        # from sharing a transaction, and a half-migrated table is worse than an
+        # unmigrated one.
+        with _tx(self.conn, lock_timeout_ms=DDL_LOCK_TIMEOUT_MS) as cur:
+            for name in missing:
+                cur.execute(
+                    f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
+                    f"{LIFECYCLE_COLUMNS[name]}"
+                )
+            cur.execute(LIFECYCLE_INDEX)
 
         log.info("Added dead_letter lifecycle columns", columns=missing)
         return True

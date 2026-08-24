@@ -990,13 +990,26 @@ def test_a_fresh_schema_is_not_reported_as_a_dead_maintenance_incident(conn) -> 
     assert got.is_healthy is True, "a correctly configured fresh install reads unhealthy"
 
 
-def test_the_boot_lock_wait_is_bounded(conn) -> None:
+@pytest.mark.parametrize("autocommit", [False, True])
+def test_the_boot_lock_wait_is_bounded(conn, autocommit: bool) -> None:
     """Every DDL statement inside ensure_queue_schema is bounded, but the front
     door was not -- so a holder wedged BETWEEN its bounded statements blocked
     every later boot indefinitely. The key is per DATABASE, so a wedged boot in
     one schema hangs boots in the other.
+
+    Parametrised over connection shape because the first version of this test
+    ran only the non-autocommit one -- precisely the shape the bound already
+    worked on. SET LOCAL is a silent no-op under autocommit, so the whole
+    defence was conditional on a property of the CALLER's connection: measured
+    at the time, bounded at 1.50s in transaction mode and still waiting at 12s
+    under autocommit. _tx now owns the autocommit flip, so this covers every
+    bounded DDL path in the package, not just the boot lock.
     """
     import threading
+
+    if autocommit:
+        conn.rollback()
+        conn.autocommit = True
 
     import cortex_utils.queue.schema as sch
     from cortex_utils.queue.schema import ensure_queue_schema
@@ -1035,4 +1048,6 @@ def test_the_boot_lock_wait_is_bounded(conn) -> None:
             sch.SCHEMA_LOCK_TIMEOUT_MS = original
     finally:
         holder.close()
+        if autocommit:
+            conn.autocommit = False
     conn.rollback()

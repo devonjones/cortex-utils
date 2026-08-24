@@ -345,7 +345,7 @@ def ensure_queue_schema(
     catalogue before touching anything, so the common case is the advisory lock,
     a handful of reads, and no table locks.
     """
-    with _tx(conn) as cur:
+    with _tx(conn, lock_timeout_ms=SCHEMA_LOCK_TIMEOUT_MS) as cur:
         # Bounded. Every DDL statement below runs under a 5s lock_timeout, but
         # this front door had none -- so a holder that wedges BETWEEN its
         # bounded statements blocked every later boot indefinitely. And the key
@@ -354,7 +354,6 @@ def ensure_queue_schema(
         # otherwise keeps tenants apart. Generous, because legitimate contention
         # here is a fleet redeploy, but finite, because an indefinite fleet hang
         # is worse than a loud boot failure.
-        cur.execute("SET LOCAL lock_timeout = %s", (f"{SCHEMA_LOCK_TIMEOUT_MS}ms",))
         # Session-scoped, not xact-scoped: the steps below commit individually,
         # and an xact lock would be released by the first one.
         cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")

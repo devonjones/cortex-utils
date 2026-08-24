@@ -139,6 +139,15 @@ def fail_or_retry(
             jitter_ratio=jitter_ratio,
         )
         # Release the claim so the row becomes eligible at next_attempt_at.
+        # claimed_by goes with claimed_at: a row back on the pending pile still
+        # carrying the last worker's token is a row certified to someone who no
+        # longer holds it, so a stalled worker's complete() would match and
+        # retire a job the next claimant is mid-flight on.
+        #
+        # Only on this branch. The 'failed' UPDATE above leaves the token as a
+        # record of who last held it, and a failed row is not claimable -- the
+        # one thing that re-pends one in place is triage's repair re-enqueue,
+        # which clears it there.
         cur.execute(
             """
             UPDATE queue
@@ -146,7 +155,8 @@ def fail_or_retry(
                 attempts = %s,
                 last_error = %s,
                 next_attempt_at = clock_timestamp() + (INTERVAL '1 second' * %s),
-                claimed_at = NULL
+                claimed_at = NULL,
+                claimed_by = NULL
             WHERE id = %s
             """,
             (next_attempts, truncated_error, delay_seconds, job_id),

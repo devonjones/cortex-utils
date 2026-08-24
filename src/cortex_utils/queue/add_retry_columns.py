@@ -56,8 +56,7 @@ def add_retry_columns(
     # instead of failing fast. Measured at 8s unbounded against a held lock,
     # versus 5s to fail. Without _tx a failure also left the caller's connection
     # aborted, which on a boot path is the next statement's problem.
-    with _tx(conn) as cur:
-        cur.execute("SET LOCAL lock_timeout = %s", (f"{MIGRATION_LOCK_TIMEOUT_MS}ms",))
+    with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
         cur.execute(
             """
             ALTER TABLE queue

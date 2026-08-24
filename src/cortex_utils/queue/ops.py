@@ -112,7 +112,9 @@ class PartitionNotAttachedError(PartitionError):
 
 @contextmanager
 def _tx(
-    conn: psycopg2.extensions.connection, commit: bool = True
+    conn: psycopg2.extensions.connection,
+    commit: bool = True,
+    lock_timeout_ms: int | None = None,
 ) -> Iterator[psycopg2.extensions.cursor]:
     """One unit of work: commit on success, roll back before re-raising.
 
@@ -129,7 +131,39 @@ def _tx(
     want to recover to it, and rolling back here would take that choice away.
     Either way the connection is aborted and unusable until the caller rolls
     back, which is the contract they accepted by owning the transaction.
+
+    lock_timeout_ms bounds how long the statements inside will wait for a lock.
+    It lives here, and not at the call sites, because SET LOCAL is a silent
+    no-op under autocommit -- there is no transaction for it to be local to --
+    so every hand-rolled bound was conditional on a connection shape the library
+    does not control. Four sites issued one without the guard and were therefore
+    unbounded on exactly the shape dead_letter's own docstrings call "the
+    connection shape a consumer is most likely to hand us"; dead_letter learned
+    it three separate times and wrote the dance out three times.
+
+    Measured, with the schema advisory lock held elsewhere and the bound at
+    1500ms: a transaction-mode connection raised LockNotAvailable at 1.50s, an
+    autocommit one was still waiting at 12s and died only to a statement_timeout
+    backstop.
     """
+    # psycopg2 refuses to change the session mode inside a transaction, but
+    # under autocommit there is none open to refuse for -- that is the whole
+    # point of the branch. Restored in the finally, including on the error path,
+    # so the caller's connection goes back the way it arrived.
+    was_autocommit = bool(lock_timeout_ms) and conn.autocommit
+    if was_autocommit:
+        conn.autocommit = False
+    try:
+        yield from _tx_body(conn, commit, lock_timeout_ms)
+    finally:
+        if was_autocommit:
+            conn.rollback()
+            conn.autocommit = True
+
+
+def _tx_body(
+    conn: psycopg2.extensions.connection, commit: bool, lock_timeout_ms: int | None
+) -> Iterator[psycopg2.extensions.cursor]:
     if not commit:
         # No claimed_by guard here deliberately: the only caller that reaches
         # this branch is _insert(), whose statement names no such column. A
@@ -140,6 +174,8 @@ def _tx(
         return
     try:
         with conn.cursor() as cur:
+            if lock_timeout_ms:
+                cur.execute("SET LOCAL lock_timeout = %s", (f"{lock_timeout_ms}ms",))
             yield cur
         conn.commit()
     except psycopg2.errors.UndefinedColumn as exc:
@@ -237,8 +273,7 @@ def ensure_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
     if has_claim_token_column(conn):
         return False
 
-    with _tx(conn) as cur:
-        cur.execute("SET LOCAL lock_timeout = %s", (f"{MIGRATION_LOCK_TIMEOUT_MS}ms",))
+    with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
         cur.execute("ALTER TABLE queue ADD COLUMN IF NOT EXISTS claimed_by TEXT")
     log.info("Added queue.claimed_by")
     return True
@@ -383,9 +418,7 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
     """
     name = _partition_name(target)
     try:
-        with _tx(conn) as cur:
-            cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
-
+        with _tx(conn, lock_timeout_ms=PARTITION_LOCK_TIMEOUT_MS) as cur:
             # Ask before creating, not only after. Two things depend on knowing
             # whether the partition was already there, and CREATE TABLE IF NOT
             # EXISTS cannot tell us afterwards -- it succeeds either way:

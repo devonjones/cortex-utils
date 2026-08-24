@@ -141,3 +141,32 @@ def test_fail_or_retry_skips_already_terminal_completed() -> None:
     result = fail_or_retry(conn, job_id=1, error="boom", max_attempts=5)
     assert result == "failed"
     assert cur.execute.call_count == 1
+
+
+def test_retrying_releases_the_claim_token_with_the_claim() -> None:
+    """A row put back on the pending pile must not still carry the token of the
+    worker that failed it.
+
+    Otherwise that worker -- which may simply be slow rather than dead -- can
+    call complete() with its old token after the next claimant has picked the
+    row up, match, and retire a job someone else is mid-flight on. Worse than
+    carrying no token at all, because the token affirmatively vouches for the
+    wrong claimant. The same defect was fixed in all six raw reset sites across
+    postmark and triage; this is the library's own copy of it.
+    """
+    conn, cur = _mock_conn((1, "processing"))
+    assert fail_or_retry(conn, job_id=42, error="boom", max_attempts=5) == "retrying"
+    retry_sql = cur.execute.call_args_list[1][0][0]
+    assert "claimed_by = NULL" in retry_sql, retry_sql
+
+
+def test_exhausting_retries_keeps_the_token_as_a_record() -> None:
+    """The other branch deliberately does NOT clear it: a 'failed' row is not
+    claimable, so the token is inert there and worth keeping as a record of who
+    last held the job. Pinned so the asymmetry reads as a decision rather than
+    an oversight someone later "fixes" into a lost diagnostic.
+    """
+    conn, cur = _mock_conn((4, "processing"))
+    assert fail_or_retry(conn, job_id=42, error="boom", max_attempts=5) == "failed"
+    failed_sql = cur.execute.call_args_list[1][0][0]
+    assert "claimed_by" not in failed_sql, failed_sql
