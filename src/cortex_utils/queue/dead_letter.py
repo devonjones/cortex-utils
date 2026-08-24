@@ -85,12 +85,37 @@ class DeadLetterManager:
         self.conn = conn
 
     def ensure_table(self) -> None:
-        """Create the dead_letter table and bring an existing one up to date."""
-        with self.conn.cursor() as cur:
-            cur.execute(DEAD_LETTER_SCHEMA)
-        self.conn.commit()
+        """Create the dead_letter table and bring an existing one up to date.
+
+        Safe on every boot, and cheap on the one that matters: the DDL below is
+        skipped entirely once the table is there.
+
+        It used to run unconditionally -- CREATE TABLE IF NOT EXISTS plus two
+        CREATE INDEX IF NOT EXISTS -- while the very next line pre-checked
+        pg_attribute before doing anything. By this module's own account, CREATE
+        INDEX IF NOT EXISTS still takes a lock and waits on an open writer even
+        when the index is already there, so the one step that skipped the
+        catalogue was taking locks on every boot of every consumer, forever, and
+        outside whatever lock_timeout the caller had set, because it opens its
+        own cursor. ensure_queue_schema() advertises "every step pre-checks the
+        catalogue"; this was the step that made that false.
+        """
+        if not self._has_table():
+            with self.conn.cursor() as cur:
+                cur.execute("SET LOCAL lock_timeout = '5000ms'")
+                cur.execute(DEAD_LETTER_SCHEMA)
+            self.conn.commit()
         self.ensure_lifecycle_columns()
         log.debug("Ensured dead_letter table exists")
+
+    def _has_table(self) -> bool:
+        """Bound through to_regclass, so it answers about this schema's table."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass('dead_letter') "
+                "AND relkind IN ('r', 'p')"
+            )
+            return cur.fetchone() is not None
 
     def ensure_lifecycle_columns(self) -> bool:
         """Add retried_at/retried_as/dismissed_at if this schema predates them.

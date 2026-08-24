@@ -66,7 +66,17 @@ class _StderrDefaultLogger:
     def _resolve(self) -> Any:
         if structlog.is_configured():
             # Their configuration wins. We are a guest here.
-            return structlog.get_logger(self._name)
+            #
+            # And pass NO argument when there is no name: structlog forwards
+            # *args to the logger factory, so get_logger(None) hands
+            # stdlib.LoggerFactory a non-empty args whose [0] is None ->
+            # logging.getLogger(None) -> the ROOT logger. Every module here
+            # then logs as "root" instead of its own namespace, and
+            # logging.getLogger("cortex_utils").setLevel(...) stops silencing
+            # us. That is this library reaching past the consumer's
+            # configuration -- the same fault as logging to their stdout, which
+            # is what this module exists to fix.
+            return structlog.get_logger(self._name) if self._name else structlog.get_logger()
         return structlog.wrap_logger(
             _stderr_factory(),
             processors=[

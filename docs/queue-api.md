@@ -369,6 +369,20 @@ only absence is a problem.
 > transaction-scoped advisory lock; keep the index for lookups if it earns its
 > place.
 
+### Adopting on a table that already has indexes
+
+`ensure_queue_table()` only ever creates, so your existing indexes survive — but
+`idx_queue_claim` and `idx_queue_stale` are created **alongside** them, not
+instead of them. Two consequences worth knowing before the first deploy:
+
+- that deploy takes real `ShareLock`s to build them, on a live table
+- the overlap is **permanent** until an operator drops the old ones. Nothing
+  here will, because this package cannot tell an index you no longer need from
+  one you rely on.
+
+Plan the cleanup as a separate, deliberate step after the new indexes are
+confirmed in use.
+
 ### Naming
 
 Names are checked against `pg_index` bound to this table, not against

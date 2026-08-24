@@ -461,3 +461,56 @@ def test_the_cli_reports_a_genuinely_missing_row_as_missing(conn) -> None:
     result = CliRunner().invoke(main, ["dead-letter", "retry", "--id", "9999"], env=env)
     assert result.exit_code == 1
     assert "no dead letter job with id 9999" in result.output
+
+
+def test_a_steady_state_boot_issues_no_dead_letter_ddl(conn) -> None:
+    """The one step that did not pre-check itself.
+
+    CREATE TABLE IF NOT EXISTS plus two CREATE INDEX IF NOT EXISTS ran
+    unconditionally while the very next line checked pg_attribute first -- and
+    by this module's own account CREATE INDEX IF NOT EXISTS still takes a lock
+    and waits on an open writer even when the index is already there. On every
+    boot of every consumer, forever, and outside any lock_timeout the caller
+    set, because it opened its own cursor.
+    """
+    mgr = DeadLetterManager(conn)
+    mgr.ensure_table()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+        other.autocommit = False
+        # A live writer holding ROW EXCLUSIVE. DDL would queue behind it.
+        with other.cursor() as cur:
+            cur.execute(
+                "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+                "last_error, created_at, failed_at, archived_from_partition) "
+                "VALUES (1, 't', '{}'::jsonb, 1, 'x', NOW(), NOW(), 'p')"
+            )
+
+        conn.rollback()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '2000ms'")
+        conn.autocommit = False
+
+        mgr.ensure_table()  # must not wait on the writer
+    finally:
+        other.rollback()
+        other.close()
+    conn.rollback()
+
+
+def test_a_missing_dead_letter_table_is_still_created(conn) -> None:
+    """The pre-check must not turn into a skip."""
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE dead_letter")
+    conn.commit()
+
+    DeadLetterManager(conn).ensure_table()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('dead_letter')")
+        assert cur.fetchone()[0] is not None

@@ -181,6 +181,8 @@ def test_the_choice_is_made_at_log_time_not_import_time() -> None:
         "import io, structlog\n"
         "from cortex_utils.log import get_logger\n"
         "log = get_logger()                      # bound BEFORE configuring\n"
+        "log.info('early')                       # and USED before, which is\n"
+        "                                        # what makes memoising visible\n"
         "sink = io.StringIO()\n"
         "structlog.configure(processors=[structlog.processors.JSONRenderer()],\n"
         "                    logger_factory=structlog.PrintLoggerFactory(file=sink))\n"
@@ -188,3 +190,37 @@ def test_the_choice_is_made_at_log_time_not_import_time() -> None:
         "print('SINK:' + sink.getvalue().strip())\n"
     )
     assert '"event": "late"' in out, f"import-time binding ignored later config: {out!r}"
+
+
+def test_library_logs_carry_their_own_namespace_not_root() -> None:
+    """structlog forwards *args to the logger factory, so get_logger(None)
+    hands stdlib.LoggerFactory a non-empty args whose [0] is None ->
+    logging.getLogger(None) -> the ROOT logger.
+
+    Consequence: every module logs as "root", and
+    logging.getLogger("cortex_utils").setLevel(...) stops silencing us. That is
+    this library reaching past the consumer's configuration -- the same fault
+    as logging to their stdout, which is what this module exists to fix.
+    """
+    out, _err = _run(
+        "import json, logging, sys\n"
+        "from cortex_utils.logging import configure_logging\n"
+        "configure_logging('svc')\n"
+        "import cortex_utils.queue.ops as ops\n"
+        "ops.log.info('probe')\n"
+    )
+    # configure_logging renders JSON through stdlib to stderr; capture either.
+    combined = (
+        out
+        + _run(
+            "import logging\n"
+            "from cortex_utils.logging import configure_logging\n"
+            "configure_logging('svc')\n"
+            "logging.getLogger('cortex_utils').setLevel(logging.CRITICAL)\n"
+            "import cortex_utils.queue.ops as ops\n"
+            "ops.log.info('should-be-silenced')\n"
+        )[1]
+    )
+    assert "should-be-silenced" not in combined, (
+        "silencing the cortex_utils namespace did not silence us -- we are logging as root"
+    )
