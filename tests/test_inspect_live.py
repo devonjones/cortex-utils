@@ -29,6 +29,7 @@ import pytest
 psycopg2 = pytest.importorskip("psycopg2")
 
 from cortex_utils.queue.add_retry_columns import has_next_attempt_at_column  # noqa: E402
+from cortex_utils.queue.dead_letter import DEAD_LETTER_SCHEMA  # noqa: E402
 from cortex_utils.queue.inspect import failures, health, resubmit, stuck  # noqa: E402
 from cortex_utils.queue.ops import (  # noqa: E402
     SELF_HEALED_MARKER,
@@ -36,6 +37,7 @@ from cortex_utils.queue.ops import (  # noqa: E402
     QueueTableNotFoundError,
     enqueue,
 )
+from cortex_utils.queue.schema import queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
 
@@ -43,36 +45,10 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="set CORTEX_TEST_DSN to a throwaway Postgres to run these"
 )
 
-QUEUE_DDL = """
-CREATE TABLE queue (
-    id BIGSERIAL,
-    queue_name TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    priority INT NOT NULL DEFAULT 0,
-    attempts INT NOT NULL DEFAULT 0,
-    max_attempts INT NOT NULL DEFAULT 3,
-    last_error TEXT,
-    claimed_at TIMESTAMPTZ,
-    claimed_by TEXT,
-    next_attempt_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
-
-CREATE TABLE dead_letter (
-    id BIGSERIAL PRIMARY KEY,
-    original_id BIGINT NOT NULL,
-    queue_name TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    attempts INT NOT NULL,
-    last_error TEXT,
-    created_at TIMESTAMPTZ NOT NULL,
-    failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    archived_from_partition TEXT NOT NULL DEFAULT 'x'
-);
-"""
+# Both tables from the modules that define them, not hand-copied. A test that
+# maintains its own idea of the shape cannot notice when the shape changes --
+# it just goes on asserting against a schema nothing else has.
+QUEUE_DDL = queue_ddl() + DEAD_LETTER_SCHEMA
 
 
 @pytest.fixture
@@ -282,13 +258,13 @@ def test_an_unpartitioned_queue_is_not_reported_as_broken(conn) -> None:
     ran out is a monitor that cries forever about something that works."""
     with conn.cursor() as cur:
         cur.execute("DROP TABLE queue")
+        # The canonical shape with the partitioning removed -- a pre-migration
+        # queue differs from a migrated one in exactly that, and hand-writing
+        # the column list here would let it drift into a shape nothing else has.
         cur.execute(
-            "CREATE TABLE queue (id BIGSERIAL PRIMARY KEY, queue_name TEXT NOT NULL, "
-            "payload JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'pending', "
-            "priority INT NOT NULL DEFAULT 0, attempts INT NOT NULL DEFAULT 0, "
-            "max_attempts INT NOT NULL DEFAULT 3, last_error TEXT, "
-            "claimed_at TIMESTAMPTZ, claimed_by TEXT, next_attempt_at TIMESTAMPTZ, "
-            "completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            queue_ddl()
+            .replace(") PARTITION BY RANGE (created_at)", ")")
+            .replace("PRIMARY KEY (id, created_at)", "PRIMARY KEY (id, created_at)")
         )
         cur.execute("INSERT INTO queue (queue_name, payload) VALUES ('t', '{}'::jsonb)")
     conn.commit()
@@ -387,8 +363,9 @@ def test_dead_letter_count_is_the_dead_letter_count(conn) -> None:
         cur.execute("INSERT INTO queue (queue_name, payload) VALUES ('t', '{}'::jsonb)")
         for _ in range(3):
             cur.execute(
-                "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, created_at) "
-                "VALUES (1, 't', '{}'::jsonb, 3, NOW())"
+                "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+                "created_at, failed_at, archived_from_partition) "
+                "VALUES (1, 't', '{}'::jsonb, 3, NOW(), NOW(), 'p')"
             )
     conn.commit()
 

@@ -66,6 +66,7 @@ jobs:
         run: |
           uv run pytest tests/test_inspect_live.py tests/test_ops_live.py \
             tests/test_dead_letter_live.py tests/test_claim_token_guard_live.py \
+            tests/test_schema_live.py \
             -q --no-header -p no:cacheprovider -p no:skipping
 
   build:

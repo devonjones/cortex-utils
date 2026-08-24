@@ -19,6 +19,7 @@ import pytest
 psycopg2 = pytest.importorskip("psycopg2")
 
 from cortex_utils.queue.dead_letter import DeadLetterManager  # noqa: E402
+from cortex_utils.queue.schema import queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
 
@@ -42,24 +43,7 @@ CREATE TABLE dead_letter (
 CREATE INDEX idx_dead_letter_queue ON dead_letter(queue_name, failed_at DESC);
 """
 
-QUEUE_SCHEMA = """
-CREATE TABLE queue (
-    id BIGSERIAL,
-    queue_name TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    priority INT NOT NULL DEFAULT 0,
-    attempts INT NOT NULL DEFAULT 0,
-    max_attempts INT NOT NULL DEFAULT 3,
-    last_error TEXT,
-    claimed_at TIMESTAMPTZ,
-    claimed_by TEXT,
-    next_attempt_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
-"""
+QUEUE_SCHEMA = queue_ddl()
 
 
 def _fresh(legacy: bool):

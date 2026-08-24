@@ -18,29 +18,15 @@ import psycopg2
 import structlog
 
 from cortex_utils.queue.ops import server_today
+from cortex_utils.queue.schema import queue_ddl
 
 log = structlog.get_logger()
 
-# Schema for partitioned queue table
-PARTITIONED_QUEUE_SCHEMA = """
-CREATE TABLE queue_new (
-    id BIGSERIAL,
-    queue_name TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempts INT DEFAULT 0,
-    max_attempts INT DEFAULT 3,
-    last_error TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    claimed_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-
-    CONSTRAINT queue_new_valid_status CHECK (
-        status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')
-    ),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
-"""
+# Built from the canonical definition rather than kept as a second copy. This
+# one had already drifted: it was missing priority, claimed_by and
+# next_attempt_at -- three columns the primitives require -- so a queue built by
+# this migration could not have been claimed from.
+PARTITIONED_QUEUE_SCHEMA = queue_ddl("queue_new")
 
 
 def analyze_existing_queue(conn: psycopg2.extensions.connection) -> dict[str, Any]:

@@ -39,6 +39,12 @@ from cortex_utils.queue.retry import (
     compute_backoff_delay,
     ready_predicate,
 )
+from cortex_utils.queue.schema import (
+    REQUIRED_COLUMNS,
+    ensure_queue_table,
+    missing_columns,
+    queue_ddl,
+)
 from cortex_utils.queue.stats import get_queue_depth, get_queue_stats, get_stale_jobs
 
 __all__ = [
@@ -63,6 +69,10 @@ __all__ = [
     "PartitionNotAttachedError",
     "QueueTableNotFoundError",
     "DeadLetterManager",
+    "ensure_queue_table",
+    "missing_columns",
+    "queue_ddl",
+    "REQUIRED_COLUMNS",
     "get_queue_stats",
     "get_queue_depth",
     "get_stale_jobs",
