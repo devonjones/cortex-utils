@@ -147,8 +147,12 @@ def test_an_existing_table_missing_a_column_is_reported_not_altered(conn) -> Non
     conn.commit()
 
     assert missing_columns(conn) == ["claimed_by"]
-    with pytest.raises(QueueError, match="claimed_by"):
+    with pytest.raises(QueueError, match="claimed_by") as excinfo:
         ensure_queue_table(conn)
+    # Name the remedy. cryo D4 added exactly this to the other door onto this
+    # failure; an operator hitting this one first should not get less.
+    assert "ensure_claim_token_column" in str(excinfo.value)
+    assert "add_retry_columns" in str(excinfo.value)
 
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('queue')")
@@ -191,8 +195,13 @@ def test_the_indexes_the_claim_query_needs_are_created(conn) -> None:
             "SELECT indexname FROM pg_indexes WHERE schemaname = 't_schema' AND tablename = 'queue'"
         )
         names = {r[0] for r in cur.fetchall()}
-    assert "idx_queue_claimable" in names
-    assert "idx_queue_processing" in names
+    assert "idx_queue_claim" in names
+    assert "idx_queue_stale" in names
+    # Deliberately NOT idx_queue_processing: migrate.py already creates one
+    # under that name with a different column list, and _ensure_indexes reads a
+    # name that resolves as "it is there" -- so reusing it would mean the
+    # canonical index is never created on any migrated deployment.
+    assert "idx_queue_processing" not in names
 
 
 def test_a_boot_with_the_indexes_already_there_issues_no_ddl(conn) -> None:
@@ -236,3 +245,117 @@ def test_a_table_name_that_is_not_a_name_is_refused() -> None:
     for bad in ("queue; DROP TABLE x", "queue--", "public.queue", ""):
         with pytest.raises(QueueError):
             queue_ddl(bad)
+
+
+def test_the_canonical_index_is_created_on_a_migrated_deployment(conn) -> None:
+    """migrate.py already creates idx_queue_pending and idx_queue_processing
+    with different column lists. _ensure_indexes reads a name that resolves as
+    "it is there", so reusing either name would mean the canonical index is
+    silently never created on exactly the deployments that have been around
+    longest -- this module's own subject matter, inside the module.
+    """
+    ensure_queue_table(conn)
+    with conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_queue_claim")
+        cur.execute("DROP INDEX idx_queue_stale")
+        # The legacy shapes, exactly as migrate.py leaves them.
+        cur.execute(
+            "CREATE INDEX idx_queue_pending ON queue (queue_name, status, created_at) "
+            "WHERE status = 'pending'"
+        )
+        cur.execute(
+            "CREATE INDEX idx_queue_processing ON queue (queue_name, claimed_at) "
+            "WHERE status = 'processing'"
+        )
+    conn.commit()
+
+    assert ensure_queue_table(conn) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 't_schema' AND tablename = 'queue'"
+        )
+        names = {r[0] for r in cur.fetchall()}
+    assert "idx_queue_claim" in names, "the legacy names must not mask the canonical ones"
+    assert "idx_queue_stale" in names
+
+
+def test_the_claim_index_can_serve_the_claim_order(conn) -> None:
+    """Column order is the whole value of this index. A range predicate between
+    the equality prefix and the sort keys stops it serving the ORDER BY, which
+    EXPLAIN reports as a Sort node -- invisible to any test that only checks
+    the index exists."""
+    ensure_queue_table(conn)
+    _today_partition(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, priority) "
+            "SELECT 'q', '{}'::jsonb, (g % 5) FROM generate_series(1, 3000) g"
+        )
+        cur.execute("ANALYZE queue")
+        cur.execute("SET LOCAL enable_seqscan = off")
+        cur.execute(
+            "EXPLAIN (COSTS OFF) SELECT id FROM queue "
+            "WHERE queue_name = 'q' AND status = 'pending' "
+            "ORDER BY priority DESC, created_at LIMIT 10"
+        )
+        plan = "\n".join(r[0] for r in cur.fetchall())
+    conn.rollback()
+
+    # A partition inherits the parent's index under its own generated name, so
+    # assert the column signature rather than ours.
+    assert "queue_name_status_priority_created_at" in plan, plan
+    assert "Sort" not in plan, f"the index cannot serve the order:\n{plan}"
+
+
+def test_an_unpartitioned_queue_is_reported_rather_than_left_to_fail_later(conn) -> None:
+    """Legal and supported -- migrate_to_partitioned() exists for it -- but
+    partitions.py would otherwise fail several frames from the thing that could
+    have mentioned it."""
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl().replace(") PARTITION BY RANGE (created_at)", ")"))
+    conn.commit()
+
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        assert ensure_queue_table(conn) == "present"
+    assert any("not partitioned" in entry["event"] for entry in logs), (
+        f"a boot that finds an unpartitioned queue must say so: {logs}"
+    )
+    assert missing_columns(conn) == []
+
+
+def test_the_stale_index_can_serve_the_recovery_scan(conn) -> None:
+    """claim()'s stale-recovery pass filters on queue_name as well as status,
+    so leading with status alone leaves queue_name as a Filter -- 86ms against
+    1.2ms on a real table, and invisible to any test that only checks the index
+    exists."""
+    ensure_queue_table(conn)
+    _today_partition(conn)
+    with conn.cursor() as cur:
+        # The real recovery shape: many rows in flight, a few actually stalled.
+        # With everything equally stale the claimed_at predicate selects nothing
+        # and the planner reasonably filters instead of seeking.
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, claimed_at, claimed_by) "
+            "SELECT 'q', '{}'::jsonb, 'processing', NOW() - INTERVAL '1 minute', 'w' "
+            "FROM generate_series(1, 5000)"
+        )
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, claimed_at, claimed_by) "
+            "SELECT 'q', '{}'::jsonb, 'processing', NOW() - INTERVAL '2 hours', 'w' "
+            "FROM generate_series(1, 5)"
+        )
+        cur.execute("ANALYZE queue")
+        cur.execute("SET LOCAL enable_seqscan = off")
+        cur.execute(
+            "EXPLAIN (COSTS OFF) SELECT id FROM queue "
+            "WHERE queue_name = 'q' AND status = 'processing' "
+            "AND claimed_at < NOW() - INTERVAL '30 minutes'"
+        )
+        plan = "\n".join(r[0] for r in cur.fetchall())
+    conn.rollback()
+
+    assert "queue_name_status_claimed_at" in plan, plan
+    assert "Filter: " not in plan, f"queue_name should be an Index Cond, not a Filter:\n{plan}"

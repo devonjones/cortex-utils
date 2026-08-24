@@ -261,11 +261,7 @@ def test_an_unpartitioned_queue_is_not_reported_as_broken(conn) -> None:
         # The canonical shape with the partitioning removed -- a pre-migration
         # queue differs from a migrated one in exactly that, and hand-writing
         # the column list here would let it drift into a shape nothing else has.
-        cur.execute(
-            queue_ddl()
-            .replace(") PARTITION BY RANGE (created_at)", ")")
-            .replace("PRIMARY KEY (id, created_at)", "PRIMARY KEY (id, created_at)")
-        )
+        cur.execute(queue_ddl().replace(") PARTITION BY RANGE (created_at)", ")"))
         cur.execute("INSERT INTO queue (queue_name, payload) VALUES ('t', '{}'::jsonb)")
     conn.commit()
 

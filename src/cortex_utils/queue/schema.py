@@ -75,18 +75,71 @@ CREATE TABLE IF NOT EXISTS {table} (
 """
 
 
-def queue_indexes(table: str = "queue") -> list[str]:
-    """Indexes the primitives' own queries depend on.
+# Names, deliberately not idx_queue_pending / idx_queue_processing. migrate.py
+# already creates indexes under both of those on any migrated deployment, with
+# different column lists -- and _ensure_indexes treats a name that resolves as
+# "the index is there". Reusing either name would mean the canonical index is
+# silently never created on exactly the deployments that have been around
+# longest. That is this module's own subject matter: two definitions sharing an
+# identifier, with the difference invisible until a query is slow.
+CLAIM_INDEX = "idx_{table}_claim"
+STALE_INDEX = "idx_{table}_stale"
 
-    On the parent, so every partition inherits them. claim() filters on
-    (queue_name, status, next_attempt_at) and orders by (priority DESC,
-    created_at); the stale-recovery pass filters on (status, claimed_at).
+
+def queue_indexes(table: str = "queue") -> list[tuple[str, str]]:
+    """(name, statement) for the indexes the primitives' own queries need.
+
+    On the parent, so every partition inherits them.
+
+    Column order is measured, not guessed. claim() filters queue_name = ? AND
+    status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()),
+    then orders by priority DESC, created_at. Putting next_attempt_at -- a range
+    predicate -- between the equality prefix and the sort keys stops the index
+    serving the ORDER BY: on 200k rows that was a 13k-row Sort, 2272 buffers,
+    4.3ms. With the range column out of the way it is no Sort, 15 buffers,
+    0.05ms.
+
+    The stale-recovery pass filters on queue_name too, so leading with status
+    alone leaves it as a Filter: 86ms against 1.2ms.
     """
     return [
-        f"CREATE INDEX IF NOT EXISTS idx_{table}_claimable ON {table} "
-        f"(queue_name, status, next_attempt_at, priority DESC, created_at)",
-        f"CREATE INDEX IF NOT EXISTS idx_{table}_processing ON {table} (status, claimed_at)",
+        (
+            CLAIM_INDEX.format(table=table),
+            f"CREATE INDEX IF NOT EXISTS {CLAIM_INDEX.format(table=table)} ON {table} "
+            f"(queue_name, status, priority DESC, created_at)",
+        ),
+        (
+            STALE_INDEX.format(table=table),
+            f"CREATE INDEX IF NOT EXISTS {STALE_INDEX.format(table=table)} ON {table} "
+            f"(queue_name, status, claimed_at)",
+        ),
     ]
+
+
+def _inspect(conn: psycopg2.extensions.connection, table: str) -> tuple[bool, bool, list[str]]:
+    """(exists, partitioned, missing_columns) in one round trip.
+
+    relkind comes free on the join the column lookup already needs, and asking
+    the same catalogue three times about one table is three chances for the
+    answers to describe three different moments.
+    """
+    with _tx(conn) as cur:
+        cur.execute(
+            "SELECT c.relkind, "
+            "  array_remove(array_agg(a.attname) FILTER (WHERE NOT a.attisdropped), NULL) "
+            "FROM pg_class c "
+            "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 "
+            "WHERE c.oid = to_regclass(%s) "
+            "GROUP BY c.relkind",
+            (table,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        return False, False, list(REQUIRED_COLUMNS)
+    relkind, present = row
+    present = set(present or ())
+    return True, relkind == "p", [n for n in REQUIRED_COLUMNS if n not in present]
 
 
 def missing_columns(conn: psycopg2.extensions.connection, table: str = "queue") -> list[str]:
@@ -100,14 +153,7 @@ def missing_columns(conn: psycopg2.extensions.connection, table: str = "queue") 
     consumer may add columns of its own, and that is the composition this module
     is meant to allow.
     """
-    with _tx(conn) as cur:
-        cur.execute(
-            "SELECT attname FROM pg_attribute "
-            "WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped",
-            (table,),
-        )
-        present = {r[0] for r in cur.fetchall()}
-    return [name for name in REQUIRED_COLUMNS if name not in present]
+    return _inspect(conn, table)[2]
 
 
 def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue") -> str:
@@ -124,24 +170,30 @@ def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue
     lets the operator decide, which is the whole point of having one definition
     to compare against.
     """
-    missing = missing_columns(conn, table)
-    if not missing:
-        with _tx(conn) as cur:
-            cur.execute("SELECT to_regclass(%s)", (table,))
-            if cur.fetchone()[0] is not None:
-                _ensure_indexes(conn, table)
-                return "present"
+    exists, partitioned, missing = _inspect(conn, table)
 
-    with _tx(conn) as cur:
-        cur.execute("SELECT to_regclass(%s)", (table,))
-        exists = cur.fetchone()[0] is not None
+    if exists and not missing:
+        if not partitioned:
+            # Legal and supported -- migrate_to_partitioned() exists for exactly
+            # this -- but say so here rather than letting partitions.py fail
+            # later with an error about a relation that "is not partitioned",
+            # several frames from the thing that could have mentioned it.
+            log.warning(
+                "queue table is not partitioned",
+                table=table,
+                hint="run migrate-queue to partition it; retention needs partitions",
+            )
+        _ensure_indexes(conn, table)
+        return "present"
 
     if exists:
         raise QueueError(
             f"{table} exists but is missing {', '.join(missing)}. "
             "The queue primitives read those columns; add them deliberately "
             "(ALTER TABLE takes ACCESS EXCLUSIVE) rather than having a boot "
-            "path do it under you."
+            "path do it under you. For the two that have their own migrations, "
+            "that is ensure_claim_token_column(conn) for claimed_by and "
+            "add_retry_columns(conn) for next_attempt_at."
         )
 
     with _tx(conn) as cur:
@@ -158,8 +210,7 @@ def _ensure_indexes(conn: psycopg2.extensions.connection, table: str) -> None:
     even when the index is already there, and its queued ShareLock times out
     inserts behind it. This runs on every boot, so it asks the catalogue.
     """
-    for statement in queue_indexes(table):
-        name = statement.split("IF NOT EXISTS ")[1].split()[0]
+    for name, statement in queue_indexes(table):
         with _tx(conn) as cur:
             cur.execute("SELECT to_regclass(%s)", (name,))
             if cur.fetchone()[0] is not None:
