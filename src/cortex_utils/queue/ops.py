@@ -150,7 +150,22 @@ def _tx(
     # under autocommit there is none open to refuse for -- that is the whole
     # point of the branch. Restored in the finally, including on the error path,
     # so the caller's connection goes back the way it arrived.
-    was_autocommit = bool(lock_timeout_ms) and conn.autocommit
+    if lock_timeout_ms is not None and not commit:
+        # These two cannot both hold. The bound is issued as SET LOCAL in the
+        # committing branch only, so combining them silently produced NO bound
+        # -- while the autocommit flip and its finally-rollback still fired off
+        # lock_timeout_ms alone, destroying the caller's uncommitted work with
+        # no error. Nothing combines them today; this refuses rather than
+        # leaving the trap set, because a bound that is conditional on the
+        # caller's connection shape is the exact defect this parameter exists
+        # to remove. A caller who owns the transaction owns its bound too.
+        raise ValueError(
+            "lock_timeout_ms needs a transaction of its own; with commit=False "
+            "the caller owns the transaction and sets its own bound"
+        )
+    # `is not None`, not truthiness: lock_timeout_ms=0 means "no wait at all" in
+    # Postgres, and reading it as "unbounded" would invert the caller's intent.
+    was_autocommit = lock_timeout_ms is not None and conn.autocommit
     if was_autocommit:
         conn.autocommit = False
     try:
@@ -174,7 +189,7 @@ def _tx_body(
         return
     try:
         with conn.cursor() as cur:
-            if lock_timeout_ms:
+            if lock_timeout_ms is not None:
                 cur.execute("SET LOCAL lock_timeout = %s", (f"{lock_timeout_ms}ms",))
             yield cur
         conn.commit()

@@ -60,6 +60,18 @@ class FakeCursor:
         return False
 
 
+def _migration_probes():
+    """Answers the probe sequence a lifecycle migration makes.
+
+    Three column probes say missing, then _ensure_index's pre-probe says the
+    index is absent, then its POST-probe says the CREATE worked. That last one
+    is the point: the migration path routes its index through _ensure_index now,
+    so a mock that cannot answer the second probe makes the method raise.
+    """
+    answers = [None, None, None, None, (1,)]
+    return lambda: answers.pop(0) if answers else (1,)
+
+
 def _manager(fetchone: Any = (99,)):
     cur = FakeCursor(fetchone=fetchone)
     conn = MagicMock()
@@ -277,7 +289,7 @@ def test_lifecycle_columns_are_added_together_or_not_at_all() -> None:
     """A half-migrated table is worse than an unmigrated one: dismiss() would
     work while list_jobs() still could not filter, so an operator would clear a
     list that kept showing the rows they cleared."""
-    mgr, conn = _manager(fetchone=None)  # no column exists
+    mgr, conn = _manager(fetchone=_migration_probes())  # no column exists
     assert mgr.ensure_lifecycle_columns() is True
     added = [s for s, _ in conn.cur.executed if "ADD COLUMN" in s]
     assert len(added) == 3
@@ -321,7 +333,7 @@ def test_columns_present_but_index_missing_still_gets_the_index() -> None:
 def test_the_migration_bounds_its_lock() -> None:
     """ACCESS EXCLUSIVE on dead_letter queued behind a long read would stall
     every archive write from drop_partition."""
-    mgr, conn = _manager(fetchone=None)
+    mgr, conn = _manager(fetchone=_migration_probes())
     mgr.ensure_lifecycle_columns()
     assert any("SET LOCAL lock_timeout" in s for s, _ in conn.cur.executed)
 
@@ -391,7 +403,7 @@ def test_the_migration_is_one_transaction_even_under_autocommit() -> None:
         def autocommit(self, value: bool) -> None:
             seen.append(value)
 
-    cur = FakeCursor(fetchone=None)
+    cur = FakeCursor(fetchone=_migration_probes())
     conn = RecordingConn()
     conn.cursor.return_value = cur
     conn.cur = cur

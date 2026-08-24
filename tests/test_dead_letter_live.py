@@ -818,3 +818,68 @@ def test_the_lifecycle_index_bound_survives_ensure_table_restoring_autocommit(
         legacy_conn.autocommit = False
     with contextlib.suppress(Exception):
         legacy_conn.rollback()
+
+
+def test_a_failed_lifecycle_migration_leaves_no_half_migrated_table(legacy_conn) -> None:
+    """All three columns land together or none do.
+
+    The docstring has said so since the method was written, and the code has
+    always provided it -- but nothing asserted it. Splitting the single _tx into
+    one transaction per ALTER left the whole dead-letter suite green, which is
+    the same shape of unpinned property that rounds 3 through 6 each rewrote
+    away and had to put back.
+
+    Why it matters: dismiss() writes dismissed_at, list_jobs() filters on
+    retried_at. With one added and not the other, an operator clears a row and
+    it keeps appearing in the list they cleared it from.
+    """
+    from cortex_utils.queue.dead_letter import LIFECYCLE_COLUMNS
+
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS dead_letter")
+        cur.execute("CREATE TABLE dead_letter (id BIGSERIAL PRIMARY KEY, queue_name TEXT)")
+    legacy_conn.commit()
+
+    mgr = DeadLetterManager(legacy_conn)
+    assert [c for c in LIFECYCLE_COLUMNS if not mgr._has_column(c)] == list(LIFECYCLE_COLUMNS)
+
+    # Fail on the last of the three, after the first two have been issued.
+    original = LIFECYCLE_COLUMNS[list(LIFECYCLE_COLUMNS)[-1]]
+    LIFECYCLE_COLUMNS[list(LIFECYCLE_COLUMNS)[-1]] = "THIS IS NOT A TYPE"
+    try:
+        with pytest.raises(psycopg2.Error):
+            mgr.ensure_lifecycle_columns()
+    finally:
+        LIFECYCLE_COLUMNS[list(LIFECYCLE_COLUMNS)[-1]] = original
+    legacy_conn.rollback()
+
+    present = [c for c in LIFECYCLE_COLUMNS if mgr._has_column(c)]
+    assert present == [], (
+        f"partial migration committed {present} -- dismiss() would work while "
+        "list_jobs() could not filter, so an operator clears a list that keeps "
+        "showing the rows they cleared"
+    )
+
+
+def test_the_migration_branch_also_proves_its_index(legacy_conn) -> None:
+    """The other half of the name-taken case, on the path that migrates.
+
+    The steady-state path re-probes after its CREATE; the migration branch used
+    to run LIFECYCLE_INDEX raw, so a name already held by something else
+    absorbed the statement via IF NOT EXISTS and the method logged "Added
+    dead_letter lifecycle columns" with the index absent. Self-healing -- the
+    next boot takes the steady-state path, which does re-probe and raises -- but
+    a boot that says it did something it did not is how the last four rounds of
+    defects got past review.
+    """
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS dead_letter")
+        cur.execute(LEGACY_SCHEMA)  # pre-lifecycle, so the migration has work to do
+        # The name, held by an index on something else entirely.
+        cur.execute("CREATE TABLE decoy_lc (x TEXT)")
+        cur.execute("CREATE INDEX idx_dead_letter_open ON decoy_lc (x)")
+    legacy_conn.commit()
+
+    with pytest.raises(QueueError, match="did not create an index named"):
+        DeadLetterManager(legacy_conn).ensure_lifecycle_columns()
+    legacy_conn.rollback()

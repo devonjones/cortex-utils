@@ -1051,3 +1051,31 @@ def test_the_boot_lock_wait_is_bounded(conn, autocommit: bool) -> None:
         if autocommit:
             conn.autocommit = False
     conn.rollback()
+
+
+def test_a_plain_queue_table_still_boots(conn) -> None:
+    """A non-partitioned queue is legal and supported. migrate_to_partitioned()
+    exists for it, and ensure_queue_table() accepts it deliberately -- warning
+    with a pointer to migrate-queue rather than failing, so that partitions.py
+    does not later raise about a relation that "is not partitioned" several
+    frames from the thing that could have explained it.
+
+    Boot then created future partitions unconditionally, which raised exactly
+    that error and killed the boot on exactly that supported shape. Nothing saw
+    it: the suite was green with the crash in it, because every other test here
+    builds a partitioned table first.
+    """
+    from cortex_utils.queue.schema import REQUIRED_COLUMNS, ensure_queue_schema
+
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS queue CASCADE")
+        cols = ", ".join(f"{n} {d}" for n, d in REQUIRED_COLUMNS.items())
+        cur.execute(f"CREATE TABLE queue ({cols})")
+    conn.commit()
+
+    assert ensure_queue_schema(conn) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('queue')")
+        assert cur.fetchone()[0] == 0, "nothing should be attached to a plain table"
+    conn.rollback()

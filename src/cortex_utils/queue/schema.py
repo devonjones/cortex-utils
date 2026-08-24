@@ -426,5 +426,16 @@ def _ensure_queue_schema_locked(
     # Boot is also the cheapest moment to create them: uncontended, and it
     # removes the only steady-state path where a correctly configured system
     # routes writes through the self-heal.
-    PartitionManager(conn).create_future_partitions(days_ahead=1)
+    # Only when there is something to partition. ensure_queue_table() above
+    # deliberately ACCEPTS a plain queue table -- migrate_to_partitioned() exists
+    # for exactly that, and it warns pointing at migrate-queue rather than
+    # failing -- so calling this unconditionally raised InvalidObjectDefinition
+    # ("queue" is not partitioned) and killed the boot on a configuration forty
+    # lines of this file exist to support.
+    #
+    # Asked of the database rather than read off the _inspect() above, because
+    # that snapshot predates the table this function may have just created.
+    partitions = PartitionManager(conn)
+    if partitions.is_table_partitioned():
+        partitions.create_future_partitions(days_ahead=1)
     return result

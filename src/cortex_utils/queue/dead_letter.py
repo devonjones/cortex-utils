@@ -198,7 +198,16 @@ class DeadLetterManager:
                     f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
                     f"{LIFECYCLE_COLUMNS[name]}"
                 )
-            cur.execute(LIFECYCLE_INDEX)
+
+        # After the columns commit, and through _ensure_index so it gets the
+        # post-probe. Run raw inside the transaction above, a name already taken
+        # by something else absorbed the CREATE via IF NOT EXISTS and this
+        # method logged success with the index absent -- detected one boot later
+        # by the steady-state path, which does re-probe, but a misleading log in
+        # the meantime. The index is deliberately NOT part of the columns'
+        # all-or-nothing set: it depends on them, and if it fails the next boot
+        # creates it, whereas half the columns is the state with no recovery.
+        self._ensure_index("idx_dead_letter_open", LIFECYCLE_INDEX)
 
         log.info("Added dead_letter lifecycle columns", columns=missing)
         return True
