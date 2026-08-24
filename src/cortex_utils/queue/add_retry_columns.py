@@ -7,7 +7,7 @@ from typing import Any
 import psycopg2
 import structlog
 
-from cortex_utils.queue.ops import require_queue_table
+from cortex_utils.queue.ops import MIGRATION_LOCK_TIMEOUT_MS, _tx, require_queue_table
 
 log = structlog.get_logger()
 
@@ -49,7 +49,15 @@ def add_retry_columns(
         log.info("Would add queue.next_attempt_at + supporting index")
         return {"status": "dry_run", "would_add_column": "next_attempt_at"}
 
-    with conn.cursor() as cur:
+    # Bounded, and through _tx, for the same reasons ensure_claim_token_column
+    # gives: this now runs on every service boot rather than as a manual CLI
+    # step, and an unbounded ALTER queues ACCESS EXCLUSIVE on the parent -- which
+    # blocks new readers while it waits, so a slow boot can wedge the live queue
+    # instead of failing fast. Measured at 8s unbounded against a held lock,
+    # versus 5s to fail. Without _tx a failure also left the caller's connection
+    # aborted, which on a boot path is the next statement's problem.
+    with _tx(conn) as cur:
+        cur.execute("SET LOCAL lock_timeout = %s", (f"{MIGRATION_LOCK_TIMEOUT_MS}ms",))
         cur.execute(
             """
             ALTER TABLE queue
@@ -63,6 +71,5 @@ def add_retry_columns(
             WHERE status = 'pending'
             """
         )
-    conn.commit()
     log.info("Added queue.next_attempt_at column and idx_queue_ready")
     return {"status": "applied"}
