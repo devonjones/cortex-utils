@@ -73,6 +73,14 @@ class QueueHealth:
 
     depths: list[QueueDepth]
     dead_letter: int
+    """Open dead letters: not dismissed, not already retried.
+
+    The same set DeadLetterManager.list_jobs() and get_stats() report by
+    default. Two human-facing views of one number that filter differently is
+    worse than either being wrong alone -- whichever you read last is the one
+    you believe.
+    """
+
     partitioned: bool
     partition_headroom_days: int | None
     self_healed_partitions: int
@@ -219,7 +227,19 @@ SELECT
         (SELECT json_agg(row_to_json(depth) ORDER BY queue_name) FROM depth),
         '[]'::json
     ),
-    (SELECT COUNT(*) FROM dead_letter),
+    -- Open only, matching DeadLetterManager.list_jobs() and get_stats(). An
+    -- unfiltered count here would put a dashboard and a digest on different
+    -- numbers for the same thing, which is the failure the dead-letter
+    -- lifecycle exists to prevent -- built into the library rather than merely
+    -- tolerated.
+    --
+    -- The predicate below is chosen by the caller, not user input:
+    -- either the lifecycle filter or TRUE, depending on whether this schema has
+    -- been migrated. Doing it that way rather than through to_jsonb keeps the
+    -- read sargable -- to_jsonb is not, and on a 50k-row archive it turned a
+    -- 0.1ms index-only scan into a 118ms sequential one, on a path documented
+    -- for polling and over a table this release stops deleting from.
+    (SELECT COUNT(*) FROM dead_letter WHERE {dl_open}),
     -- Whether the table is partitioned at all. Without this, a plain queue --
     -- a supported pre-migration state, since this package ships
     -- migrate_to_partitioned() -- has no pg_inherits rows and so reports the
@@ -241,7 +261,21 @@ def health(conn: psycopg2.extensions.connection) -> QueueHealth:
     self-healing partitions because maintenance stopped.
     """
     with _tx(conn) as cur:
-        cur.execute(_HEALTH_SQL, {"marker": SELF_HEALED_MARKER})
+        # One cheap catalogue read before the main statement. health() is
+        # read-only and gets called during an upgrade window, so it must work on
+        # a dead_letter table that predates the lifecycle columns -- naming them
+        # unconditionally is how the CLI's show and retry broke. Two small round
+        # trips beat one that scans the whole archive.
+        cur.execute(
+            "SELECT COUNT(*) = 2 FROM pg_attribute "
+            "WHERE attrelid = to_regclass('dead_letter') "
+            "AND attname IN ('dismissed_at', 'retried_at') AND NOT attisdropped"
+        )
+        has_lifecycle = bool(cur.fetchone()[0])
+        # Nothing can have been dismissed on a schema with nowhere to record it,
+        # so every row is open there.
+        dl_open = "dismissed_at IS NULL AND retried_at IS NULL" if has_lifecycle else "TRUE"
+        cur.execute(_HEALTH_SQL.format(dl_open=dl_open), {"marker": SELF_HEALED_MARKER})
         depths, dead_letter, partitioned, headroom, self_healed, now = cur.fetchone()
 
     return QueueHealth(

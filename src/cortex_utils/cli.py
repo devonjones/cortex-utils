@@ -273,9 +273,16 @@ def dead_letter() -> None:
 @click.option("--queue", "queue_name", help="Filter by queue name")
 @click.option("--since", help="Only jobs failed within duration (e.g., 24h, 7d)")
 @click.option("--limit", default=20, help="Max jobs to show")
+@click.option(
+    "--include-resolved", is_flag=True, help="Also show jobs already retried or written off"
+)
 @click.pass_context
 def dead_letter_list(
-    ctx: click.Context, queue_name: str | None, since: str | None, limit: int
+    ctx: click.Context,
+    queue_name: str | None,
+    since: str | None,
+    limit: int,
+    include_resolved: bool,
 ) -> None:
     """List dead letter jobs."""
     config = ctx.obj["config"]
@@ -289,21 +296,33 @@ def dead_letter_list(
         dlm = DeadLetterManager(conn)
         dlm.ensure_table()
 
-        jobs = dlm.list_jobs(queue_name=queue_name, since=since_delta, limit=limit)
+        jobs = dlm.list_jobs(
+            queue_name=queue_name,
+            since=since_delta,
+            limit=limit,
+            include_resolved=include_resolved,
+        )
 
         if not jobs:
             click.echo("No dead letter jobs found.")
             return
 
-        click.echo(f"{'ID':<8} {'Queue':<12} {'Failed At':<20} {'Error (truncated)':<40}")
+        click.echo(f"{'ID':<8} {'Queue':<12} {'Failed At':<20} {'St':<4} {'Error':<36}")
         click.echo("-" * 80)
         for job in jobs:
-            error = (job["last_error"] or "")[:37]
-            if len(job["last_error"] or "") > 37:
+            error = (job["last_error"] or "")[:33]
+            if len(job["last_error"] or "") > 33:
                 error += "..."
+            # A row that was already retried or written off looks identical to an
+            # untouched one otherwise, which makes the list unusable for triage.
+            state = "--"
+            if job["dismissed_at"]:
+                state = "DIS"
+            elif job["retried_at"]:
+                state = "RTY"
             click.echo(
                 f"{job['id']:<8} {job['queue_name']:<12} "
-                f"{str(job['failed_at'])[:19]:<20} {error:<40}"
+                f"{str(job['failed_at'])[:19]:<20} {state:<4} {error:<36}"
             )
     finally:
         conn.close()
@@ -319,6 +338,9 @@ def dead_letter_show(ctx: click.Context, job_id: int) -> None:
 
     try:
         dlm = DeadLetterManager(conn)
+        # Every command that reads the lifecycle columns must migrate first:
+        # these two selected them on a table that might not have them yet.
+        dlm.ensure_table()
         job = dlm.get_job(job_id)
 
         if not job:
@@ -361,15 +383,44 @@ def dead_letter_retry(
 
     try:
         dlm = DeadLetterManager(conn)
+        # Every command that reads the lifecycle columns must migrate first:
+        # these two selected them on a table that might not have them yet.
+        dlm.ensure_table()
 
         if job_id:
             if dlm.retry_job(job_id, dry_run=dry_run):
                 click.echo(f"Retried job {job_id}")
             else:
-                click.echo(f"Job {job_id} not found")
+                # "not found" for a row the operator can see in the list, with
+                # exit 0, is worse than saying nothing.
+                click.echo(f"Did not retry job {job_id}: {dlm.why_not_retryable(job_id)}", err=True)
+                ctx.exit(1)
         else:
             count = dlm.retry_jobs(queue_name=queue_name, since=since_delta, dry_run=dry_run)
             click.echo(f"Retried {count} jobs")
+    finally:
+        conn.close()
+
+
+@dead_letter.command("dismiss")
+@click.argument("dead_letter_id", type=int)
+@click.pass_context
+def dead_letter_dismiss(ctx: click.Context, dead_letter_id: int) -> None:
+    """Write a job off. Terminal, but keeps the record.
+
+    DEAD_LETTER_ID is an id from `dead-letter list`, not a queue id.
+    """
+    config = ctx.obj["config"]
+    conn = get_connection(config)
+
+    try:
+        dlm = DeadLetterManager(conn)
+        dlm.ensure_table()
+        if dlm.dismiss(dead_letter_id):
+            click.echo(f"Dismissed dead letter job {dead_letter_id}.")
+        else:
+            click.echo(f"No dead letter job with id {dead_letter_id}.", err=True)
+            ctx.exit(1)
     finally:
         conn.close()
 
@@ -406,8 +457,11 @@ def dead_letter_purge(
 
 
 @dead_letter.command("stats")
+@click.option(
+    "--include-resolved", is_flag=True, help="Also count jobs already retried or written off"
+)
 @click.pass_context
-def dead_letter_stats(ctx: click.Context) -> None:
+def dead_letter_stats(ctx: click.Context, include_resolved: bool) -> None:
     """Show dead letter queue statistics."""
     config = ctx.obj["config"]
     conn = get_connection(config)
@@ -415,9 +469,10 @@ def dead_letter_stats(ctx: click.Context) -> None:
     try:
         dlm = DeadLetterManager(conn)
         dlm.ensure_table()
-        stats = dlm.get_stats()
+        stats = dlm.get_stats(include_resolved=include_resolved)
 
-        click.echo(f"Dead Letter Queue: {stats['total']} total jobs")
+        scope = "total" if include_resolved else "open"
+        click.echo(f"Dead Letter Queue: {stats['total']} {scope} jobs")
         click.echo("")
 
         if stats["by_queue"]:

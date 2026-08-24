@@ -304,48 +304,46 @@ one up to date. `health()` reads that table, so without it the call fails.
 
 ---
 
-## Open question: dead-letter replay deletes the archive (from cryo)
+## Dead letters
 
-`DeadLetterManager.retry_job()` re-enqueues the payload and then **deletes** the
-`dead_letter` row, both in one transaction. The atomicity is right — a crash
-between the two would leave the job queued *and* still dead-lettered. The
-question is the delete itself.
+```python
+from cortex_utils.queue import DeadLetterManager
 
-That row is the record that a piece of work was given up on, when, after how
-many attempts, and with what error. Replay erases it, so the failure history
-disappears at exactly the moment someone acts on it — and if the same item dies
-again next week, the fact that it already died once is gone.
+dlm = DeadLetterManager(conn)
+dlm.ensure_table()                       # on boot; idempotent
+dlm.list_jobs(queue_name="triage")       # open items only
+dlm.retry_job(dead_letter_id)            # re-enqueue, keep the record
+dlm.dismiss(dead_letter_id)              # write off, keep the record
+dlm.purge(older_than=timedelta(days=30)) # retention, by age
+```
 
-cryo hit this concretely. Its 2026-08-18 outage looked like it had cost four
-videos; two more were already in `dead_letter` with the identical
-`visibility timeout, attempts exhausted`, invisible to every `queue` query, and
-were only found because someone thought to ask. Replaying them under
-`retry_job()` would have removed the only evidence they had ever failed.
+Failed rows are archived here before their partition is dropped. Ids in this
+table are a **separate namespace** from queue ids — both number from 1 — so
+every parameter says `dead_letter_id`.
 
-There is also no **terminal state**. `purge(older_than)` is retention, not a
-decision: nothing records "this will never be done". Without one the list only
-grows, genuinely-undoable items accumulate, real failures end up buried in
-noise, and a triage list nobody can clear stops being read.
+**Retry keeps the archive row.** It stamps `retried_at` / `retried_as` rather
+than deleting. That row is the record that work was given up on, when, after how
+many attempts and with what error, and it is exactly the history you want when
+the same item dies again. Retry refuses a row that was already retried: if the
+retry itself failed, that failure archived a *new* row, and that is the one to
+retry.
 
-cryo therefore keeps its own dead-letter layer rather than adopting
-`DeadLetterManager`, which by the shared-library rule means this is a gap
-rather than a boundary. What cryo does, offered as one possible shape:
+**`dismiss()` is the terminal state** — not destructive, and idempotent, because
+the date answers *when did we stop caring about this* and moving it forward on a
+stray re-dismissal destroys the only thing it records. Without a terminal state
+the list only grows until real failures are buried in noise and nobody reads it.
 
-- **replay leaves the row in place**, and the row's own state is what stops a
-  second replay. `enqueue()`'s dedup does *not* cover this: dedup is opt-in via
-  `dedup_key` and `retry_job()` passes none, so with the delete gone and nothing
-  else added, a second sweep re-enqueues everything the first put back and
-  overwrites the record of where it went. (Verified against live Postgres: three
-  dead letters, two sweeps, six queue rows.)
-- **`dismissed_at TIMESTAMPTZ`** is the terminal state: idempotent, so
-  re-dismissing keeps the date it was actually written off, and the row stays
-  in the table as history while leaving the default view.
-- **the depth counter counts undismissed rows only**, so the number on a
-  dashboard and the number in a digest cannot disagree.
+**One number.** `list_jobs()`, `get_stats()` and `health().dead_letter` all
+report the same set — open, meaning neither dismissed nor retried. `list_jobs`
+and `get_stats` share an `include_resolved` flag. A page reporting 2 while a
+digest reports 6 is worse than either being wrong alone.
 
-Deciding this is yours — the counter-argument (a dead-letter table that only
-grows is its own problem, and `purge` is the answer) is reasonable. Recording
-it because cryo cannot adopt the module until it is settled.
+**`purge()` is by age alone**, dismissed or not. `dismiss()` is the triage verb
+and this is the housekeeping one; a row old enough to purge and still not
+dismissed was never triaged, and keeping it forever would not fix that.
+
+*This section answers cryo's G7, which is why it uses cryo's `dismissed_at`
+name: an existing cryo schema satisfies the shared one without a rename.*
 
 ---
 
