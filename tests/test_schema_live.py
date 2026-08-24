@@ -430,3 +430,233 @@ def test_both_entry_points_agree_about_what_a_queue_is(conn) -> None:
     with pytest.raises(QueueTableNotFoundError):
         has_claim_token_column(conn)
     conn.rollback()
+
+
+# --- indexes a consumer hands over -------------------------------------------
+
+CRYO_DEDUP = (
+    "idx_queue_dedup_video",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup_video ON queue "
+    "((payload->>'video_id'), created_at) WHERE queue_name = 'drain'",
+)
+
+
+def test_a_consumer_index_is_created_alongside_the_canonical_ones(conn) -> None:
+    """The point of taking these: a consumer that adopts ensure_queue_table and
+    deletes its own DDL otherwise loses them silently -- nothing here would put
+    them back, and the absence shows up as a slow query or a constraint that has
+    quietly stopped constraining."""
+    assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "created"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 't_schema' AND tablename = 'queue'"
+        )
+        names = {r[0] for r in cur.fetchall()}
+    assert {"idx_queue_claim", "idx_queue_stale", "idx_queue_dedup_video"} <= names
+
+
+def test_a_partial_unique_index_dedups_within_a_transaction_only(conn) -> None:
+    """Recorded because a consumer relies on one as a "dedup backstop".
+
+    The truth is narrower than either "it works" or "it does nothing". A unique
+    index on a partitioned table must include the partition key, so the key is
+    (payload->>'video_id', created_at). NOW() is transaction_timestamp(), so two
+    inserts in ONE transaction share a created_at and the index catches the
+    second. Two producers in SEPARATE transactions get different timestamps and
+    both rows satisfy it.
+
+    Concurrent producers are the case dedup exists for, so as a backstop it is
+    not one. That is why enqueue() takes a transaction-scoped advisory lock.
+    Handing the index over is still right -- it serves lookups -- it just must
+    not be mistaken for the thing keeping duplicates out.
+    """
+    ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    _today_partition(conn)
+    row = "INSERT INTO queue (queue_name, payload) VALUES ('drain', %s::jsonb)"
+    payload = '{"video_id": "v1"}'
+
+    # Same transaction: caught.
+    with pytest.raises(psycopg2.errors.UniqueViolation):
+        with conn.cursor() as cur:
+            cur.execute(row, (payload,))
+            cur.execute(row, (payload,))
+    conn.rollback()
+
+    # Separate transactions, which is what two producers actually are: not caught.
+    other = psycopg2.connect(DSN)
+    try:
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_schema")
+            cur.execute(row, (payload,))
+        other.commit()
+        with conn.cursor() as cur:
+            cur.execute(row, (payload,))
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM queue WHERE payload->>'video_id' = 'v1'")
+            assert cur.fetchone()[0] == 2, (
+                "if this is ever 1 the index started backstopping and this note is stale"
+            )
+    finally:
+        other.rollback()
+        other.close()
+
+    # The thing that does hold across producers.
+    assert enqueue(conn, "drain", {"video_id": "v2"}, dedup_key="video_id") is not None
+    assert enqueue(conn, "drain", {"video_id": "v2"}, dedup_key="video_id") is None
+
+
+def test_consumer_indexes_are_asked_about_before_being_created(conn) -> None:
+    """Same discipline as the canonical ones: CREATE INDEX IF NOT EXISTS still
+    takes a lock and waits on an open writer even when the index exists, and
+    this runs on every boot."""
+    ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    _today_partition(conn)
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_schema")
+        other.autocommit = False
+        with other.cursor() as cur:
+            cur.execute("INSERT INTO queue (queue_name, payload) VALUES ('t', '{}'::jsonb)")
+
+        conn.rollback()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '2000ms'")
+        conn.autocommit = False
+
+        assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "present"
+    finally:
+        other.rollback()
+        other.close()
+
+
+def test_a_boot_without_them_does_not_remove_them(conn) -> None:
+    """ensure_queue_table only ever creates. A caller that forgets to pass its
+    indexes on one boot must not lose them -- the failure should be that they
+    were never made, not that they were taken away."""
+    ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    assert ensure_queue_table(conn) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('idx_queue_dedup_video')")
+        assert cur.fetchone()[0] is not None
+
+
+def test_a_name_taken_by_something_that_is_not_an_index_does_not_count(conn) -> None:
+    """to_regclass resolving proves a name is taken, not that the index exists.
+    Reading it as proof means the CREATE is skipped forever and the index
+    silently never exists -- and opening the name space to consumers is what
+    makes that collision realistic rather than theoretical."""
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl())
+        cur.execute("CREATE TABLE idx_queue_dedup_video (x int)")  # squats the name
+    conn.commit()
+
+    with pytest.raises(QueueError, match="did not create an index"):
+        ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    conn.rollback()
+
+
+def test_a_statement_that_does_not_create_the_promised_name_is_refused(conn) -> None:
+    """A mismatch is not a one-off: with IF NOT EXISTS the statement runs on
+    every boot, taking exactly the lock the probe exists to avoid; without it,
+    the second boot raises DuplicateTable and the service gets no queue."""
+    mismatched = (
+        "idx_queue_promised",
+        "CREATE INDEX IF NOT EXISTS idx_queue_actual ON queue (queue_name)",
+    )
+    with pytest.raises(QueueError, match="idx_queue_promised"):
+        ensure_queue_table(conn, extra_indexes=[mismatched])
+    conn.rollback()
+
+
+def test_an_extra_cannot_take_over_a_canonical_index(conn) -> None:
+    """Canonical first. Reversed, a consumer silently replaces the index
+    claim() depends on -- this module's subject matter from the other side."""
+    hijack = (
+        "idx_queue_claim",
+        "CREATE INDEX IF NOT EXISTS idx_queue_claim ON queue (last_error)",
+    )
+    assert ensure_queue_table(conn, extra_indexes=[hijack]) == "created"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_claim' AND i.indrelid = to_regclass('queue')"
+        )
+        definition = cur.fetchone()[0]
+    assert "priority" in definition, f"the consumer took it over: {definition}"
+    assert "last_error" not in definition
+
+
+def test_an_index_added_later_arrives_on_the_present_path(conn) -> None:
+    """`present` is every boot after the first, and is how a consumer adds an
+    index once the table already exists -- the common case, not the rare one."""
+    assert ensure_queue_table(conn) == "created"
+    assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video' AND i.indrelid = to_regclass('queue')"
+        )
+        assert cur.fetchone() is not None
+
+
+def test_the_same_index_name_in_another_schema_is_not_ours(conn) -> None:
+    """The probe matches relname, which is schema-blind, so the binding to
+    THIS table's oid is what makes the answer mean anything. Without it, a
+    neighbouring schema that named an index the same thing makes our CREATE be
+    skipped forever -- the bare-relname shape that cost cortex 4.8 days, one
+    relation kind over.
+    """
+    with conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA other")
+        cur.execute("SET search_path = other")
+        cur.execute(queue_ddl())
+        cur.execute("CREATE INDEX idx_queue_dedup_video ON queue ((payload->>'video_id'))")
+        cur.execute("SET search_path = t_schema")
+    conn.commit()
+
+    assert ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP]) == "created"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video' "
+            "AND i.indrelid = to_regclass('t_schema.queue')"
+        )
+        assert cur.fetchone()[0] == 1, "our schema must get its own index"
+
+
+def test_an_invalid_index_does_not_count_as_present(conn) -> None:
+    """CREATE INDEX ON ONLY a partitioned parent leaves an invalid index. It
+    resolves, it joins, and without the indisvalid check it would pass the
+    probe forever while indexing nothing."""
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl())
+        cur.execute(
+            "CREATE TABLE queue_today PARTITION OF queue "
+            "FOR VALUES FROM (CURRENT_DATE) TO (CURRENT_DATE + 1)"
+        )
+        cur.execute("CREATE INDEX idx_queue_dedup_video ON ONLY queue ((payload->>'video_id'))")
+        cur.execute(
+            "SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_queue_dedup_video'"
+        )
+        assert cur.fetchone()[0] is False, "premise: ON ONLY leaves it invalid"
+    conn.commit()
+
+    # The name is taken by an invalid index, so ours cannot be created under it
+    # -- but the failure must be loud rather than a silent skip.
+    with pytest.raises((QueueError, psycopg2.Error)):
+        ensure_queue_table(conn, extra_indexes=[CRYO_DEDUP])
+    conn.rollback()

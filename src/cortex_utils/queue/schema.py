@@ -22,6 +22,8 @@ its absence.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import psycopg2
 import structlog
 
@@ -89,11 +91,12 @@ CREATE TABLE IF NOT EXISTS {table} (
 
 # Names, deliberately not idx_queue_pending / idx_queue_processing. migrate.py
 # already creates indexes under both of those on any migrated deployment, with
-# different column lists -- and _ensure_indexes treats a name that resolves as
-# "the index is there". Reusing either name would mean the canonical index is
-# silently never created on exactly the deployments that have been around
-# longest. That is this module's own subject matter: two definitions sharing an
-# identifier, with the difference invisible until a query is slow.
+# different column lists, and renames them onto queue -- so they are indexes on
+# this table and _index_present finds them. Reusing either name would mean the
+# canonical index is silently never created on exactly the deployments that have
+# been around longest, and a claim() that quietly stopped having an index. That
+# is this module's own subject matter: two definitions sharing an identifier,
+# with the difference invisible until a query is slow.
 CLAIM_INDEX = "idx_{table}_claim"
 STALE_INDEX = "idx_{table}_stale"
 
@@ -181,11 +184,31 @@ def missing_columns(conn: psycopg2.extensions.connection, table: str = "queue") 
     return _inspect(conn, table)[2]
 
 
-def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue") -> str:
+def ensure_queue_table(
+    conn: psycopg2.extensions.connection,
+    table: str = "queue",
+    extra_indexes: Sequence[tuple[str, str]] = (),
+) -> str:
     """Make `table` exist with the canonical shape. Safe on every boot.
 
     Returns "created" if this call made it, "present" if it was already there
     and compatible.
+
+    `extra_indexes` is (name, CREATE INDEX statement) pairs a consumer needs on
+    top of the canonical ones -- a payload expression index, a per-queue partial
+    index to keep a hot lookup cheap. Not a unique index for dedup: on a
+    partitioned table the key must include created_at, so two producers in
+    separate transactions both satisfy it. Use enqueue()'s dedup_key, which
+    takes an advisory lock. They are applied with the same discipline as ours:
+    the catalogue is asked first, because CREATE INDEX IF NOT EXISTS still takes
+    a lock and waits on an open writer even when the index is already there, and
+    this runs on every boot.
+
+    Passing them here rather than keeping a private migration is the point. A
+    consumer that adopts this function and deletes its own DDL otherwise loses
+    those indexes silently -- nothing here would put them back, and the absence
+    shows up as a slow query or a constraint that has quietly stopped
+    constraining. Hand them over instead.
 
     Raises QueueError if it exists but is missing columns the primitives need.
     Adding them here is not safe to do silently: this package cannot know
@@ -208,7 +231,7 @@ def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue
                 table=table,
                 hint="run migrate-queue to partition it; retention needs partitions",
             )
-        _ensure_indexes(conn, table)
+        _ensure_indexes(conn, table, extra_indexes)
         return "present"
 
     if exists:
@@ -223,22 +246,68 @@ def ensure_queue_table(conn: psycopg2.extensions.connection, table: str = "queue
 
     with _tx(conn) as cur:
         cur.execute(queue_ddl(table))
-    _ensure_indexes(conn, table)
+    _ensure_indexes(conn, table, extra_indexes)
     log.info("Created queue table", table=table)
     return "created"
 
 
-def _ensure_indexes(conn: psycopg2.extensions.connection, table: str) -> None:
+def _ensure_indexes(
+    conn: psycopg2.extensions.connection,
+    table: str,
+    extra: Sequence[tuple[str, str]] = (),
+) -> None:
     """Create any missing index, asking first.
 
     CREATE INDEX IF NOT EXISTS still takes a lock and waits on an open writer
     even when the index is already there, and its queued ShareLock times out
     inserts behind it. This runs on every boot, so it asks the catalogue.
     """
-    for name, statement in queue_indexes(table):
+    # Canonical first, deliberately. An extra whose name collides with
+    # idx_queue_claim is then discarded rather than replacing it -- reversed,
+    # a consumer would silently take over the index claim() depends on.
+    for name, statement in [*queue_indexes(table), *extra]:
         with _tx(conn) as cur:
-            cur.execute("SELECT to_regclass(%s)", (name,))
-            if cur.fetchone()[0] is not None:
+            if _index_present(cur, table, name):
                 continue
             cur.execute(statement)
-        log.info("Created queue index", index=name)
+            # Ask again. The statement is the consumer's, so nothing until this
+            # moment guarantees it creates the index the name promised -- and a
+            # mismatch is not a one-off: with IF NOT EXISTS the statement runs
+            # on every boot, taking exactly the lock the probe exists to avoid;
+            # without it, the second boot raises DuplicateTable and the service
+            # gets no queue at all. This is the one point where it is provable.
+            if not _index_present(cur, table, name):
+                raise QueueError(
+                    f"{statement.strip()[:60]}... did not create an index named "
+                    f"{name!r} on {table}. The name and the statement have to "
+                    "agree; the name is what every later boot checks."
+                )
+        log.info("Created queue index", index=name, table=table)
+
+
+def _index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bool:
+    """True if `name` is an index ON `table`.
+
+    Not to_regclass(name): that proves a name is taken, which is the thing this
+    module refuses to accept as proof elsewhere. A table, a sequence, or an
+    index on some other relation all resolve, and reading any of them as "the
+    index is there" means the CREATE is skipped forever and the index silently
+    never exists. Opening the name space to consumers is what makes that
+    collision realistic rather than theoretical.
+
+    indisvalid for the same reason one step further in: CREATE INDEX ON ONLY a
+    partitioned parent leaves an invalid index, which resolves and joins and
+    would otherwise pass this check forever while indexing nothing.
+
+    Takes a cursor rather than a connection so it shares the caller's
+    transaction. The post-CREATE probe has to see the uncommitted index; opening
+    its own would commit the CREATE before checking it, which is the difference
+    between a mismatch rolling back cleanly and leaving an orphan index under a
+    name no later boot will look for.
+    """
+    cur.execute(
+        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s) AND i.indisvalid",
+        (name, table),
+    )
+    return cur.fetchone() is not None

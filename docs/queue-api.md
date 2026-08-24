@@ -41,6 +41,30 @@ version until we tag releases.
 
 ---
 
+## The rule
+
+**Unless there is an app-level reason to join queue data against another table,
+`cortex_utils` owns all SQL that talks to the queue database.**
+
+Not a style preference. Every incident this package has been shaped by came
+from a second copy of some query or shape existing somewhere else and drifting:
+partition lookups that matched a same-named table in another schema and cost
+4.8 days of email; a `queue_new` DDL missing three columns the primitives
+require; a dead-letter retry that deleted the record it existed to keep. One
+owner is the only arrangement where a fix reaches everyone.
+
+So the practical consequence, for a consumer and for cortex's own services
+alike:
+
+- **If you are writing SQL against the queue, that is a gap here.** Report it
+  rather than writing it. Every gap reported so far turned out to be a real
+  missing primitive, and several turned out to be live bugs on this side.
+- **A join against your own tables is the exception**, because this package
+  cannot know your schema. Read what you need through the API, join in your own
+  query, and keep the queue side of it here.
+- **Schema included.** `ensure_queue_table()` owns the shape; hand your extra
+  indexes to it rather than keeping a private migration alongside it.
+
 ## The five primitives
 
 ```python
@@ -280,6 +304,92 @@ never a Python cutoff.
 **Nothing reports an outcome it did not confirm.** A `DELETE` whose `rowcount`
 is never read is the same defect as a success-reporting `except`, with no
 exception to grep for.
+
+---
+
+## The table
+
+```python
+from cortex_utils.queue import ensure_queue_table, missing_columns, queue_ddl
+
+ensure_queue_table(conn)     # on boot; idempotent. "created" or "present"
+missing_columns(conn)        # [] means the shape is compatible
+```
+
+The table shape **is** the contract — every primitive compiles assumptions
+about the status values, `attempts`/`max_attempts`, `next_attempt_at`,
+`claimed_by` and the partition key. Maintaining your own copy means maintaining
+half of an interface whose other half lives here, and the two drift silently.
+
+`ensure_queue_table()` **only ever creates.** None of the SQL this package
+emits for it is a `DROP` or an `ALTER`. (Statements you pass in `extra_indexes`
+run verbatim — it does not inspect them, so that guarantee covers our half, not
+yours.) If the table exists and is missing columns the primitives need, it
+raises and names them, plus the migration for the two that have one — adding them silently
+would take `ACCESS EXCLUSIVE` on a live queue, and this package cannot tell a
+table that predates a column from one you shape deliberately.
+
+### What it owns, and what stays yours
+
+It owns the columns in `REQUIRED_COLUMNS`, the status `CHECK`, the partition
+key, and exactly two indexes: `idx_queue_claim` and `idx_queue_stale`, which
+`claim()`'s own queries need.
+
+**Hand your own indexes over rather than keeping a private migration.** If you
+need more — a per-queue partial index, a payload expression index — pass them:
+
+```python
+ensure_queue_table(conn, extra_indexes=[
+    ("idx_queue_dedup_video",
+     "CREATE INDEX IF NOT EXISTS idx_queue_dedup_video ON queue "
+     "((payload->>'video_id')) WHERE queue_name = 'drain'"),
+])
+```
+
+They get the same discipline as the canonical ones: the catalogue is asked
+before each `CREATE INDEX`, because `IF NOT EXISTS` still takes a lock and waits
+on an open writer even when the index is already there, and this runs on every
+boot.
+
+This matters at the moment of adoption. `ensure_queue_table()` only ever
+creates — it will not remove an index you made — but a consumer that adopts it
+and *deletes its own DDL* loses those indexes on any fresh deployment, and the
+absence is silent until the query they served turns slow.
+
+`missing_columns()` treats extra columns as fine. Composing on top is the point;
+only absence is a problem.
+
+> **A partial unique index is not a dedup backstop.** Worth stating because it
+> reads like one. A unique index on a partitioned table must include the
+> partition key, so the key becomes `(your_field, created_at)`. `NOW()` is
+> `transaction_timestamp()`, so two inserts in *one* transaction share a
+> timestamp and the second is rejected — but two producers in *separate*
+> transactions get different ones and both rows satisfy the index. Concurrent
+> producers are the case dedup exists for. Use `dedup_key`, which takes a
+> transaction-scoped advisory lock; keep the index for lookups if it earns its
+> place.
+
+### Naming
+
+Names are checked against `pg_index` bound to this table, not against
+`to_regclass`. A name that resolves to a table, a sequence, or an index on some
+*other* relation does not count as your index being present — otherwise the
+`CREATE` is skipped forever and the index silently never exists. The statement
+is also re-probed immediately after it runs, so a name that disagrees with what
+the statement actually creates is refused at the one moment that is provable
+rather than becoming a lock on every boot.
+
+Canonical indexes are applied first, so an extra that collides with
+`idx_queue_claim` is discarded rather than taking it over.
+
+The canonical indexes are deliberately **not** `idx_queue_pending` or
+`idx_queue_processing`. `migrate.py` already creates indexes under both of those
+names with different column lists, and renames them onto `queue` — so they are
+indexes on this table and the probe finds them. Reusing either name would mean
+the canonical index is silently never created on exactly the deployments that
+have been around longest, and a `claim()` that has quietly stopped having an
+index to use.
+Pick names of your own that collide with neither set.
 
 ---
 
