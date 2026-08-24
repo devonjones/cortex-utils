@@ -26,14 +26,22 @@ capture_logs, so anything that reaches for it inherits the same trap.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
 import structlog
 
 
-@pytest.fixture(autouse=True)
-def _isolate_structlog_configuration() -> Iterator[None]:
+@contextmanager
+def structlog_configuration_restored() -> Iterator[None]:
+    """Put back whatever structlog configuration was in place on entry.
+
+    A plain contextmanager rather than only a fixture so the restore branch is
+    reachable from a test. This suite never configures structlog at entry, so
+    every test takes the reset_defaults() path and the other one would otherwise
+    ship unexecuted -- see test_basic.py.
+    """
     was_configured = structlog.is_configured()
     saved: dict[str, Any] | None = dict(structlog.get_config()) if was_configured else None
     try:
@@ -43,3 +51,9 @@ def _isolate_structlog_configuration() -> Iterator[None]:
             structlog.configure(**saved)
         else:
             structlog.reset_defaults()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_structlog_configuration() -> Iterator[None]:
+    with structlog_configuration_restored():
+        yield

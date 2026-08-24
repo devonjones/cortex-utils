@@ -245,3 +245,49 @@ def test_the_log_stream_is_resolved_per_write_not_at_import() -> None:
     assert "redirected-marker" in captured.getvalue(), (
         "the stream was captured when the logger was built, not resolved per write"
     )
+
+
+def test_the_conftest_fixture_restores_a_configuration_it_found() -> None:
+    """conftest's fixture has two branches and this suite only reaches one.
+
+    Nothing here configures structlog at entry, so every test takes the
+    reset_defaults() path and the restore path never runs. That asymmetry is
+    how an untested branch ships, and it is not hypothetical: a consumer running
+    this suite inside their own structlog setup would have it reset out from
+    under them -- the library reaching past its consumer's configuration, which
+    is the fault the whole log module exists to avoid.
+
+    Driven directly rather than through capture_logs(), because capture_logs
+    turns out to restore correctly when structlog WAS configured -- it only
+    leaks from the unconfigured state. So no test using it can reach this
+    branch, which is exactly why it needs driving by hand.
+    """
+    import io
+
+    import structlog
+
+    from tests.conftest import structlog_configuration_restored
+
+    sink = io.StringIO()
+    structlog.configure(
+        processors=[structlog.processors.JSONRenderer()],
+        logger_factory=structlog.PrintLoggerFactory(file=sink),
+        cache_logger_on_first_use=False,
+    )
+    original = dict(structlog.get_config())
+    try:
+        with structlog_configuration_restored():
+            # A test mutates it, the way any test touching structlog might.
+            structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=io.StringIO()))
+            assert structlog.get_config()["logger_factory"] is not original["logger_factory"]
+
+        assert structlog.get_config()["logger_factory"] is original["logger_factory"], (
+            "the caller's configuration was not restored -- their logging is "
+            "now going somewhere they did not choose"
+        )
+        from cortex_utils.log import get_logger
+
+        get_logger("probe").info("restored", k=1)
+        assert "restored" in sink.getvalue()
+    finally:
+        structlog.reset_defaults()
