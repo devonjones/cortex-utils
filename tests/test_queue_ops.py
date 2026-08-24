@@ -182,7 +182,9 @@ def test_claim_orders_by_priority_and_skips_locked() -> None:
 
 
 def test_claim_returns_the_worker_facing_job_shape() -> None:
-    conn = _conn(fetchall=[(7, "triage", {"gmail_id": "abc"}, 2, 5)])
+    """The whole dict, not a subset: this is the contract consumers build on,
+    so a field appearing or vanishing should be a deliberate edit here."""
+    conn = _conn(fetchall=[(7, "triage", {"gmail_id": "abc"}, 2, 5, ROW_CREATED_AT)])
     jobs = claim(conn, "triage", WORKER)
     assert jobs == [
         {
@@ -191,8 +193,21 @@ def test_claim_returns_the_worker_facing_job_shape() -> None:
             "payload": {"gmail_id": "abc"},
             "attempts": 2,
             "priority": 5,
+            # Free: partitioning forces created_at into the primary key, so the
+            # CTE already joins on it. Without it a consumer that needs the age
+            # of the work runs a second query per claimed row.
+            "created_at": ROW_CREATED_AT,
         }
     ]
+
+
+def test_claim_asks_the_database_for_created_at() -> None:
+    """It has to come from the RETURNING, not from a second query or a client
+    clock -- created_at is server-produced and half the primary key."""
+    conn = _conn(fetchall=[(7, "triage", {}, 0, 0, ROW_CREATED_AT)])
+    claim(conn, "triage", WORKER)
+    sql = [s for s, _ in conn.cur.executed if "RETURNING" in s][0]
+    assert "q.created_at" in sql.split("RETURNING")[1]
 
 
 def test_claim_passes_the_worker_as_the_token() -> None:

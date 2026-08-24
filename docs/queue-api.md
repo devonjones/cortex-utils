@@ -21,6 +21,19 @@ Not on PyPI and not in Artifact Registry — a public GitHub repo installed by
 URL, so `pip install -r requirements.txt` needs no registry auth. Your image
 needs `git`.
 
+**Dependency weight, from cryo's integration.** Installing this for the queue
+alone pulls the whole package's base dependencies — `docker`, `schedule`,
+`prometheus-client`, `pydantic`, `httpx`, `pyyaml`, `click` — into the image.
+`src/cortex_utils/queue/` itself imports only `psycopg2` and `structlog`, plus
+stdlib. cryo's daemon went from four dependencies to roughly thirty by adding
+this line.
+
+That is not a blocker and cryo shipped it, but a `queue` extra with a lighter
+base would make the package cheaper for a consumer that wants one subsystem.
+Splitting it needs an audit of what the *other* modules genuinely require,
+which is yours to do — recording the observation and the evidence rather than
+guessing at the split from outside.
+
 **Pin a SHA, not a branch.** Existing consumers pin different SHAs on purpose,
 so each upgrades on its own cadence. `version` in `pyproject.toml` has said
 `0.1.0` since the repo began and is vestigial; the SHA is the only honest
@@ -67,6 +80,18 @@ forfeit the partition self-heal below, because it needs to commit DDL.
 ### `claim(conn, queue_name, worker, limit=1, visibility_timeout_min=30) -> list[dict]`
 
 `FOR UPDATE SKIP LOCKED`, so N workers polling the same queue never collide.
+
+Each dict has `id`, `queue_name`, `payload`, `attempts`, `priority`,
+`created_at`.
+
+`created_at` is there so you do not have to ask a second time — it is half the
+primary key, so the claim already had it. **It is for reading.** Together with
+`id` it is the whole key, which makes a partition-pruned `UPDATE` easy to write
+and tempting; any such write bypasses the claim token, which is the one thing
+standing between a stalled worker and reporting on a row somebody else has since
+claimed. Report through `complete()` / `release()` / `fail_or_retry()`. It is
+also a *server* timestamp, so compare it server-side rather than against a local
+`datetime.now()`.
 
 **`worker` is required and must be non-empty** — `QueueError` otherwise. It is
 the claim token, and it is the whole point: `complete()` and `release()` match
@@ -279,21 +304,78 @@ one up to date. `health()` reads that table, so without it the call fails.
 
 ---
 
+## Open question: dead-letter replay deletes the archive (from cryo)
+
+`DeadLetterManager.retry_job()` re-enqueues the payload and then **deletes** the
+`dead_letter` row, both in one transaction. The atomicity is right — a crash
+between the two would leave the job queued *and* still dead-lettered. The
+question is the delete itself.
+
+That row is the record that a piece of work was given up on, when, after how
+many attempts, and with what error. Replay erases it, so the failure history
+disappears at exactly the moment someone acts on it — and if the same item dies
+again next week, the fact that it already died once is gone.
+
+cryo hit this concretely. Its 2026-08-18 outage looked like it had cost four
+videos; two more were already in `dead_letter` with the identical
+`visibility timeout, attempts exhausted`, invisible to every `queue` query, and
+were only found because someone thought to ask. Replaying them under
+`retry_job()` would have removed the only evidence they had ever failed.
+
+There is also no **terminal state**. `purge(older_than)` is retention, not a
+decision: nothing records "this will never be done". Without one the list only
+grows, genuinely-undoable items accumulate, real failures end up buried in
+noise, and a triage list nobody can clear stops being read.
+
+cryo therefore keeps its own dead-letter layer rather than adopting
+`DeadLetterManager`, which by the shared-library rule means this is a gap
+rather than a boundary. What cryo does, offered as one possible shape:
+
+- **replay leaves the row in place**, and the row's own state is what stops a
+  second replay. `enqueue()`'s dedup does *not* cover this: dedup is opt-in via
+  `dedup_key` and `retry_job()` passes none, so with the delete gone and nothing
+  else added, a second sweep re-enqueues everything the first put back and
+  overwrites the record of where it went. (Verified against live Postgres: three
+  dead letters, two sweeps, six queue rows.)
+- **`dismissed_at TIMESTAMPTZ`** is the terminal state: idempotent, so
+  re-dismissing keeps the date it was actually written off, and the row stays
+  in the table as history while leaving the default view.
+- **the depth counter counts undismissed rows only**, so the number on a
+  dashboard and the number in a digest cannot disagree.
+
+Deciding this is yours — the counter-argument (a dead-letter table that only
+grows is its own problem, and `purge` is the answer) is reasonable. Recording
+it because cryo cannot adopt the module until it is settled.
+
+---
+
 ## Known limitations
 
-**No live-Postgres coverage of `ops.py`.** The suite is mock-based and
-mutation-tested, but `SKIP LOCKED` not double-claiming, advisory-lock
-serialisation, and the partition-creation race cannot be asserted against a
-mock. They were argued in review and, for the `DuplicateTable`-vs-
-`UniqueViolation` question, settled by racing a throwaway Postgres 16 by hand.
-A container-based selfcheck is the single most valuable contribution back.
+**One concurrency branch is still unreached.** `SKIP LOCKED` not
+double-claiming and advisory-lock serialisation now have live-Postgres
+coverage — `tests/test_ops_live.py`, contributed by cryo, two real connections
+genuinely raced, and CI fails if that layer silently skips.
+
+What remains uncovered is `_ensure_partition`'s `DuplicateTable` handler.
+Nothing reaches it: the mock tests synthesise the exception, and it could not be
+provoked through `enqueue()` at all — an uncommitted `CREATE` on one connection
+blocks the other on the parent's `ACCESS EXCLUSIVE` before it can reach
+`CheckViolation`, and four producers behind a barrier came back clean 12 times
+out of 12, one reporting `created` and the rest `present` because the pre-check
+had already seen the winner's partition. Two sessions issuing the raw
+`CREATE TABLE IF NOT EXISTS ... PARTITION OF` simultaneously *does* raise it
+(40/40 `42P07`), so the branch is right — it is just not reachable from here.
 
 **Claim-loss is encoded two ways** — `False` from `complete()`/`release()`,
 `"stale"` from `fail_or_retry()` — so a worker loop cannot share a branch.
 Unification is tracked as cortex-i5jc.
 
-**`claim()` returns `list[dict[str, Any]]`,** not a `TypedDict`. Worth doing
-once the field set settles.
+**`claim()` returns `list[dict[str, Any]]`,** not a `TypedDict`. The fields are
+`id`, `queue_name`, `payload`, `attempts`, `priority`, `created_at` — that last
+one is free, because partitioning forces it into the primary key so the CTE has
+the row in hand anyway, and without it a consumer needing the age of the work
+runs a second query per claimed row. Worth a `TypedDict` now the set has
+settled.
 
 **No LISTEN/NOTIFY.** Cortex polls. Keep any notify trigger consumer-side for
 now; when it moves here it moves with a validated `channel` parameter.

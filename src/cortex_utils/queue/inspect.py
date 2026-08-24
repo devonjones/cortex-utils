@@ -35,7 +35,13 @@ from typing import Any
 import psycopg2
 import structlog
 
-from cortex_utils.queue.ops import SELF_HEALED_MARKER, QueueError, _tx, enqueue
+from cortex_utils.queue.ops import (
+    SELF_HEALED_MARKER,
+    QueueError,
+    _tx,
+    enqueue,
+    is_dedup_value,
+)
 
 log = structlog.get_logger()
 
@@ -128,6 +134,35 @@ class Failure:
     max_attempts: int
     last_error: str | None
     created_at: datetime
+
+    def ref(self, dedup_key: str | None) -> str | None:
+        """The value that IDENTIFIES this work, without the rest of the payload.
+
+        A failure list needs to say WHICH item failed, and consumers reach for
+        `payload` to get it — which hands the whole payload to whatever renders
+        the list. That is often more than the surface should hold: cryo's drain
+        payloads carry URLs captured from browser tabs, including from private
+        sessions, and its failure list renders inside a privileged browser
+        extension page.
+
+        Offering the identifying value directly makes the minimal thing the
+        easy thing. Consumers that genuinely need the payload still have it;
+        those that only need a label no longer have to remember to strip it.
+
+        Returns exactly the values the queue will let you dedup on, and None for
+        anything else -- including a key that is absent, or one whose value is a
+        container. str() on a container yields its Python repr, which would hand
+        the renderer a stringified blob of the very thing this method exists to
+        keep out of it: a caller who passes the wrong key would get more
+        exposure, not less, and silently.
+
+        Shares one predicate with enqueue()'s validation rather than restating
+        the rule, so the promise above cannot drift from what enqueue accepts.
+        """
+        if not dedup_key:
+            return None
+        value = (self.payload or {}).get(dedup_key)
+        return str(value) if is_dedup_value(value) else None
 
 
 _HEALTH_SQL = """
@@ -333,5 +368,17 @@ def resubmit(
             # rather than leaving the work queued twice.
             raise QueueError(f"resubmit could not cancel job {job_id}; rolled back")
 
-    log.info("Resubmitted failed job", original=job_id, new=new_id, queue=queue_name)
+    # Say which of the two things happened. new_id is None when the enqueue
+    # deduped against work that is already live again -- a correct and common
+    # outcome, but "Resubmitted failed job ... new=None" reads as a resubmit
+    # that produced nothing, which is the one line an operator would grep for
+    # while working out why a requeue seemed to vanish.
+    if new_id is None:
+        log.info(
+            "Resubmit deduped: work already queued",
+            original=job_id,
+            queue=queue_name,
+        )
+    else:
+        log.info("Resubmitted failed job", original=job_id, new=new_id, queue=queue_name)
     return new_id

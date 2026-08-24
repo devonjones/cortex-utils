@@ -390,6 +390,21 @@ def _is_missing_partition(exc: psycopg2.Error) -> bool:
     return not getattr(exc.diag, "constraint_name", None)
 
 
+def is_dedup_value(value: Any) -> bool:
+    """True if the queue can deduplicate on this value.
+
+    One predicate rather than the rule written twice: inspect.Failure.ref()
+    promises to return "exactly the values the queue will let you dedup on", and
+    a promise like that decays the moment the two copies can drift.
+
+    bool is excluded even though isinstance(True, int) is True, because
+    str(True) is "True" while Postgres jsonb ->> yields "true" -- a mismatch
+    that makes dedup silently never fire. Floats and containers diverge the same
+    way; rejecting them loudly beats a comparison that quietly never matches.
+    """
+    return isinstance(value, _DEDUP_VALUE_TYPES) and not isinstance(value, bool)
+
+
 def _validate_dedup(dedup_key: str, payload: dict[str, Any]) -> str:
     """Check the dedup key is a usable identifier and its value is comparable."""
     if not _IDENTIFIER_RE.match(dedup_key):
@@ -397,7 +412,7 @@ def _validate_dedup(dedup_key: str, payload: dict[str, Any]) -> str:
     if dedup_key not in payload:
         raise QueueError(f"dedup_key {dedup_key!r} is absent from the payload")
     value = payload[dedup_key]
-    if not isinstance(value, _DEDUP_VALUE_TYPES) or isinstance(value, bool):
+    if not is_dedup_value(value):
         raise QueueError(
             f"dedup_key {dedup_key!r} holds {type(value).__name__}; "
             "only str and int dedup cleanly against jsonb text output"
@@ -545,7 +560,8 @@ def claim(
             SET status = 'processing', claimed_at = NOW(), claimed_by = %(w)s
             FROM claimable c
             WHERE q.id = c.id AND q.created_at = c.created_at
-            RETURNING q.id, q.queue_name, q.payload, q.attempts, q.priority
+            RETURNING q.id, q.queue_name, q.payload, q.attempts, q.priority,
+                      q.created_at
             """,
             {"q": queue_name, "vis": visibility_timeout_min, "lim": limit, "w": worker},
         )
@@ -556,6 +572,25 @@ def claim(
                 "payload": r[2],
                 "attempts": r[3],
                 "priority": r[4],
+                # Free: partitioning forces created_at into the primary key, so
+                # the CTE already joins on it and the row is already in hand.
+                # Without it a consumer that needs the age of the work -- to
+                # route it, to report it, to decide it is too old to bother
+                # with -- must issue a second query per claimed row. Verified
+                # against PG16: EXPLAIN is byte-identical with and without it.
+                #
+                # It is for READING. Together with `id` it is the whole primary
+                # key, which makes a partition-pruned UPDATE easy to write and
+                # tempting -- and any such UPDATE bypasses the claim token,
+                # which is the one thing standing between a stalled worker and
+                # reporting on a row somebody else has since claimed. Report
+                # through complete()/release()/fail_or_retry(); they match on
+                # claimed_by and tell you when you have lost the row.
+                #
+                # It is also a SERVER timestamp. Comparing it to a local
+                # datetime.now() is two clocks; ask the server for the
+                # comparison, as everything else in this package does.
+                "created_at": r[5],
             }
             for r in cur.fetchall()
         ]

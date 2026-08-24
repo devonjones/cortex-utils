@@ -316,3 +316,63 @@ def test_resubmit_carries_the_original_priority_and_the_dedup_key() -> None:
     assert insert[1][0] == "triage"
     assert 0 in insert[1], "the original priority"
     assert any("gmail_id" in str(p) for _, p in conn.cur.executed), "the dedup key"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"vid": "abc"}, "abc"),
+        ({"vid": 42}, "42"),
+        ({"vid": 0}, "0"),  # falsy but present
+        # A container's repr would hand the renderer a stringified blob of the
+        # very thing ref() exists to keep out of it -- more exposure, not less.
+        ({"a": {"b": 1}}, None),
+        ({"vid": ["x"]}, None),
+        # str(True) is "True" but jsonb ->> yields "true"; enqueue rejects bool
+        # dedup values for exactly that reason, so ref() must not render one.
+        ({"vid": True}, None),
+        ({"vid": 1.5}, None),
+        ({"vid": None}, None),
+        ({}, None),
+    ],
+)
+def test_ref_returns_only_what_the_queue_can_dedup_on(payload, expected) -> None:
+    failure = Failure(1, "q", payload, 3, 3, "boom", NOW)
+    assert failure.ref("vid" if "vid" in payload or not payload else "a") == expected
+
+
+def test_ref_without_a_dedup_key_returns_nothing() -> None:
+    """A queue with no dedup key has no identifying field to offer."""
+    assert Failure(1, "q", {"vid": "abc"}, 3, 3, "boom", NOW).ref(None) is None
+
+
+def test_a_deduped_resubmit_does_not_log_as_a_resubmit() -> None:
+    """`new=None` on a "Resubmitted" line reads as a resubmit that produced
+    nothing, and it is the line an operator greps while working out why a
+    requeue seemed to vanish. Both outcomes are correct; only one is a resubmit.
+    """
+    import structlog
+
+    for new_id, expected in ((99, "Resubmitted failed job"), (None, "Resubmit deduped")):
+        conn = _resubmit_conn(new_id=new_id)
+        with structlog.testing.capture_logs() as logs:
+            resubmit(conn, 5)
+        events = [entry["event"] for entry in logs]
+        assert any(expected in e for e in events), f"{new_id} -> {events}"
+        assert len(events) == 1, "one line, not both"
+
+
+def test_ref_and_enqueue_agree_on_what_a_dedup_value_is() -> None:
+    """ref() promises "exactly the values the queue will let you dedup on".
+    Two copies of that rule would drift; this asserts there is one."""
+    from cortex_utils.queue.ops import _validate_dedup
+
+    for value in ("abc", 42, 0, True, 1.5, None, {"b": 1}, ["x"]):
+        payload = {"vid": value}
+        ref = Failure(1, "q", payload, 3, 3, "boom", NOW).ref("vid")
+        try:
+            _validate_dedup("vid", payload)
+        except QueueError:
+            assert ref is None, f"enqueue rejects {value!r} but ref() rendered {ref!r}"
+        else:
+            assert ref is not None, f"enqueue accepts {value!r} but ref() dropped it"

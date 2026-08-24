@@ -104,6 +104,18 @@ def _server_today(conn) -> date:
         return cur.fetchone()[0]
 
 
+def _backdated(conn, day: date) -> None:
+    """Cover yesterday too.
+
+    A test that backdates a row by hours silently depends on the clock: at
+    03:00 `NOW() - INTERVAL '6 hours'` lands on yesterday, which has no
+    partition, and the insert raises CheckViolation. Found the hard way when
+    midnight passed mid-session. Retention would drop yesterday in production;
+    here it just has to exist.
+    """
+    _partition(conn, day - timedelta(days=1))
+
+
 def _partition(conn, day: date, self_healed: bool = False) -> str:
     name = f"queue_{day.strftime('%Y_%m_%d')}"
     with conn.cursor() as cur:
@@ -226,6 +238,7 @@ def test_oldest_ready_age_ignores_deferred_rows(conn) -> None:
     """A week-old row still backing off is not a week of queue latency."""
     today = _server_today(conn)
     _partition(conn, today)
+    _backdated(conn, today)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO queue (queue_name, payload, created_at, next_attempt_at) "
@@ -248,6 +261,7 @@ def test_oldest_ready_age_is_the_oldest_not_the_newest(conn) -> None:
     is worst, and this is the only latency signal health() emits."""
     today = _server_today(conn)
     _partition(conn, today)
+    _backdated(conn, today)
     with conn.cursor() as cur:
         for minutes in (1, 240, 90):
             cur.execute(
