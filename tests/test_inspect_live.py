@@ -33,6 +33,7 @@ from cortex_utils.queue.dead_letter import DEAD_LETTER_SCHEMA  # noqa: E402
 from cortex_utils.queue.inspect import failures, health, resubmit, stuck  # noqa: E402
 from cortex_utils.queue.ops import (  # noqa: E402
     SELF_HEALED_MARKER,
+    JobNotFailedError,
     QueueError,
     QueueTableNotFoundError,
     enqueue,
@@ -735,4 +736,68 @@ def test_health_counts_dead_letters_on_a_schema_predating_the_lifecycle_columns(
     conn.commit()
 
     assert health(conn).dead_letter == 1, "every row is open where none can be dismissed"
+    conn.rollback()
+
+
+def test_zero_partitions_on_a_partitioned_table_is_distinguishable(conn) -> None:
+    """cryo's G11, second half. `oldest_partition_age_days is None` means two
+    opposite things, and the obvious guard goes silent on the dangerous one.
+
+      non-partitioned queue          -> None, benign: nothing to age
+      PARTITIONED, zero partitions   -> None, critical: no row can be written
+
+    A monitor writing `if age is not None and age > retention` skips exactly the
+    case where the queue is already dead. partition_count separates them without
+    inference -- which is the point, because it was inferred wrongly twice.
+    """
+    from cortex_utils.queue.partitions import PartitionManager
+
+    PartitionManager(conn).create_future_partitions(days_ahead=1)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('queue')")
+        assert cur.fetchone()[0] > 0, "should have partitions before we take them away"
+        cur.execute(
+            "SELECT string_agg(format('DROP TABLE %s', inhrelid::regclass), '; ') "
+            "FROM pg_inherits WHERE inhparent = to_regclass('queue')"
+        )
+        cur.execute(cur.fetchone()[0])
+    conn.commit()
+
+    h = health(conn)
+    assert h.partitioned is True
+    assert h.partition_count == 0
+    assert h.oldest_partition_age_days is None
+    assert h.partition_headroom_days is None
+    assert h.is_healthy is False, "a partitioned queue with no partitions is not healthy"
+    conn.rollback()
+
+
+def test_a_stale_id_and_an_internal_bug_raise_different_exceptions(conn) -> None:
+    """cryo's G11, first half. resubmit() raises for three conditions and a
+    batch caller has to tell them apart:
+
+      caller error (both dedup args)  -> QueueError, a programming mistake
+      not a failed row                -> JobNotFailedError, skip and carry on
+      cancel could not update         -> QueueError, "not a race -- it is a bug"
+
+    Collapsing the last two makes a broken internal invariant look like a stale
+    click. With one exception type the only way to separate them was to re-read
+    failures() after the raise and infer, which cryo wrote and got wrong first.
+
+    JobNotFailedError subclasses QueueError, so anything catching the base type
+    keeps working.
+    """
+    job_id = enqueue(conn, "q", {"n": 1})
+    conn.commit()
+
+    # A live pending row is not a failed row -- the ordinary, skippable case.
+    with pytest.raises(JobNotFailedError) as caught:
+        resubmit(conn, job_id)
+    assert isinstance(caught.value, QueueError), "must stay catchable as the base type"
+    conn.rollback()
+
+    # The caller error keeps the base type: it is not a row you skip.
+    with pytest.raises(QueueError) as caught2:
+        resubmit(conn, job_id, dedup_key="a", dedup_keys={"b": 1})
+    assert not isinstance(caught2.value, JobNotFailedError)
     conn.rollback()

@@ -98,6 +98,23 @@ class QueueError(RuntimeError):
     """Base for queue operation failures."""
 
 
+class JobNotFailedError(QueueError):
+    """resubmit() was given a job id that is not a failed row.
+
+    Its own condition, because resubmit() raises for three different things and
+    a batch caller has to tell them apart: a caller error (both dedup arguments),
+    THIS -- the ordinary "someone already handled it, or the id was stale" -- and
+    the cancel-rollback path, which resubmit's own comment calls "not a race, it
+    is a bug".
+
+    Collapsing the last two loses the distinction that matters: one is a row to
+    skip and carry on, the other is an internal invariant broken, and reporting
+    that as a stale click is how it stays unnoticed. Without a subclass the only
+    way to separate them is to re-read failures() after the raise and infer --
+    which cryo had to write, and got wrong first.
+    """
+
+
 class PartitionError(QueueError):
     """Base for partition-management failures, so callers can catch the category."""
 
