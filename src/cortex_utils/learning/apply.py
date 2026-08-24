@@ -14,6 +14,7 @@ loop live in the service that runs the bot.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import psycopg2
@@ -67,13 +68,22 @@ def claim_proposal_apply_jobs(
     on failure — so a job's attempt count reflects failures, not claims. Does
     not commit.
     """
+    # cortex_utils hand-writing its own claim is the same rule violation the
+    # deprecation exists to flag, and it needs the same port (cortex-xluv) --
+    # it also takes no worker identity, so it cannot set a claim token. Silenced
+    # here only so the warning means "a consumer still needs porting" instead of
+    # firing on ourselves every time this module is imported.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        predicate = ready_predicate()
+
     with conn.cursor() as cur:
         cur.execute(
             f"""
             WITH claimable AS (
                 SELECT id FROM queue
                 WHERE queue_name = %s AND status = 'pending'
-                  AND {ready_predicate()}
+                  AND {predicate}
                 ORDER BY priority DESC, id
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s

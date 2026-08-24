@@ -14,6 +14,11 @@ from cortex_utils.queue.retry import (
     ready_predicate,
 )
 
+# This module exists to test the legacy entry points, so their own deprecation
+# warnings are expected here and only drown out real ones. pytest.warns still
+# fires under an ignore filter, so the test that asserts them still works.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
 
 def test_backoff_doubles_each_attempt() -> None:
     delays = [
@@ -170,3 +175,19 @@ def test_exhausting_retries_keeps_the_token_as_a_record() -> None:
     assert fail_or_retry(conn, job_id=42, error="boom", max_attempts=5) == "failed"
     failed_sql = cur.execute.call_args_list[1][0][0]
     assert "claimed_by" not in failed_sql, failed_sql
+
+
+def test_both_legacy_entry_points_warn() -> None:
+    """The warning is the port checklist. All five cortex workers import these
+    two names, so turning the deprecation on lights up exactly the call sites
+    the port has to visit -- at no cost, and without breaking anyone today.
+
+    Worth pinning because both are easy to lose: the docstrings said DEPRECATED
+    for months while the functions warned about nothing, and a docstring is not
+    something a consumer's CI can see.
+    """
+    conn, _ = _mock_conn((1, "processing"))
+    with pytest.warns(DeprecationWarning, match="ops.fail_or_retry"):
+        fail_or_retry(conn, job_id=1, error="boom", max_attempts=5)
+    with pytest.warns(DeprecationWarning, match="claim"):
+        ready_predicate()

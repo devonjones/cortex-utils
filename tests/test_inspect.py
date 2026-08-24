@@ -40,6 +40,7 @@ HEALTH_ROW = (
     True,
     5,
     0,
+    3,  # oldest_partition_age_days
     NOW,
 )
 
@@ -68,7 +69,10 @@ class FakeCursor:
 
     def fetchone(self) -> Any:
         if self.executed and "pg_attribute" in self.executed[-1][0]:
-            return (True,)  # this schema has the lifecycle columns
+            # (table present, has the lifecycle columns) -- one probe answers
+            # both, because a missing table and a missing column need different
+            # substitutions and the old single answer could not tell them apart.
+            return (True, True)
         return self._fetchone
 
     def fetchall(self) -> Any:
@@ -158,6 +162,7 @@ def test_is_healthy_covers_both_ways_the_queue_dies(headroom, healed, expected) 
         partitioned=True,
         partition_headroom_days=headroom,
         self_healed_partitions=healed,
+        oldest_partition_age_days=3,
         server_time=NOW,
     )
     assert h.is_healthy is expected
@@ -311,11 +316,12 @@ def test_every_scalar_lands_in_its_own_field() -> None:
     SELECT-list-to-unpack correspondence was free to drift. HEALTH_ROW already
     carries distinct values; asserting all of them costs one line."""
     got = health(_conn(fetchone=HEALTH_ROW))
-    assert (got.dead_letter, got.partition_headroom_days, got.self_healed_partitions) == (
-        7,
-        5,
-        0,
-    )
+    assert (
+        got.dead_letter,
+        got.partition_headroom_days,
+        got.self_healed_partitions,
+        got.oldest_partition_age_days,
+    ) == (7, 5, 0, 3)
     assert got.server_time == NOW
     assert got.depths[0].queue_name == "triage"
 

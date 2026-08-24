@@ -670,3 +670,24 @@ def test_a_negative_window_is_refused(conn) -> None:
 
     today = _server_today(conn)
     assert manager.partition_exists(today) is False, "nothing was created"
+
+
+def test_health_survives_a_schema_with_no_dead_letter_table(conn) -> None:
+    """health() is the call an operator makes when things are already wrong, so
+    it has to work on a half-provisioned schema rather than crash on one.
+
+    Reachable without doing anything exotic: ensure_queue_table() is exported
+    alongside ensure_queue_schema() and does not create dead_letter, so a
+    consumer who picks the wrong one gets a working queue and a monitor that
+    raises UndefinedTable. The pre-probe defended against the table missing its
+    lifecycle COLUMNS but not against the table being absent -- it swapped the
+    WHERE clause while the statement still named dead_letter.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS dead_letter")
+    conn.commit()
+
+    result = health(conn)
+
+    assert result.dead_letter == 0, "nowhere to record dead letters means none"
+    assert result.depths is not None, "the rest of the report must still arrive"

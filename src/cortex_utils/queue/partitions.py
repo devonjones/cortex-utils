@@ -19,6 +19,7 @@ from typing import Any
 import psycopg2
 
 from cortex_utils.log import get_logger
+from cortex_utils.queue.dead_letter import DeadLetterManager
 from cortex_utils.queue.ops import (
     PartitionError,
     PartitionNotAttachedError,
@@ -172,7 +173,14 @@ class PartitionManager:
 
         With force=True the live jobs are re-enqueued with a fresh created_at --
         so they land in today's partition, not the one being dropped -- and the
-        drop proceeds.
+        drop proceeds. priority and next_attempt_at survive the move; attempts
+        is reset, because the job is being relocated rather than retried.
+
+        A forced move of a partition holding `processing` rows gives those rows
+        a second, pending copy while the original worker is still running: the
+        work may execute twice, and that worker's report then bounces against a
+        row that no longer exists. force=True is for unwedging retention, not
+        routine maintenance.
 
         With archive_failed=False the failed rows go with the partition. Nothing
         else preserves them; this is not a soft delete.
@@ -269,14 +277,24 @@ class PartitionManager:
                     )
                     requeued_count = active_count
                 else:
+                    # priority and next_attempt_at carry over. Dropping them
+                    # silently promoted a -100 backfill to 0 -- ahead of
+                    # real-time mail, which is the exact thing that priority
+                    # exists to prevent -- and cleared a backoff, so a job
+                    # waiting out an hour became immediately ready. Both via
+                    # the tool an operator reaches for to unwedge retention.
+                    #
+                    # attempts deliberately does NOT: the row is being moved
+                    # rather than retried, and a job that keeps its spent
+                    # budget across a forced move would fail on arrival.
                     cur.execute(f"""
                         INSERT INTO queue (
-                            queue_name, payload, status, attempts, max_attempts,
-                            last_error, created_at
+                            queue_name, payload, status, priority, attempts,
+                            max_attempts, last_error, next_attempt_at, created_at
                         )
                         SELECT
-                            queue_name, payload, 'pending', 0, max_attempts,
-                            last_error, NOW()
+                            queue_name, payload, 'pending', priority, 0,
+                            max_attempts, last_error, next_attempt_at, NOW()
                         FROM {partition_name}
                         WHERE status IN ('pending', 'processing');
                     """)
@@ -491,6 +509,16 @@ class PartitionManager:
             days_ahead=days_ahead,
             dry_run=dry_run,
         )
+
+        if not dry_run:
+            # The archive step below writes to dead_letter, and only
+            # ensure_queue_schema() guarantees it exists. This runs from cron on
+            # a host that may never boot a service -- and because creation
+            # happens before dropping, a missing table meant partitions kept
+            # being created while retention silently stopped, with nothing but a
+            # cron log line to say so. Every dead-letter CLI command already
+            # ensures the table; the one that writes to it did not.
+            DeadLetterManager(self.conn).ensure_table()
 
         created = self.create_future_partitions(days_ahead=days_ahead, dry_run=dry_run)
         drop_result = self.drop_old_partitions(
