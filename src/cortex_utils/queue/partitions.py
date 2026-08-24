@@ -194,22 +194,27 @@ class PartitionManager:
             return {"archived_failed": 0, "requeued": 0, "dropped_rows": 0}
 
         try:
-            return self._drop_locked(partition_name, partition_date, archive_failed, force, dry_run)
+            return self._drop_locked(partition_name, archive_failed, force, dry_run)
         except Exception:
-            # Every exit that is not an exception rolls back or commits
-            # explicitly; this is the one that did not. The LOCK TABLE below is
-            # held for the transaction, so a failure anywhere after it left the
-            # connection in a failed transaction still holding SHARE ROW
-            # EXCLUSIVE -- and drop_old_partitions() loops on that same
-            # connection, so every later partition failed too, for a reason
-            # belonging to the first one.
+            # A PYTHON-side exception is what this catches, and it is worth
+            # being exact about, because the obvious story is wrong: a database
+            # error does NOT leak the lock. Postgres releases locks at
+            # AbortTransaction -- when the statement errors, not when the client
+            # gets around to sending ROLLBACK -- so a CheckViolation under the
+            # LOCK leaves an aborted transaction holding nothing.
+            #
+            # An exception raised in our own code between the LOCK and the
+            # commit never reaches the server, so nothing aborts: the
+            # transaction stays open and SHARE ROW EXCLUSIVE stays held, on a
+            # connection the caller is likely to keep. Measured -- without this,
+            # the backend sits `idle in transaction` with the lock and the next
+            # writer gets LockNotAvailable; with it, `idle` and no locks.
             self.conn.rollback()
             raise
 
     def _drop_locked(
         self,
         partition_name: str,
-        partition_date: date,
         archive_failed: bool,
         force: bool,
         dry_run: bool,
