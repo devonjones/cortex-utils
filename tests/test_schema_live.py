@@ -359,3 +359,43 @@ def test_the_stale_index_can_serve_the_recovery_scan(conn) -> None:
 
     assert "queue_name_status_claimed_at" in plan, plan
     assert "Filter: " not in plan, f"queue_name should be an Index Cond, not a Filter:\n{plan}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "ddl"),
+    [
+        ("view", "CREATE VIEW queue AS SELECT 1 AS id"),
+        ("materialized view", "CREATE MATERIALIZED VIEW queue AS SELECT 1 AS id"),
+        ("sequence", "CREATE SEQUENCE queue"),
+    ],
+)
+def test_something_that_is_not_a_table_is_named_as_such(conn, kind, ddl) -> None:
+    """to_regclass resolving is not proof the thing is a table -- the same
+    argument this module makes about index names, one relation kind over.
+
+    Before this check: a matview with the right column names returned
+    "present", a view raised a raw WrongObjectType from inside _ensure_indexes,
+    and a sequence was reported as a table missing every column it never had.
+    Each is a wrong diagnosis of a search_path problem.
+    """
+    with conn.cursor() as cur:
+        cur.execute(ddl)
+    conn.commit()
+
+    with pytest.raises(QueueError, match=kind):
+        ensure_queue_table(conn)
+    conn.rollback()
+
+
+def test_a_matview_with_the_right_columns_is_still_not_a_queue(conn) -> None:
+    """The contrived case is the one that used to pass silently."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE MATERIALIZED VIEW queue AS SELECT "
+            + ", ".join(f"NULL::text AS {name}" for name in REQUIRED_COLUMNS)
+        )
+    conn.commit()
+
+    with pytest.raises(QueueError, match="materialized view"):
+        ensure_queue_table(conn)
+    conn.rollback()

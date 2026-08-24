@@ -52,6 +52,18 @@ REQUIRED_COLUMNS: dict[str, str] = {
     "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
 }
 
+# pg_class.relkind, for saying what was found instead of a table.
+_RELKINDS = {
+    "v": "view",
+    "m": "materialized view",
+    "i": "index",
+    "I": "partitioned index",
+    "S": "sequence",
+    "f": "foreign table",
+    "c": "composite type",
+    "t": "TOAST table",
+}
+
 VALID_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
 
 
@@ -138,6 +150,19 @@ def _inspect(conn: psycopg2.extensions.connection, table: str) -> tuple[bool, bo
     if row is None:
         return False, False, list(REQUIRED_COLUMNS)
     relkind, present = row
+
+    # to_regclass resolving is not proof that `table` is a table -- the same
+    # argument this module makes about index names, one relation kind over. A
+    # matview with the right column names would otherwise read as "present", a
+    # view would raise WrongObjectType from inside _ensure_indexes, and a
+    # sequence would be reported as a table missing every column it never had.
+    if relkind not in ("r", "p"):
+        raise QueueError(
+            f"{table} exists but is a {_RELKINDS.get(relkind, relkind)}, not a table. "
+            "Check the connection's search_path -- the queue primitives need a "
+            "table (partitioned, ideally) of that name."
+        )
+
     present = set(present or ())
     return True, relkind == "p", [n for n in REQUIRED_COLUMNS if n not in present]
 
