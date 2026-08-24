@@ -510,17 +510,25 @@ class PartitionManager:
             dry_run=dry_run,
         )
 
+        created = self.create_future_partitions(days_ahead=days_ahead, dry_run=dry_run)
+
         if not dry_run:
-            # The archive step below writes to dead_letter, and only
+            # The archive step inside the drop writes to dead_letter, and only
             # ensure_queue_schema() guarantees it exists. This runs from cron on
             # a host that may never boot a service -- and because creation
             # happens before dropping, a missing table meant partitions kept
             # being created while retention silently stopped, with nothing but a
             # cron log line to say so. Every dead-letter CLI command already
             # ensures the table; the one that writes to it did not.
+            #
+            # AFTER the create, deliberately. Ahead of it, anything this raises
+            # -- a name collision caught by _ensure_index's post-probe, or
+            # LockNotAvailable off DDL_LOCK_TIMEOUT_MS -- takes the write path's
+            # headroom down with it, and the horizon is what stops enqueues
+            # failing. Trading "retention stops silently" for "tomorrow has no
+            # partition" is not the trade this fix is making.
             DeadLetterManager(self.conn).ensure_table()
 
-        created = self.create_future_partitions(days_ahead=days_ahead, dry_run=dry_run)
         drop_result = self.drop_old_partitions(
             retention_days=retention_days,
             archive_failed=True,

@@ -569,8 +569,9 @@ settled.
 `== "retrying"` check gives you a comparison that is silently always false.
 
 `__all__` now lists only the surface you should reach for — boot, work, watch,
-operate. Everything else stays importable by name from `cortex_utils.queue`;
-nothing was removed. It is simply no longer advertised, because the package had
+operate. Everything else stays importable **by name** from `cortex_utils.queue`;
+nothing was removed. The one case that does change is `import *`, which no
+longer pulls in the 18 unadvertised names. It is simply no longer advertised, because the package had
 accumulated two inspection APIs, two ways to create the schema, and every
 migration internal at top level, which invited callers to run the pieces that
 `ensure_queue_schema()` exists to sequence.

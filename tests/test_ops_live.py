@@ -381,3 +381,25 @@ def test_a_per_connection_timezone_override_is_reported(conns, capsys) -> None:
     server_today(a)
     assert "TimeZone is overridden per connection" in capsys.readouterr().err
     a.rollback()
+
+    # PGOPTIONS is what the docstring is actually about, and it lands as
+    # source='client', not 'session'. Covering only the SET TIME ZONE shape
+    # meant 'client' could be deleted from the predicate with the suite green --
+    # the named cause untested, the incidental one pinned.
+    opts = psycopg2.connect(DSN, options="-c timezone=America/New_York")
+    try:
+        capsys.readouterr()
+        server_today(opts)
+        assert "TimeZone is overridden per connection" in capsys.readouterr().err
+    finally:
+        opts.close()
+
+    # And the one that is NOT a finding: a zone every connection inherits from
+    # the server is consistent by construction.
+    b = psycopg2.connect(DSN)
+    try:
+        capsys.readouterr()
+        server_today(b)
+        assert "TimeZone" not in capsys.readouterr().err
+    finally:
+        b.close()

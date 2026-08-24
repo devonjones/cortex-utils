@@ -298,6 +298,21 @@ def _partition_name(day: date) -> str:
     return f"queue_{day.strftime('%Y_%m_%d')}"
 
 
+# GUC sources that mean "the server handed this out", so every connection to it
+# agrees. Everything else -- 'client' (PGOPTIONS), 'session' (SET TIME ZONE),
+# 'user' (ALTER ROLE ... SET) and 'database' (ALTER DATABASE ... SET) -- is a
+# per-connection or per-role override.
+#
+# Written as an allow-list, not a deny-list. The first version named only
+# 'client' and 'session', which missed 'user' and 'database' -- and ALTER ROLE
+# is the IDIOMATIC way to give one application its own timezone in a shared
+# database, so it missed the likeliest cause of the disagreement it looks for.
+# An unknown future source now reads as suspicious rather than as fine.
+_INHERITED_TIMEZONE_SOURCES = frozenset(
+    {"default", "configuration file", "environment variable", "command line", "override"}
+)
+
+
 def server_today(conn: psycopg2.extensions.connection) -> date:
     """Today according to the server, not this process.
 
@@ -324,16 +339,15 @@ def server_today(conn: psycopg2.extensions.connection) -> date:
     """
     with _tx(conn) as cur:
         # Folded into the same round trip the date already costs. pg_settings
-        # reports where the value came from; 'client' or 'session' means this
-        # connection was handed its own TimeZone rather than inheriting the
-        # server's, which is exactly how two connections on one queue end up
-        # framing day boundaries differently.
+        # reports where the value came from; anything the server did not hand
+        # out means this connection was given its own TimeZone, which is how two
+        # connections on one queue end up framing day boundaries differently.
         cur.execute(
             "SELECT CURRENT_DATE, current_setting('TimeZone'), "
             "(SELECT source FROM pg_settings WHERE name = 'TimeZone')"
         )
         today, zone, source = cur.fetchone()
-    if source in ("client", "session"):
+    if source not in _INHERITED_TIMEZONE_SOURCES:
         # A warning, not an error: a deployment where every connection sets the
         # same zone this way is consistent and fine. What cannot be checked from
         # one connection is whether the OTHER ones agree -- so this reports the

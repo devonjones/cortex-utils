@@ -24,6 +24,7 @@ import pytest
 psycopg2 = pytest.importorskip("psycopg2")
 
 from cortex_utils.queue.dead_letter import DeadLetterManager  # noqa: E402
+from cortex_utils.queue.ops import QueueError, server_today  # noqa: E402
 from cortex_utils.queue.partitions import PartitionManager  # noqa: E402
 from cortex_utils.queue.schema import ensure_queue_schema  # noqa: E402
 
@@ -66,8 +67,16 @@ def conn():
 
 
 def _old_partition_with(conn, statuses: list[str], days_old: int = 10) -> date:
-    """Build a real partition `days_old` days back and put one row per status in it."""
-    day = date.today() - timedelta(days=days_old)
+    """Build a real partition `days_old` days back and put one row per status in it.
+
+    Dated from the SERVER, not date.today(). created_at is TIMESTAMPTZ DEFAULT
+    NOW(), a value the server produces, so a partition framed by the client's
+    clock only lines up when both happen to share a timezone. Built from
+    date.today(), `TZ=Pacific/Kiritimati uv run pytest` failed this file on the
+    age assertion -- which is the exact failure server_today()'s docstring
+    predicts, in a file testing the code that docstring is attached to.
+    """
+    day = server_today(conn) - timedelta(days=days_old)
     with conn.cursor() as cur:
         cur.execute(
             f"CREATE TABLE queue_{day:%Y_%m_%d} PARTITION OF queue "
@@ -149,7 +158,7 @@ def test_a_forced_move_does_not_promote_a_backfill_ahead_of_real_time_mail(
     operator does when retention is wedged, i.e. when the queue is already
     unhappy -- promoted the whole backlog to the front.
     """
-    day = date.today() - timedelta(days=10)
+    day = server_today(conn) - timedelta(days=10)
     with conn.cursor() as cur:
         cur.execute(
             f"CREATE TABLE queue_{day:%Y_%m_%d} PARTITION OF queue "
@@ -159,7 +168,7 @@ def test_a_forced_move_does_not_promote_a_backfill_ahead_of_real_time_mail(
             "INSERT INTO queue (queue_name, payload, status, priority, created_at, "
             "attempts, max_attempts, next_attempt_at) VALUES "
             "('q', '{}'::jsonb, 'pending', -100, %s, 2, 3, %s)",
-            (day, date.today() + timedelta(days=1)),
+            (day, server_today(conn) + timedelta(days=1)),
         )
     conn.commit()
 
@@ -194,3 +203,35 @@ def test_health_reports_how_old_the_oldest_partition_is(conn) -> None:
     _old_partition_with(conn, ["pending"], days_old=30)
 
     assert health(conn).oldest_partition_age_days == 30
+
+
+def test_a_broken_dead_letter_does_not_cost_the_write_path_its_headroom(conn) -> None:
+    """Ordering inside maintain(): create the horizon first, then ensure
+    dead_letter, then drop.
+
+    ensure_table() can raise -- a name collision caught by _ensure_index's
+    post-probe, or LockNotAvailable off its DDL bound. Ahead of the create, that
+    takes future partitions down with it, and the horizon is the only thing
+    standing between the queue and enqueues that fail outright. Retention
+    stopping is recoverable; tomorrow having no partition is the outage.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_open")
+        cur.execute("CREATE TABLE decoy_dl (x TEXT)")
+        cur.execute("CREATE INDEX idx_dead_letter_open ON decoy_dl (x)")
+        cur.execute("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('queue')")
+        before = cur.fetchone()[0]
+    conn.commit()
+
+    with pytest.raises(QueueError):
+        PartitionManager(conn).maintain(retention_days=7, days_ahead=5)
+    conn.rollback()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('queue')")
+        after = cur.fetchone()[0]
+    conn.rollback()
+    assert after > before, (
+        f"partitions {before} -> {after}: the horizon was not extended, so a "
+        "broken dead_letter now breaks the write path too"
+    )
