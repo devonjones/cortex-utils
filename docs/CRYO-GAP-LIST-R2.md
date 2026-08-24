@@ -124,3 +124,87 @@ it on our side (structlog → stderr, plus an assertion that the claim channel
 carries TSV and nothing else). Worth considering whether the library should
 default its own logs to stderr: any consumer whose stdout is a protocol has
 this exposure, including your own CLI entry points.
+
+---
+
+# Addendum, against `8fac743` (#43)
+
+## RETRACTION — the dead-letter lifecycle gap I reported does not exist
+
+I told you `ensure_queue_schema()` calls `ensure_table()` but not
+`ensure_lifecycle_columns()`, so a `dead_letter` predating `retried_at` would
+be created-if-absent but never brought forward — and framed it as the same
+shape as the incident #43 exists to prevent.
+
+**That is wrong.** `ensure_table()` calls `self.ensure_lifecycle_columns()`
+itself, one frame down, and has since `305a2ab`. The one boot call does cover
+it. cryo's redundant call and the comment justifying it are removed.
+
+How I got there is the part worth passing on: I read `ensure_queue_schema()`,
+saw `ensure_table()` named, checked that `ensure_queue_schema` did not also
+name `ensure_lifecycle_columns`, and stopped. Reading one frame and inferring
+the second is how you report a bug that is not there — and, on the same read,
+miss the one that is.
+
+## G10 — `ensure_table()` is the one step that does not pre-check itself
+
+Found while verifying the above.
+
+```python
+def ensure_table(self) -> None:
+    with self.conn.cursor() as cur:
+        cur.execute(DEAD_LETTER_SCHEMA)      # unconditional
+    self.conn.commit()
+    self.ensure_lifecycle_columns()          # pre-checks pg_attribute
+```
+
+`DEAD_LETTER_SCHEMA` is `CREATE TABLE IF NOT EXISTS` plus two
+`CREATE INDEX IF NOT EXISTS`, run **every time, with no catalogue check**,
+while the very next line does check. By this module's own comment, *"CREATE
+INDEX IF NOT EXISTS still takes a lock and waits on a writer even when the
+index is already there"*.
+
+That now runs on every boot of every consumer, forever — `ensure_queue_schema`
+is documented as *"cheap on the steady state — every step pre-checks the
+catalogue before touching anything"*, and this is the step that does not. It is
+also outside any `lock_timeout` the caller set, since `ensure_table` opens its
+own cursor on the connection.
+
+`ensure_lifecycle_columns` is the model: ask `pg_attribute`, return early.
+
+## Confirmed on cryo's live database
+
+Before adopting, I compared the running production table against
+`REQUIRED_COLUMNS` rather than a test fixture:
+
+```
+MISSING from production: NONE
+CHECK valid_status: status = ANY (ARRAY['pending','processing','completed','failed','cancelled'])
+dead_letter cols: ... dismissed_at, retried_at, retried_as
+```
+
+All 13 columns present, the surviving pre-existing CHECK allows exactly your
+`VALID_STATUSES`, so `ensure_queue_table()` does not raise on boot and nothing
+writes a status the old constraint rejects. cryo now runs `ensure_queue_schema`
+with its three dedup indexes as `extra_indexes`, and deletes 68 lines of DDL.
+
+## One thing worth documenting for the next consumer
+
+Adopting on an EXISTING table creates `idx_queue_claim` and `idx_queue_stale`
+alongside whatever the consumer already had — cryo keeps
+`idx_queue_pending_priority`, `idx_queue_ready`, `idx_queue_processing`, so it
+now carries overlapping pairs. That is correct behaviour (`ensure_queue_table`
+only ever creates, which is the right call), but the first deploy takes real
+ShareLocks for the new indexes and the redundancy is permanent until an
+operator drops the old ones.
+
+Worth one line in the adoption docs: *adopting adds the canonical indexes; your
+old ones are yours to retire.* Note `idx_queue_processing` is a name you warn
+your own `migrate.py` owns with a different column list — cryo has one, so that
+warning has at least one real instance in the wild.
+
+## Still open from the main list
+
+G8 (LISTEN/NOTIFY — no support at all; cryo owns the trigger, the channel-bound
+probe, and `LISTEN`) and G9 (`resubmit()` forcing a `SELECT queue_name` to
+derive the dedup key).
