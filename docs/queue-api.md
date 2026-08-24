@@ -41,6 +41,30 @@ version until we tag releases.
 
 ---
 
+## The rule
+
+**Unless there is an app-level reason to join queue data against another table,
+`cortex_utils` owns all SQL that talks to the queue database.**
+
+Not a style preference. Every incident this package has been shaped by came
+from a second copy of some query or shape existing somewhere else and drifting:
+partition lookups that matched a same-named table in another schema and cost
+4.8 days of email; a `queue_new` DDL missing three columns the primitives
+require; a dead-letter retry that deleted the record it existed to keep. One
+owner is the only arrangement where a fix reaches everyone.
+
+So the practical consequence, for a consumer and for cortex's own services
+alike:
+
+- **If you are writing SQL against the queue, that is a gap here.** Report it
+  rather than writing it. Every gap reported so far turned out to be a real
+  missing primitive, and several turned out to be live bugs on this side.
+- **A join against your own tables is the exception**, because this package
+  cannot know your schema. Read what you need through the API, join in your own
+  query, and keep the queue side of it here.
+- **Schema included.** `ensure_queue_table()` owns the shape; hand your extra
+  indexes to it rather than keeping a private migration alongside it.
+
 ## The five primitives
 
 ```python
