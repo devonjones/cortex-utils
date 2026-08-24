@@ -389,3 +389,91 @@ def test_health_works_on_a_dead_letter_table_that_predates_the_migration(
     legacy_conn.commit()
 
     assert health(legacy_conn).dead_letter == 3
+
+
+def test_two_concurrent_retries_cannot_both_win(legacy_conn) -> None:
+    """The guards read through get_job() and decide in Python. Without the same
+    conditions on the UPDATE, both callers pass the read, both write, the job
+    runs twice and retried_as is overwritten -- destroying the record this
+    change exists to keep, while both are told it worked.
+    """
+    DeadLetterManager(legacy_conn).ensure_table()
+    [dl_id] = _archive(legacy_conn)
+
+    b = psycopg2.connect(DSN)
+    try:
+        with b.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+        b.commit()
+
+        mgr_a = DeadLetterManager(legacy_conn)
+        mgr_b = DeadLetterManager(b)
+
+        # B's read happens before A commits, so B sees the row as open. Pinning
+        # that stale answer is the point: leave it live and B's own re-read
+        # catches the conflict, the UPDATE's WHERE is never exercised, and the
+        # suite looks green while the database is the only thing that could
+        # actually have arbitrated. Verified: without the pin, removing the
+        # WHERE clause still passes.
+        stale = mgr_b.get_job(dl_id)
+        assert stale["retried_at"] is None
+        mgr_b.get_job = lambda _id: dict(stale)  # type: ignore[method-assign]
+
+        won = [mgr_a.retry_job(dl_id), mgr_b.retry_job(dl_id)]
+
+        assert won.count(True) == 1, f"exactly one may win, got {won}"
+        with legacy_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM queue")
+            assert cur.fetchone()[0] == 1, "the work must not be queued twice"
+            cur.execute("SELECT retried_as FROM dead_letter WHERE id = %s", (dl_id,))
+            assert cur.fetchone()[0] is not None
+    finally:
+        b.rollback()
+        b.close()
+
+
+def test_the_cli_says_why_it_did_not_retry(conn) -> None:
+    """retry_job returns False for three different reasons and the CLI used to
+    report all of them as "not found", exit 0 -- telling an operator a row they
+    can see in the list does not exist."""
+    from click.testing import CliRunner
+
+    from cortex_utils.cli import main
+
+    [dl_id] = _archive(conn)
+    mgr = DeadLetterManager(conn)
+    mgr.dismiss(dl_id)
+
+    parts = dict(kv.split("=", 1) for kv in os.environ["CORTEX_TEST_DSN"].split())
+    env = {
+        "POSTGRES_HOST": parts["host"],
+        "POSTGRES_PORT": parts["port"],
+        "POSTGRES_USER": parts["user"],
+        "POSTGRES_PASSWORD": parts["password"],
+        "POSTGRES_DB": parts["dbname"],
+        "PGOPTIONS": "-c search_path=t_dl",
+    }
+    result = CliRunner().invoke(main, ["dead-letter", "retry", "--id", str(dl_id)], env=env)
+
+    assert result.exit_code == 1, "a refusal must not exit 0"
+    assert "dismissed" in result.output, result.output
+    assert "not found" not in result.output
+
+
+def test_the_cli_reports_a_genuinely_missing_row_as_missing(conn) -> None:
+    from click.testing import CliRunner
+
+    from cortex_utils.cli import main
+
+    parts = dict(kv.split("=", 1) for kv in os.environ["CORTEX_TEST_DSN"].split())
+    env = {
+        "POSTGRES_HOST": parts["host"],
+        "POSTGRES_PORT": parts["port"],
+        "POSTGRES_USER": parts["user"],
+        "POSTGRES_PASSWORD": parts["password"],
+        "POSTGRES_DB": parts["dbname"],
+        "PGOPTIONS": "-c search_path=t_dl",
+    }
+    result = CliRunner().invoke(main, ["dead-letter", "retry", "--id", "9999"], env=env)
+    assert result.exit_code == 1
+    assert "no dead letter job with id 9999" in result.output

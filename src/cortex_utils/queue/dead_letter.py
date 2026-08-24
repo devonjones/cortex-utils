@@ -288,8 +288,9 @@ class DeadLetterManager:
 
         The row is stamped with retried_at/retried_as rather than deleted. It
         used to be deleted, which erased the only evidence the item had ever
-        failed -- precisely the history you want when it dies again. Retrying
-        twice is handled by enqueue()'s dedup, not by removing the record.
+        failed -- precisely the history you want when it dies again. A second
+        retry is refused by retried_at, checked here and re-asserted in the
+        UPDATE's WHERE so two concurrent callers cannot both win.
 
         Returns True if the job was re-enqueued. A False can mean the row does
         not exist, was already retried, or was dismissed -- `why_not_retryable`
@@ -330,15 +331,23 @@ class DeadLetterManager:
         new_id = enqueue(self.conn, job["queue_name"], job["payload"], commit=False)
 
         with self.conn.cursor() as cur:
+            # The guards above read through get_job() and decided in Python;
+            # this re-asserts them where the database can arbitrate. Without it
+            # two concurrent retries both pass the read, both UPDATE, and the
+            # job runs twice with retried_as overwritten -- destroying the
+            # record this whole change exists to keep, while both callers are
+            # told it worked.
             cur.execute(
-                "UPDATE dead_letter SET retried_at = NOW(), retried_as = %s WHERE id = %s",
+                "UPDATE dead_letter SET retried_at = NOW(), retried_as = %s "
+                "WHERE id = %s AND retried_at IS NULL AND dismissed_at IS NULL",
                 (new_id, dead_letter_id),
             )
             if cur.rowcount == 0:
-                # The row went while we were working -- purge(). Reporting
-                # success would claim we moved something nobody can see we
-                # moved, and the re-enqueue above would be an orphan. Ask the
-                # database rather than assume.
+                # Either the row went while we were working (purge), or another
+                # caller retried or dismissed it between our read and this
+                # write. Reporting success would claim we moved something
+                # nobody can see we moved, and leave the re-enqueue above as a
+                # duplicate. Ask the database rather than assume.
                 self.conn.rollback()
                 log.warning("Dead letter row vanished mid-retry", dead_letter_id=dead_letter_id)
                 return False

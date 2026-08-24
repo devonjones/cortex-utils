@@ -44,6 +44,18 @@ HEALTH_ROW = (
 )
 
 
+def _statement(conn, index: int = 0):
+    """The health/stuck/failures statement, skipping health()'s catalogue probe.
+
+    Positional indexing broke the moment health() gained a cheap column check
+    in front of its main query -- and a test that asserts on whichever statement
+    happens to be first is asserting on statement order, which carries no
+    meaning here.
+    """
+    real = [(sql, params) for sql, params in conn.cur.executed if "pg_attribute" not in sql]
+    return real[index]
+
+
 class FakeCursor:
     def __init__(self, fetchone: Any = None, fetchall: Any = ()):
         self.executed: list[tuple[str, Any]] = []
@@ -55,6 +67,8 @@ class FakeCursor:
         self.executed.append((sql, params))
 
     def fetchone(self) -> Any:
+        if self.executed and "pg_attribute" in self.executed[-1][0]:
+            return (True,)  # this schema has the lifecycle columns
         return self._fetchone
 
     def fetchall(self) -> Any:
@@ -82,7 +96,7 @@ def test_health_is_one_round_trip() -> None:
     """A card needing five queries will either be slow or be written wrong."""
     conn = _conn(fetchone=HEALTH_ROW)
     health(conn)
-    assert len(conn.cur.executed) == 1
+    assert len([s for s, _ in conn.cur.executed if "pg_attribute" not in s]) == 1
 
 
 def test_health_reports_ready_and_deferred_separately() -> None:
@@ -96,7 +110,7 @@ def test_health_reports_ready_and_deferred_separately() -> None:
 def test_health_distinguishes_ready_from_merely_pending_in_sql() -> None:
     conn = _conn(fetchone=HEALTH_ROW)
     health(conn)
-    sql = conn.cur.executed[0][0]
+    sql = _statement(conn)[0]
     assert "next_attempt_at IS NULL OR next_attempt_at <= NOW()" in sql
     assert "next_attempt_at > NOW()" in sql, "deferred must be counted apart"
 
@@ -111,7 +125,7 @@ def test_health_binds_the_queue_through_search_path() -> None:
     """A bare relname lookup reports healthy off the other schema's partitions."""
     conn = _conn(fetchone=HEALTH_ROW)
     health(conn)
-    sql = conn.cur.executed[0][0]
+    sql = _statement(conn)[0]
     assert "to_regclass('queue')" in sql
     assert "relname = 'queue'" not in sql
 
@@ -121,7 +135,7 @@ def test_health_counts_self_healed_partitions() -> None:
     already failed to surface a two-day outage; this is countable."""
     conn = _conn(fetchone=HEALTH_ROW)
     health(conn)
-    sql, params = conn.cur.executed[0]
+    sql, params = _statement(conn)
     assert "obj_description" in sql
     assert params == {"marker": SELF_HEALED_MARKER}
 
@@ -129,7 +143,7 @@ def test_health_counts_self_healed_partitions() -> None:
 def test_health_takes_its_timestamp_from_the_server() -> None:
     conn = _conn(fetchone=HEALTH_ROW)
     assert health(conn).server_time == NOW
-    assert "NOW()" in conn.cur.executed[0][0]
+    assert "NOW()" in _statement(conn)[0]
 
 
 @pytest.mark.parametrize(
@@ -155,7 +169,7 @@ def test_is_healthy_covers_both_ways_the_queue_dies(headroom, healed, expected) 
 def test_stuck_measures_the_window_on_the_server() -> None:
     conn = _conn(fetchall=[])
     stuck(conn, visibility_timeout_min=9)
-    sql, params = conn.cur.executed[0]
+    sql, params = _statement(conn)
     assert "claimed_at < NOW() - (INTERVAL '1 minute' * %s)" in sql
     assert params[0] == 9
 
@@ -186,14 +200,14 @@ def test_failures_return_the_error_text_intact() -> None:
 def test_failures_can_be_scoped_to_one_queue() -> None:
     conn = _conn(fetchall=[])
     failures(conn, limit=10, queue_name="triage")
-    _, params = conn.cur.executed[0]
+    _, params = _statement(conn)
     assert params == ("triage", "triage", 10)
 
 
 def test_failures_are_newest_first() -> None:
     conn = _conn(fetchall=[])
     failures(conn)
-    assert "ORDER BY created_at DESC" in conn.cur.executed[0][0]
+    assert "ORDER BY created_at DESC" in _statement(conn)[0]
 
 
 # --- resubmit ---------------------------------------------------------------
