@@ -342,3 +342,50 @@ def test_show_and_retry_work_on_a_database_that_never_ran_the_migration(
     for args in (["dead-letter", "show", str(dl_id)], ["dead-letter", "retry", "--id", str(dl_id)]):
         result = runner.invoke(main, args, env=env)
         assert result.exit_code == 0, f"{args} -> {result.output}\n{result.exception}"
+
+
+def test_health_and_get_stats_never_report_different_numbers(conn) -> None:
+    """A dashboard reading health() and a digest reading get_stats() must agree.
+    Two human-facing views of one number that filter differently is worse than
+    either being wrong alone: whichever you read last is the one you believe.
+    """
+    from cortex_utils.queue.inspect import health
+
+    ids = _archive(conn, n=4)
+    mgr = DeadLetterManager(conn)
+
+    def agree() -> int:
+        a = health(conn).dead_letter
+        b = mgr.get_stats()["total"]
+        c = len(mgr.list_jobs())
+        assert a == b == c, f"health {a} / stats {b} / list {c}"
+        return a
+
+    assert agree() == 4
+    mgr.dismiss(ids[0])
+    assert agree() == 3
+    mgr.retry_job(ids[1])
+    assert agree() == 2
+
+
+def test_health_works_on_a_dead_letter_table_that_predates_the_migration(
+    legacy_conn,
+) -> None:
+    """health() is read-only and gets called during the upgrade window. Naming
+    the lifecycle columns directly would make it raise UndefinedColumn there --
+    the same way show/retry did before round 2. Every row counts as open, which
+    is right: nothing can have been dismissed on a schema with nowhere to
+    record it."""
+    from cortex_utils.queue.inspect import health
+
+    with legacy_conn.cursor() as cur:
+        for i in range(3):
+            cur.execute(
+                "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+                "last_error, created_at, failed_at, archived_from_partition) "
+                "VALUES (%s, 'triage', '{}'::jsonb, 3, 'boom', NOW(), NOW(), 'p')",
+                (i,),
+            )
+    legacy_conn.commit()
+
+    assert health(legacy_conn).dead_letter == 3

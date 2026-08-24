@@ -73,6 +73,14 @@ class QueueHealth:
 
     depths: list[QueueDepth]
     dead_letter: int
+    """Open dead letters: not dismissed, not already retried.
+
+    The same set DeadLetterManager.list_jobs() and get_stats() report by
+    default. Two human-facing views of one number that filter differently is
+    worse than either being wrong alone -- whichever you read last is the one
+    you believe.
+    """
+
     partitioned: bool
     partition_headroom_days: int | None
     self_healed_partitions: int
@@ -219,7 +227,23 @@ SELECT
         (SELECT json_agg(row_to_json(depth) ORDER BY queue_name) FROM depth),
         '[]'::json
     ),
-    (SELECT COUNT(*) FROM dead_letter),
+    -- Open only, matching DeadLetterManager.list_jobs() and get_stats(). An
+    -- unfiltered count here would put a dashboard and a digest on different
+    -- numbers for the same thing, which is the failure the dead-letter
+    -- lifecycle exists to prevent -- built into the library rather than merely
+    -- tolerated.
+    --
+    -- Through to_jsonb rather than naming the columns, so this read still works
+    -- on a dead_letter table that predates the lifecycle migration: an absent
+    -- key yields NULL, so every row counts as open, which is exactly right --
+    -- nothing can have been dismissed or retried on a schema with nowhere to
+    -- record it. health() is read-only and gets called during the upgrade
+    -- window; making it require a migration first is how #37 broke show/retry.
+    (
+        SELECT COUNT(*) FROM dead_letter d
+        WHERE to_jsonb(d) ->> 'dismissed_at' IS NULL
+          AND to_jsonb(d) ->> 'retried_at' IS NULL
+    ),
     -- Whether the table is partitioned at all. Without this, a plain queue --
     -- a supported pre-migration state, since this package ships
     -- migrate_to_partitioned() -- has no pg_inherits rows and so reports the
