@@ -294,11 +294,18 @@ def require_queue_table(conn: psycopg2.extensions.connection) -> None:
     and an operator is handed a migration to run that then blows up.
 
     Every catalogue read that can be reached without one should call this, so
-    the contract does not vary by entry point.
+    the contract does not vary by entry point. That promise is why the relkind
+    is checked here too: a matview or a view named queue resolves through
+    to_regclass and carries pg_attribute rows, so without it
+    has_claim_token_column() would answer True about a matview -- a wrong branch
+    reported as success, and the same entry point disagreeing with
+    schema.missing_columns() about the same connection.
     """
     with _tx(conn) as cur:
-        cur.execute("SELECT to_regclass('queue')")
-        if cur.fetchone()[0] is not None:
+        cur.execute(
+            "SELECT 1 FROM pg_class WHERE oid = to_regclass('queue') AND relkind IN ('r', 'p')"
+        )
+        if cur.fetchone() is not None:
             return
         cur.execute("SHOW search_path")
         log.error(
@@ -307,7 +314,8 @@ def require_queue_table(conn: psycopg2.extensions.connection) -> None:
             hint="check the connection's PGOPTIONS",
         )
     raise QueueTableNotFoundError(
-        "no 'queue' table on search_path; check the connection's PGOPTIONS"
+        "no 'queue' table on search_path; check the connection's PGOPTIONS "
+        "(a view or matview of that name does not count)"
     )
 
 

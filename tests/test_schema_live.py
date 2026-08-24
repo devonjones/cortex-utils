@@ -399,3 +399,34 @@ def test_a_matview_with_the_right_columns_is_still_not_a_queue(conn) -> None:
     with pytest.raises(QueueError, match="materialized view"):
         ensure_queue_table(conn)
     conn.rollback()
+
+
+def test_both_entry_points_agree_about_what_a_queue_is(conn) -> None:
+    """require_queue_table() promises the contract does not vary by entry
+    point. A matview resolves through to_regclass and carries pg_attribute
+    rows, so without a relkind check it would accept one -- and
+    has_claim_token_column() would then answer True about a matview, a wrong
+    branch reported as success.
+    """
+    from cortex_utils.queue.ops import (
+        QueueTableNotFoundError,
+        has_claim_token_column,
+        require_queue_table,
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE MATERIALIZED VIEW queue AS SELECT "
+            + ", ".join(f"NULL::text AS {name}" for name in REQUIRED_COLUMNS)
+        )
+    conn.commit()
+
+    with pytest.raises(QueueError, match="materialized view"):
+        missing_columns(conn)
+    conn.rollback()
+    with pytest.raises(QueueTableNotFoundError):
+        require_queue_table(conn)
+    conn.rollback()
+    with pytest.raises(QueueTableNotFoundError):
+        has_claim_token_column(conn)
+    conn.rollback()
