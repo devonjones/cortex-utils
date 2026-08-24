@@ -43,7 +43,14 @@ _COLUMN_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 def ready_predicate(column: str = "next_attempt_at") -> str:
-    """SQL predicate that matches jobs ready to be claimed.
+    """DEPRECATED. Splices an SQL fragment into a claim query you write yourself.
+
+    That is this library subsidising violations of its own rule -- the one that
+    says cortex_utils owns the SQL that talks to the queue. It exists only
+    because five cortex workers still hand-write their claim, and it should be
+    deleted in the same migration that ports them (cortex-i5jc). Call claim().
+
+    SQL predicate that matches jobs ready to be claimed.
 
     Splice into the `claimable` CTE of a consumer's claim query.
     `column` must be a SQL identifier (alphanumeric/underscore only).

@@ -99,8 +99,9 @@ class DeadLetterManager:
     def ensure_table(self) -> None:
         """Create the dead_letter table and bring an existing one up to date.
 
-        Safe on every boot, and cheap on the one that matters: the DDL below is
-        skipped entirely once the table is there.
+        Safe on every boot, and cheap on the one that matters: every step
+        pre-checks the catalogue, and each index is asked about on its own --
+        the table existing is not evidence that its indexes do.
 
         It used to run unconditionally -- CREATE TABLE IF NOT EXISTS plus two
         CREATE INDEX IF NOT EXISTS -- while the very next line pre-checked
@@ -127,16 +128,8 @@ class DeadLetterManager:
                     cur.execute(DEAD_LETTER_SCHEMA)
                 self.conn.commit()
 
-            # Each index asked about on its own. The table existing is not
-            # evidence that its indexes do.
             for name, statement in BASE_INDEXES:
-                if self._has_index(name):
-                    continue
-                with self.conn.cursor() as cur:
-                    cur.execute("SET LOCAL lock_timeout = '5000ms'")
-                    cur.execute(statement)
-                self.conn.commit()
-                log.info("Created dead_letter index", index=name)
+                self._ensure_index(name, statement)
         except Exception:
             # Without this a DDL failure leaves the transaction aborted, and
             # ensure_queue_schema()'s finally-unlock then raises
@@ -159,6 +152,48 @@ class DeadLetterManager:
 
         self.ensure_lifecycle_columns()
         log.debug("Ensured dead_letter table exists")
+
+    def _ensure_index(self, name: str, statement: str) -> None:
+        """Create one index if the catalogue says it is missing, then prove it.
+
+        CREATE INDEX IF NOT EXISTS still takes a lock and waits on an open
+        writer even when the index is already there, and its queued ShareLock
+        times out inserts behind it -- so every boot asks first.
+
+        And asks again afterwards. IF NOT EXISTS guards the NAME in this schema,
+        not the index: with the name held by an index on another table, by an
+        invalid index on this one, or by a plain table, the CREATE returns
+        normally with a NOTICE and the index is still absent. Without the second
+        probe every later boot re-takes the lock the first probe exists to avoid
+        and logs that it created something it did not. schema._ensure_indexes
+        re-asks for exactly this reason; this half did not come across with it.
+        """
+        if self._has_index(name):
+            return
+        # SET LOCAL is a silent no-op under autocommit, and this is reachable
+        # from ensure_lifecycle_columns() after ensure_table() has restored it.
+        was_autocommit = self.conn.autocommit
+        if was_autocommit:
+            self.conn.autocommit = False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SET LOCAL lock_timeout = '5000ms'")
+                cur.execute(statement)
+            self.conn.commit()
+            if not self._has_index(name):
+                raise QueueError(
+                    f"{statement.strip()[:60]}... did not create an index named "
+                    f"{name!r} on dead_letter. Something else holds that name; "
+                    "the name is what every later boot checks."
+                )
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            if was_autocommit:
+                self.conn.rollback()
+                self.conn.autocommit = True
+        log.info("Created dead_letter index", index=name)
 
     def _has_table(self) -> bool:
         """Bound through to_regclass, so it answers about this schema's table."""
@@ -192,16 +227,7 @@ class DeadLetterManager:
         """
         missing = [c for c in LIFECYCLE_COLUMNS if not self._has_column(c)]
         if not missing:
-            if self._has_index("idx_dead_letter_open"):
-                # CREATE INDEX IF NOT EXISTS still takes a lock and waits on a
-                # writer even when the index is already there -- measured
-                # blocking for the full duration of an open transaction, and
-                # its queued ShareLock times out new inserts behind it. This is
-                # the path every boot takes, so it asks the catalogue instead.
-                return False
-            with self.conn.cursor() as cur:
-                cur.execute(LIFECYCLE_INDEX)
-            self.conn.commit()
+            self._ensure_index("idx_dead_letter_open", LIFECYCLE_INDEX)
             return False
 
         # SET LOCAL is a silent no-op under autocommit -- there is no

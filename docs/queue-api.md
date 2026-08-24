@@ -117,6 +117,14 @@ claimed. Report through `complete()` / `release()` / `fail_or_retry()`. It is
 also a *server* timestamp, so compare it server-side rather than against a local
 `datetime.now()`.
 
+> **Status on the cortex queue, as of this writing.** All five cortex workers
+> still hand-write their own claim SQL and **none of them set `claimed_by`**, so
+> on that queue the claim token currently protects nothing. The column exists;
+> the primitives are not yet the ones claiming. Migrating those five is
+> cortex-i5jc. cryo goes through these primitives and does have the property.
+> This section describes what the API guarantees to a caller who uses it — not a
+> property the production queue has today.
+
 **`worker` is required and must be non-empty** — `QueueError` otherwise. It is
 the claim token, and it is the whole point: `complete()` and `release()` match
 on it, so a worker that stalled past its visibility timeout cannot report on a
@@ -131,6 +139,14 @@ them.
 budget. This is deliberate: an expired OAuth token kills a worker, the row comes
 back with its budget intact, and the work runs when auth returns — rather than
 burning three attempts on an outage that was never about the job.
+
+The cost, stated because it is real: a job that kills the worker for its *own*
+reasons — OOM, segfault, an unhandled crash — never reaches `fail_or_retry()`
+either. So it cycles claim → crash → recovery → claim indefinitely with its
+budget intact, and because `attempts` never increments, **nothing in the system
+counts the loop**. The only signature is worker churn. The older
+attempts-consuming semantics self-limited poison pills; this one does not.
+Tracked as cortex-wh3b.
 
 ### `complete(conn, job_id, worker) -> bool`
 
@@ -155,6 +171,12 @@ Use this when the work **was attempted and failed**. Spends an attempt, then:
 
 The backoff constants are the library's, overridable per call. Do not
 hand-copy them.
+
+> **`ready_predicate()` is deprecated for the same reason.** It splices an SQL
+> fragment into a claim query the caller writes themselves — which is the
+> library subsidising violations of its own rule. It exists because the five
+> unmigrated workers need it, and it should die in the same migration they do.
+> Do not reach for it in new code; call `claim()`.
 
 > **Migration trap.** `cortex_utils.queue.retry.fail_or_retry` is a different,
 > older function that returns `"retrying"` where this one returns `"pending"`.

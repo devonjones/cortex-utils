@@ -963,3 +963,76 @@ def test_a_refused_boot_does_not_leak_the_schema_lock(conn) -> None:
         )
         assert cur.fetchone()[0] == 0, "the schema lock outlived a failed boot"
     conn.commit()
+
+
+def test_a_fresh_schema_is_not_reported_as_a_dead_maintenance_incident(conn) -> None:
+    """The marker exists so the self-heal count means what it says. On the
+    bootstrap path it was saying something false.
+
+    ensure_queue_schema created the table with zero partitions, so the first
+    enqueue self-healed, stamped SELF_HEALED_MARKER, and health().is_healthy
+    read False -- "maintenance is not keeping up" -- for up to retention_days
+    on every new install, while maintenance was fine and simply had not had its
+    2AM turn yet.
+    """
+    from cortex_utils.queue.inspect import health
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    assert ensure_queue_schema(conn) == "created"
+
+    enqueue(conn, "q", {"n": 1})
+
+    got = health(conn)
+    assert got.self_healed_partitions == 0, (
+        "a fresh install routed its first write through the self-heal"
+    )
+    assert got.partition_headroom_days >= 1
+    assert got.is_healthy is True, "a correctly configured fresh install reads unhealthy"
+
+
+def test_the_boot_lock_wait_is_bounded(conn) -> None:
+    """Every DDL statement inside ensure_queue_schema is bounded, but the front
+    door was not -- so a holder wedged BETWEEN its bounded statements blocked
+    every later boot indefinitely. The key is per DATABASE, so a wedged boot in
+    one schema hangs boots in the other.
+    """
+    import threading
+
+    import cortex_utils.queue.schema as sch
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    holder = psycopg2.connect(DSN)
+    try:
+        holder.autocommit = True
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")
+
+        outcome: dict[str, object] = {}
+
+        def boot() -> None:
+            try:
+                ensure_queue_schema(conn)
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        # Turn the production bound down rather than waiting a real minute --
+        # what is being asserted is that the wait is FINITE, and a test that
+        # releases the lock first would pass whether or not it is.
+        original = sch.SCHEMA_LOCK_TIMEOUT_MS
+        sch.SCHEMA_LOCK_TIMEOUT_MS = 1500
+        try:
+            t = threading.Thread(target=boot, daemon=True)
+            t.start()
+            t.join(timeout=25)
+            assert not t.is_alive(), (
+                "still waiting on a lock nobody is going to release -- the boot "
+                "wait is unbounded, and the key is per DATABASE, so this hangs "
+                "the other tenant's boots too"
+            )
+            assert isinstance(outcome["r"], psycopg2.errors.LockNotAvailable), outcome
+        finally:
+            sch.SCHEMA_LOCK_TIMEOUT_MS = original
+    finally:
+        holder.close()
+    conn.rollback()

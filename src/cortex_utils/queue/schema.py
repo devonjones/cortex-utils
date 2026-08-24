@@ -35,6 +35,7 @@ from cortex_utils.queue.ops import (
     ensure_claim_token_column,
     index_present,
 )
+from cortex_utils.queue.partitions import PartitionManager
 
 log = get_logger()
 
@@ -76,6 +77,12 @@ _RELKINDS = {
 # The columns ensure_queue_schema() can add to an existing table. Anything else
 # missing is refused rather than half-migrated.
 _MIGRATED_COLUMNS = frozenset({"next_attempt_at", "claimed_by"})
+
+# How long a boot waits for the schema lock. Generous, because legitimate
+# contention here is a fleet redeploy -- but finite, because an indefinite fleet
+# hang is worse than a loud boot failure, and the key is per DATABASE, so one
+# tenant's wedged boot would otherwise hang the other's.
+SCHEMA_LOCK_TIMEOUT_MS = 60_000
 
 VALID_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
 
@@ -339,6 +346,15 @@ def ensure_queue_schema(
     a handful of reads, and no table locks.
     """
     with _tx(conn) as cur:
+        # Bounded. Every DDL statement below runs under a 5s lock_timeout, but
+        # this front door had none -- so a holder that wedges BETWEEN its
+        # bounded statements blocked every later boot indefinitely. And the key
+        # is per DATABASE, not per schema, so a wedged cryo boot would hang
+        # cortex boots: cross-tenant coupling at the one place this package
+        # otherwise keeps tenants apart. Generous, because legitimate contention
+        # here is a fleet redeploy, but finite, because an indefinite fleet hang
+        # is worse than a loud boot failure.
+        cur.execute("SET LOCAL lock_timeout = %s", (f"{SCHEMA_LOCK_TIMEOUT_MS}ms",))
         # Session-scoped, not xact-scoped: the steps below commit individually,
         # and an xact lock would be released by the first one.
         cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")
@@ -399,4 +415,17 @@ def _ensure_queue_schema_locked(
     # health() reads dead_letter, and drop_partition() archives into it, so a
     # service that never dead-letters anything itself still needs it to exist.
     DeadLetterManager(conn).ensure_table()
+
+    # Today and tomorrow, so a fresh schema does not report itself as a dead
+    # maintenance incident. Without this the table is created with zero
+    # partitions, the first enqueue self-heals, stamps SELF_HEALED_MARKER, and
+    # health().is_healthy reads False -- "maintenance is not keeping up" -- for
+    # up to retention_days on every new install, while maintenance is fine and
+    # simply has not had its 2AM turn yet. The marker exists so the count means
+    # what it says; on the bootstrap path it was saying something false.
+    #
+    # Boot is also the cheapest moment to create them: uncontended, and it
+    # removes the only steady-state path where a correctly configured system
+    # routes writes through the self-heal.
+    PartitionManager(conn).create_future_partitions(days_ahead=1)
     return result

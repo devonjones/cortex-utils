@@ -699,3 +699,122 @@ def test_an_index_of_that_name_in_another_schema_is_not_ours(conn) -> None:
         cur.execute("SET search_path = t_dl")
         cur.execute("DROP SCHEMA neighbour CASCADE")
     conn.commit()
+
+
+def test_an_index_dropped_and_its_name_taken_is_caught_not_logged_as_created(conn) -> None:
+    """The case three rewrites walked past.
+
+    The suite tested "index present" and "index dropped, name free". Neither
+    exercises what IF NOT EXISTS actually guards, which is the NAME: hand the
+    name to an index on a DIFFERENT table and the CREATE returns normally with
+    a NOTICE while idx_dead_letter_queue stays absent. Without the second probe
+    that is a boot logging "Created dead_letter index" about nothing, taking
+    the lock again every boot forever.
+
+    Not covered by the other-schema test next door -- index names are unique
+    per schema, so the CREATE succeeds there.
+    """
+    DeadLetterManager(conn).ensure_table()
+    with conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_queue")
+        cur.execute("CREATE TABLE decoy (queue_name TEXT)")
+        cur.execute("CREATE INDEX idx_dead_letter_queue ON decoy (queue_name)")
+    conn.commit()
+
+    with pytest.raises(QueueError, match="did not create an index named"):
+        DeadLetterManager(conn).ensure_table()
+
+
+def test_the_index_lock_bound_applies_too(legacy_conn) -> None:
+    """The bound on the CREATE TABLE path was asserted; the CREATE INDEX path
+    was not, and it is the one every steady-state boot reaches. CREATE INDEX
+    takes a ShareLock, so an open writer blocks it -- unbounded, that is a boot
+    that hangs instead of failing, holding the schema advisory lock while it
+    does.
+    """
+    import threading
+
+    DeadLetterManager(legacy_conn).ensure_table()
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_queue")
+    legacy_conn.commit()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+            cur.execute("BEGIN; LOCK TABLE dead_letter IN ROW EXCLUSIVE MODE")
+
+        legacy_conn.autocommit = True
+        outcome: dict[str, object] = {}
+
+        def boot() -> None:
+            try:
+                DeadLetterManager(legacy_conn).ensure_table()
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        t = threading.Thread(target=boot, daemon=True)
+        t.start()
+        t.join(timeout=20)
+        assert not t.is_alive(), "still waiting after 20s -- the CREATE INDEX ran without the bound"
+        assert isinstance(outcome["r"], psycopg2.errors.LockNotAvailable), outcome
+    finally:
+        with contextlib.suppress(Exception):
+            other.rollback()
+        other.close()
+        legacy_conn.autocommit = False
+    with contextlib.suppress(Exception):
+        legacy_conn.rollback()
+
+
+def test_the_lifecycle_index_bound_survives_ensure_table_restoring_autocommit(
+    legacy_conn,
+) -> None:
+    """ensure_lifecycle_columns() is called AFTER ensure_table() has put
+    autocommit back, so it is the one index site that actually reaches the
+    autocommit branch -- the loop inside ensure_table never does, because the
+    outer toggle has already fired. SET LOCAL there would be a silent no-op and
+    this path would create its index unbounded.
+    """
+    import threading
+
+    DeadLetterManager(legacy_conn).ensure_table()
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_open")
+    legacy_conn.commit()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+            cur.execute("BEGIN; LOCK TABLE dead_letter IN ROW EXCLUSIVE MODE")
+
+        legacy_conn.autocommit = True
+        outcome: dict[str, object] = {}
+
+        def go() -> None:
+            try:
+                DeadLetterManager(legacy_conn).ensure_lifecycle_columns()
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout=20)
+        assert not t.is_alive(), (
+            "still waiting after 20s -- autocommit was left on and SET LOCAL "
+            "had no transaction to be local to"
+        )
+        assert isinstance(outcome["r"], psycopg2.errors.LockNotAvailable), outcome
+    finally:
+        with contextlib.suppress(Exception):
+            other.rollback()
+        other.close()
+        legacy_conn.autocommit = False
+    with contextlib.suppress(Exception):
+        legacy_conn.rollback()
