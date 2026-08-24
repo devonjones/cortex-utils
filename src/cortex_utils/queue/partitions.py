@@ -17,8 +17,8 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import (
     PartitionError,
     PartitionNotAttachedError,
@@ -33,7 +33,7 @@ __all__ = [
     "QueueTableNotFoundError",
 ]
 
-log = structlog.get_logger()
+log = get_logger()
 
 
 class PartitionManager:
@@ -347,7 +347,9 @@ class PartitionManager:
             "dropped_rows": row_count,
         }
 
-    def create_future_partitions(self, days_ahead: int = 3, dry_run: bool = False) -> int:
+    def create_future_partitions(
+        self, days_ahead: int = 3, dry_run: bool = False, days_back: int = 0
+    ) -> int:
         """Create partitions for the next N days.
 
         Returns count of partitions created.
@@ -361,7 +363,26 @@ class PartitionManager:
         The caller's retention pass is skipped when this raises. Exposure is bounded
         by the days_ahead window rather than by run count: dates already created stay
         created, and a later run re-creates only what is still missing.
+
+        `days_back` covers dates before today. Zero is right for steady-state
+        maintenance -- retention is about to drop those anyway -- but a row can
+        legitimately carry a created_at in the recent past: a producer whose
+        clock is behind the server's, or a test that rewinds a visibility
+        timestamp across local midnight. created_at is NOW() on the server, so
+        which dates need covering is a property of that clock rather than of any
+        one consumer, which is why this lives here.
         """
+        if days_ahead < 0 or days_back < 0:
+            # A negative window silently skips today. days_back=-1 returns 3 and
+            # maintain() reports it as partitions_created, while the write path
+            # then self-heals and logs "partition maintenance is not keeping
+            # up" -- which is false, and points debugging away from the caller
+            # that asked for a window with no today in it.
+            raise PartitionError(
+                f"days_ahead={days_ahead} days_back={days_back}: a negative "
+                "window would skip today's partition"
+            )
+
         created = 0
         # Server clock, not this process: created_at is NOW() on the server, so
         # a partition dated by the client only lines up by coincidence. Same
@@ -369,7 +390,7 @@ class PartitionManager:
         today = server_today(self.conn)
         failures: list[PartitionNotAttachedError] = []
 
-        for i in range(days_ahead + 1):  # Include today
+        for i in range(-days_back, days_ahead + 1):  # Include today
             partition_date = today + timedelta(days=i)
             try:
                 if self.create_partition(partition_date, dry_run=dry_run):

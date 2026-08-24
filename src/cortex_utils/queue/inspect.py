@@ -28,13 +28,14 @@ of silently dropped enqueues.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.ops import (
     SELF_HEALED_MARKER,
     QueueError,
@@ -43,7 +44,7 @@ from cortex_utils.queue.ops import (
     is_dedup_value,
 )
 
-log = structlog.get_logger()
+log = get_logger()
 
 DEFAULT_FAILURE_LIMIT = 50
 
@@ -351,6 +352,7 @@ def resubmit(
     conn: psycopg2.extensions.connection,
     job_id: int,
     dedup_key: str | None = None,
+    dedup_keys: Mapping[str, str] | None = None,
 ) -> int | None:
     """Re-queue a failed job as a new row. Returns the new id, or None if deduped.
 
@@ -366,7 +368,23 @@ def resubmit(
 
     Both halves commit together, so a crash cannot leave the work re-queued and
     the original still showing failed.
+
+    `dedup_keys` maps queue_name -> dedup field, for a caller that resubmits
+    across several queues and would otherwise have to look up which queue the
+    job is on before it could pick the key. This function already reads
+    queue_name to re-enqueue, so making the caller fetch it too meant a raw
+    SELECT against the queue on their side -- which under this package's own
+    rule is a gap here, not a boundary. Pass `dedup_key` for a single queue, or
+    `dedup_keys` and let the row decide.
     """
+    # `is not None`, not truthiness: resolution below tests identity, and an
+    # empty map disagreeing with a truthy guard means no raise, then .get()
+    # returns None, the caller's dedup_key is silently discarded, and a
+    # duplicate is enqueued while this returns a new id -- success reported on a
+    # false belief. An empty map is the likely shape, too: cfg.get("dedup_keys",
+    # {}) or a filtered comprehension.
+    if dedup_key is not None and dedup_keys is not None:
+        raise QueueError("pass dedup_key or dedup_keys, not both")
     with _tx(conn) as cur:
         cur.execute(
             "SELECT queue_name, payload, priority, created_at FROM queue "
@@ -377,6 +395,8 @@ def resubmit(
         if row is None:
             raise QueueError(f"job {job_id} is not a failed row")
         queue_name, payload, priority, created_at = row
+        if dedup_keys is not None:
+            dedup_key = dedup_keys.get(queue_name)
 
         # commit=False: the cancel below must land with it or not at all.
         new_id = enqueue(

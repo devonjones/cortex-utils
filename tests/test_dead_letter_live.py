@@ -11,6 +11,7 @@ Skipped unless CORTEX_TEST_DSN points at a throwaway Postgres; CI starts one.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from datetime import timedelta
 
@@ -19,6 +20,7 @@ import pytest
 psycopg2 = pytest.importorskip("psycopg2")
 
 from cortex_utils.queue.dead_letter import DeadLetterManager  # noqa: E402
+from cortex_utils.queue.ops import QueueError  # noqa: E402
 from cortex_utils.queue.schema import queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
@@ -461,3 +463,423 @@ def test_the_cli_reports_a_genuinely_missing_row_as_missing(conn) -> None:
     result = CliRunner().invoke(main, ["dead-letter", "retry", "--id", "9999"], env=env)
     assert result.exit_code == 1
     assert "no dead letter job with id 9999" in result.output
+
+
+def test_a_steady_state_boot_issues_no_dead_letter_ddl(conn) -> None:
+    """The one step that did not pre-check itself.
+
+    CREATE TABLE IF NOT EXISTS plus two CREATE INDEX IF NOT EXISTS ran
+    unconditionally while the very next line checked pg_attribute first -- and
+    by this module's own account CREATE INDEX IF NOT EXISTS still takes a lock
+    and waits on an open writer even when the index is already there. On every
+    boot of every consumer, forever, and outside any lock_timeout the caller
+    set, because it opened its own cursor.
+    """
+    mgr = DeadLetterManager(conn)
+    mgr.ensure_table()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+        other.autocommit = False
+        # A live writer holding ROW EXCLUSIVE. DDL would queue behind it.
+        with other.cursor() as cur:
+            cur.execute(
+                "INSERT INTO dead_letter (original_id, queue_name, payload, attempts, "
+                "last_error, created_at, failed_at, archived_from_partition) "
+                "VALUES (1, 't', '{}'::jsonb, 1, 'x', NOW(), NOW(), 'p')"
+            )
+
+        conn.rollback()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '2000ms'")
+        conn.autocommit = False
+
+        mgr.ensure_table()  # must not wait on the writer
+    finally:
+        other.rollback()
+        other.close()
+    conn.rollback()
+
+
+def test_a_missing_dead_letter_table_is_still_created(conn) -> None:
+    """The pre-check must not turn into a skip."""
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE dead_letter")
+    conn.commit()
+
+    DeadLetterManager(conn).ensure_table()
+
+    # The thing, not the name. to_regclass resolving proves a name is taken,
+    # which is the inference _index_present()'s own docstring refuses -- so
+    # check the columns and the indexes actually arrived.
+    assert missing_dead_letter_columns(conn) == []
+    assert _indexes(conn) >= {
+        "idx_dead_letter_queue",
+        "idx_dead_letter_created",
+        "idx_dead_letter_open",
+    }
+
+
+def _indexes(conn) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE i.indrelid = to_regclass('dead_letter') AND i.indisvalid"
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def missing_dead_letter_columns(conn) -> list[str]:
+    from cortex_utils.queue.dead_letter import LIFECYCLE_COLUMNS
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('dead_letter') "
+            "AND attnum > 0 AND NOT attisdropped"
+        )
+        present = {r[0] for r in cur.fetchall()}
+    return [c for c in LIFECYCLE_COLUMNS if c not in present]
+
+
+@pytest.mark.parametrize(
+    "index",
+    ["idx_dead_letter_queue", "idx_dead_letter_created", "idx_dead_letter_open"],
+)
+def test_a_dropped_index_comes_back_on_the_next_boot(conn, index: str) -> None:
+    """The table existing is not evidence that its indexes do.
+
+    The base indexes used to ride along inside DEAD_LETTER_SCHEMA, so gating
+    that whole script on "does the table exist" meant a dropped index never
+    came back -- on any later boot, forever, because nothing else in the
+    package creates them. ensure_table() returned normally and logged
+    "Ensured dead_letter table exists" throughout.
+    """
+    mgr = DeadLetterManager(conn)
+    mgr.ensure_table()
+    assert index in _indexes(conn)
+
+    with conn.cursor() as cur:
+        cur.execute(f"DROP INDEX {index}")
+    conn.commit()
+    assert index not in _indexes(conn)
+
+    mgr.ensure_table()
+    assert index in _indexes(conn), f"{index} was never recreated"
+
+
+def test_ensure_table_works_on_an_autocommit_connection(conn) -> None:
+    """SET LOCAL is a silent no-op with no transaction to be local to, so the
+    lock bound would not apply on exactly the connection shape a consumer is
+    most likely to hand us."""
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE dead_letter")
+    conn.commit()
+
+    conn.autocommit = True
+    try:
+        mgr = DeadLetterManager(conn)
+        mgr.ensure_table()
+        # Boot twice. The first call does DDL, and its incidental commit closes
+        # the transaction the catalogue probes opened -- so "repeated boot" and
+        # "autocommit connection" were each covered while their intersection,
+        # which is production, was not. On the steady-state path nothing
+        # commits, and restoring autocommit inside a transaction raises.
+        mgr.ensure_table()
+        mgr.ensure_table()
+        # Read it BEFORE the cleanup below writes it. Asserting after the
+        # finally re-reads a value this test just set, so it cannot fail --
+        # verified: adding a silent `self.conn.autocommit = False` at the end
+        # of ensure_table left the whole suite green while it stole a
+        # consumer's connection setting, which is the exact damage this is for.
+        survived = conn.autocommit
+    finally:
+        conn.autocommit = False
+
+    assert survived is True, "ensure_table kept the caller's connection non-autocommit"
+
+    assert _indexes(conn) >= {"idx_dead_letter_queue", "idx_dead_letter_created"}
+
+
+def test_the_lock_bound_applies_on_an_autocommit_connection(legacy_conn) -> None:
+    """SET LOCAL is a silent no-op with no transaction to be local to. Asserting
+    only that the table gets created misses that: the DDL still succeeds, it
+    just succeeds *unbounded*, so a boot against a busy table hangs instead of
+    failing. The guard's effect is the bound, so the bound is what to assert.
+    """
+    import threading
+
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP TABLE dead_letter")
+    legacy_conn.commit()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+            # Hold the name so CREATE TABLE must wait.
+            cur.execute("BEGIN; CREATE TABLE dead_letter (x int)")
+
+        legacy_conn.autocommit = True
+        outcome: dict[str, object] = {}
+
+        def boot() -> None:
+            try:
+                DeadLetterManager(legacy_conn).ensure_table()
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        t = threading.Thread(target=boot, daemon=True)
+        t.start()
+        t.join(timeout=20)
+        assert not t.is_alive(), (
+            "still waiting after 20s -- SET LOCAL was a no-op under autocommit "
+            "and the DDL ran unbounded"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            other.rollback()
+        other.close()
+        legacy_conn.autocommit = False
+    with contextlib.suppress(Exception):
+        legacy_conn.rollback()
+
+
+def test_a_view_named_dead_letter_is_not_mistaken_for_the_table(legacy_conn) -> None:
+    """to_regclass resolving proves a name is taken. Without the relkind check
+    _has_table() says True for a view, ensure_table() skips creation entirely,
+    and every later call reports success against something that is not the
+    table -- the same inference this package refuses elsewhere."""
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP TABLE dead_letter")
+        cur.execute("CREATE VIEW dead_letter AS SELECT 1 AS id")
+    legacy_conn.commit()
+
+    # A raw psycopg2 error would happen either way -- without the relkind check
+    # we skip creation and fail several statements later on an index against a
+    # view. What the check buys is a message that names what was found.
+    with pytest.raises(QueueError, match="not a table"):
+        DeadLetterManager(legacy_conn).ensure_table()
+    legacy_conn.rollback()
+
+
+def test_an_index_of_that_name_in_another_schema_is_not_ours(conn) -> None:
+    """to_regclass(name) proves a name resolves somewhere on the search_path,
+    not that the index is on THIS table.
+
+    Under `search_path = app, shared`, an unrelated index of the same name in
+    `shared` made the gate answer "present" and the index was never created --
+    on any boot, forever, while ensure_table() logged success. Multi-schema is
+    this package's normal deployment: every test in this file runs under a SET
+    search_path.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP SCHEMA IF EXISTS neighbour CASCADE")
+        cur.execute("CREATE SCHEMA neighbour")
+        cur.execute("CREATE TABLE neighbour.other (x int)")
+        cur.execute("CREATE INDEX idx_dead_letter_queue ON neighbour.other (x)")
+        cur.execute("DROP INDEX idx_dead_letter_queue")  # ours, so it is missing
+        cur.execute("SET search_path = t_dl, neighbour")
+    conn.commit()
+
+    DeadLetterManager(conn).ensure_table()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE c.relname = 'idx_dead_letter_queue' "
+            "AND i.indrelid = to_regclass('t_dl.dead_letter')"
+        )
+        assert cur.fetchone()[0] == 1, "the neighbour's index was mistaken for ours"
+        cur.execute("SET search_path = t_dl")
+        cur.execute("DROP SCHEMA neighbour CASCADE")
+    conn.commit()
+
+
+def test_an_index_dropped_and_its_name_taken_is_caught_not_logged_as_created(conn) -> None:
+    """The case three rewrites walked past.
+
+    The suite tested "index present" and "index dropped, name free". Neither
+    exercises what IF NOT EXISTS actually guards, which is the NAME: hand the
+    name to an index on a DIFFERENT table and the CREATE returns normally with
+    a NOTICE while idx_dead_letter_queue stays absent. Without the second probe
+    that is a boot logging "Created dead_letter index" about nothing, taking
+    the lock again every boot forever.
+
+    Not covered by the other-schema test next door -- index names are unique
+    per schema, so the CREATE succeeds there.
+    """
+    DeadLetterManager(conn).ensure_table()
+    with conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_queue")
+        cur.execute("CREATE TABLE decoy (queue_name TEXT)")
+        cur.execute("CREATE INDEX idx_dead_letter_queue ON decoy (queue_name)")
+    conn.commit()
+
+    with pytest.raises(QueueError, match="did not create an index named"):
+        DeadLetterManager(conn).ensure_table()
+
+
+def test_the_index_lock_bound_applies_too(legacy_conn) -> None:
+    """The bound on the CREATE TABLE path was asserted; the CREATE INDEX path
+    was not, and it is the one every steady-state boot reaches. CREATE INDEX
+    takes a ShareLock, so an open writer blocks it -- unbounded, that is a boot
+    that hangs instead of failing, holding the schema advisory lock while it
+    does.
+    """
+    import threading
+
+    DeadLetterManager(legacy_conn).ensure_table()
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_queue")
+    legacy_conn.commit()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+            cur.execute("BEGIN; LOCK TABLE dead_letter IN ROW EXCLUSIVE MODE")
+
+        legacy_conn.autocommit = True
+        outcome: dict[str, object] = {}
+
+        def boot() -> None:
+            try:
+                DeadLetterManager(legacy_conn).ensure_table()
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        t = threading.Thread(target=boot, daemon=True)
+        t.start()
+        t.join(timeout=20)
+        assert not t.is_alive(), "still waiting after 20s -- the CREATE INDEX ran without the bound"
+        assert isinstance(outcome["r"], psycopg2.errors.LockNotAvailable), outcome
+    finally:
+        with contextlib.suppress(Exception):
+            other.rollback()
+        other.close()
+        legacy_conn.autocommit = False
+    with contextlib.suppress(Exception):
+        legacy_conn.rollback()
+
+
+def test_the_lifecycle_index_bound_survives_ensure_table_restoring_autocommit(
+    legacy_conn,
+) -> None:
+    """ensure_lifecycle_columns() is called AFTER ensure_table() has put
+    autocommit back, so it is the one index site that actually reaches the
+    autocommit branch -- the loop inside ensure_table never does, because the
+    outer toggle has already fired. SET LOCAL there would be a silent no-op and
+    this path would create its index unbounded.
+    """
+    import threading
+
+    DeadLetterManager(legacy_conn).ensure_table()
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP INDEX idx_dead_letter_open")
+    legacy_conn.commit()
+
+    other = psycopg2.connect(DSN)
+    try:
+        other.autocommit = True
+        with other.cursor() as cur:
+            cur.execute("SET search_path = t_dl")
+            cur.execute("BEGIN; LOCK TABLE dead_letter IN ROW EXCLUSIVE MODE")
+
+        legacy_conn.autocommit = True
+        outcome: dict[str, object] = {}
+
+        def go() -> None:
+            try:
+                DeadLetterManager(legacy_conn).ensure_lifecycle_columns()
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout=20)
+        assert not t.is_alive(), (
+            "still waiting after 20s -- autocommit was left on and SET LOCAL "
+            "had no transaction to be local to"
+        )
+        assert isinstance(outcome["r"], psycopg2.errors.LockNotAvailable), outcome
+    finally:
+        with contextlib.suppress(Exception):
+            other.rollback()
+        other.close()
+        legacy_conn.autocommit = False
+    with contextlib.suppress(Exception):
+        legacy_conn.rollback()
+
+
+def test_a_failed_lifecycle_migration_leaves_no_half_migrated_table(legacy_conn) -> None:
+    """All three columns land together or none do.
+
+    The docstring has said so since the method was written, and the code has
+    always provided it -- but nothing asserted it. Splitting the single _tx into
+    one transaction per ALTER left the whole dead-letter suite green, which is
+    the same shape of unpinned property that rounds 3 through 6 each rewrote
+    away and had to put back.
+
+    Why it matters: dismiss() writes dismissed_at, list_jobs() filters on
+    retried_at. With one added and not the other, an operator clears a row and
+    it keeps appearing in the list they cleared it from.
+    """
+    from cortex_utils.queue.dead_letter import LIFECYCLE_COLUMNS
+
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS dead_letter")
+        cur.execute("CREATE TABLE dead_letter (id BIGSERIAL PRIMARY KEY, queue_name TEXT)")
+    legacy_conn.commit()
+
+    mgr = DeadLetterManager(legacy_conn)
+    assert [c for c in LIFECYCLE_COLUMNS if not mgr._has_column(c)] == list(LIFECYCLE_COLUMNS)
+
+    # Fail on the last of the three, after the first two have been issued.
+    original = LIFECYCLE_COLUMNS[list(LIFECYCLE_COLUMNS)[-1]]
+    LIFECYCLE_COLUMNS[list(LIFECYCLE_COLUMNS)[-1]] = "THIS IS NOT A TYPE"
+    try:
+        with pytest.raises(psycopg2.Error):
+            mgr.ensure_lifecycle_columns()
+    finally:
+        LIFECYCLE_COLUMNS[list(LIFECYCLE_COLUMNS)[-1]] = original
+    legacy_conn.rollback()
+
+    present = [c for c in LIFECYCLE_COLUMNS if mgr._has_column(c)]
+    assert present == [], (
+        f"partial migration committed {present} -- dismiss() would work while "
+        "list_jobs() could not filter, so an operator clears a list that keeps "
+        "showing the rows they cleared"
+    )
+
+
+def test_the_migration_branch_also_proves_its_index(legacy_conn) -> None:
+    """The other half of the name-taken case, on the path that migrates.
+
+    The steady-state path re-probes after its CREATE; the migration branch used
+    to run LIFECYCLE_INDEX raw, so a name already held by something else
+    absorbed the statement via IF NOT EXISTS and the method logged "Added
+    dead_letter lifecycle columns" with the index absent. Self-healing -- the
+    next boot takes the steady-state path, which does re-probe and raises -- but
+    a boot that says it did something it did not is how the last four rounds of
+    defects got past review.
+    """
+    with legacy_conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS dead_letter")
+        cur.execute(LEGACY_SCHEMA)  # pre-lifecycle, so the migration has work to do
+        # The name, held by an index on something else entirely.
+        cur.execute("CREATE TABLE decoy_lc (x TEXT)")
+        cur.execute("CREATE INDEX idx_dead_letter_open ON decoy_lc (x)")
+    legacy_conn.commit()
+
+    with pytest.raises(QueueError, match="did not create an index named"):
+        DeadLetterManager(legacy_conn).ensure_lifecycle_columns()
+    legacy_conn.rollback()

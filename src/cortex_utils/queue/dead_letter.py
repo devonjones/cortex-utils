@@ -30,11 +30,11 @@ from datetime import timedelta
 from typing import Any
 
 import psycopg2
-import structlog
 
-from cortex_utils.queue.ops import enqueue
+from cortex_utils.log import get_logger
+from cortex_utils.queue.ops import QueueError, _tx, enqueue, index_present
 
-log = structlog.get_logger()
+log = get_logger()
 
 # SQL to create dead_letter table
 DEAD_LETTER_SCHEMA = """
@@ -52,12 +52,24 @@ CREATE TABLE IF NOT EXISTS dead_letter (
     retried_as BIGINT,
     dismissed_at TIMESTAMPTZ
 );
-
-CREATE INDEX IF NOT EXISTS idx_dead_letter_queue
-    ON dead_letter(queue_name, failed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_dead_letter_created
-    ON dead_letter(created_at);
 """
+
+# Each index separately, so each can be ASKED about separately. They used to
+# ride along in the script above, which meant the table's existence stood in for
+# theirs: drop idx_dead_letter_queue and it never came back, on any later boot,
+# because nothing else in the package creates it. A gate answering one question
+# must not be used to skip three.
+BASE_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "idx_dead_letter_queue",
+        "CREATE INDEX IF NOT EXISTS idx_dead_letter_queue "
+        "ON dead_letter(queue_name, failed_at DESC)",
+    ),
+    (
+        "idx_dead_letter_created",
+        "CREATE INDEX IF NOT EXISTS idx_dead_letter_created ON dead_letter(created_at)",
+    ),
+)
 
 # Deliberately NOT in the script above. CREATE TABLE IF NOT EXISTS no-ops on an
 # existing table, and IF NOT EXISTS on an index guards the NAME, not the
@@ -65,6 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_dead_letter_created
 # shape and raised UndefinedColumn, taking ensure_table() down before the
 # migration it was supposed to reach. Every deployment that already had the
 # table, which is every deployment this feature exists for.
+# Bound on every DDL statement in this module: fail fast rather than queue
+# ACCESS EXCLUSIVE behind a long read and time out the inserts stacked behind it.
+DDL_LOCK_TIMEOUT_MS = 5000
+
 LIFECYCLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_dead_letter_open
     ON dead_letter(failed_at DESC) WHERE dismissed_at IS NULL AND retried_at IS NULL
@@ -85,12 +101,78 @@ class DeadLetterManager:
         self.conn = conn
 
     def ensure_table(self) -> None:
-        """Create the dead_letter table and bring an existing one up to date."""
-        with self.conn.cursor() as cur:
-            cur.execute(DEAD_LETTER_SCHEMA)
-        self.conn.commit()
+        """Create the dead_letter table and bring an existing one up to date.
+
+        Safe on every boot, and cheap on the one that matters: every step
+        pre-checks the catalogue, and each index is asked about on its own --
+        the table existing is not evidence that its indexes do.
+
+        It used to run unconditionally -- CREATE TABLE IF NOT EXISTS plus two
+        CREATE INDEX IF NOT EXISTS -- while the very next line pre-checked
+        pg_attribute before doing anything. By this module's own account, CREATE
+        INDEX IF NOT EXISTS still takes a lock and waits on an open writer even
+        when the index is already there, so the one step that skipped the
+        catalogue was taking locks on every boot of every consumer, forever, and
+        outside whatever lock_timeout the caller had set, because it opens its
+        own cursor. ensure_queue_schema() advertises "every step pre-checks the
+        catalogue"; this was the step that made that false.
+        """
+        if not self._has_table():
+            with _tx(self.conn, lock_timeout_ms=DDL_LOCK_TIMEOUT_MS) as cur:
+                cur.execute(DEAD_LETTER_SCHEMA)
+
+        for name, statement in BASE_INDEXES:
+            self._ensure_index(name, statement)
+
         self.ensure_lifecycle_columns()
         log.debug("Ensured dead_letter table exists")
+
+    def _ensure_index(self, name: str, statement: str) -> None:
+        """Create one index if the catalogue says it is missing, then prove it.
+
+        CREATE INDEX IF NOT EXISTS still takes a lock and waits on an open
+        writer even when the index is already there, and its queued ShareLock
+        times out inserts behind it -- so every boot asks first.
+
+        And asks again afterwards. IF NOT EXISTS guards the NAME in this schema,
+        not the index: with the name held by an index on another table, by an
+        invalid index on this one, or by a plain table, the CREATE returns
+        normally with a NOTICE and the index is still absent. Without the second
+        probe every later boot re-takes the lock the first probe exists to avoid
+        and logs that it created something it did not. schema._ensure_indexes
+        re-asks for exactly this reason; this half did not come across with it.
+        """
+        if self._has_index(name):
+            return
+        with _tx(self.conn, lock_timeout_ms=DDL_LOCK_TIMEOUT_MS) as cur:
+            cur.execute(statement)
+        if not self._has_index(name):
+            raise QueueError(
+                f"{statement.strip()[:60]}... did not create an index named "
+                f"{name!r} on dead_letter. Something else holds that name; "
+                "the name is what every later boot checks."
+            )
+        log.info("Created dead_letter index", index=name)
+
+    def _has_table(self) -> bool:
+        """Bound through to_regclass, so it answers about this schema's table."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT relkind FROM pg_class WHERE oid = to_regclass('dead_letter')")
+            row = cur.fetchone()
+        if row is None:
+            return False
+        if row[0] not in ("r", "p"):
+            # to_regclass resolving proves a name is taken, not that it is the
+            # table. Returning False here would send us into CREATE TABLE IF
+            # NOT EXISTS, which skips on any same-named relation, and the
+            # failure would surface several statements later as an index error
+            # about a view. Say what was actually found -- the same answer
+            # schema._inspect gives for queue.
+            raise QueueError(
+                f"dead_letter exists but is a {row[0]!r} relation, not a table. "
+                "Check the connection's search_path."
+            )
+        return True
 
     def ensure_lifecycle_columns(self) -> bool:
         """Add retried_at/retried_as/dismissed_at if this schema predates them.
@@ -104,55 +186,36 @@ class DeadLetterManager:
         """
         missing = [c for c in LIFECYCLE_COLUMNS if not self._has_column(c)]
         if not missing:
-            if self._has_index("idx_dead_letter_open"):
-                # CREATE INDEX IF NOT EXISTS still takes a lock and waits on a
-                # writer even when the index is already there -- measured
-                # blocking for the full duration of an open transaction, and
-                # its queued ShareLock times out new inserts behind it. This is
-                # the path every boot takes, so it asks the catalogue instead.
-                return False
-            with self.conn.cursor() as cur:
-                cur.execute(LIFECYCLE_INDEX)
-            self.conn.commit()
+            self._ensure_index("idx_dead_letter_open", LIFECYCLE_INDEX)
             return False
 
-        # SET LOCAL is a silent no-op under autocommit -- there is no
-        # transaction for it to be local to -- and each ALTER would then commit
-        # on its own, so both the lock bound and the all-or-nothing property
-        # would be false exactly where this class does not own the connection.
-        # Only when it is actually on: psycopg2 refuses to change the session
-        # mode inside a transaction, and on a normal connection the probe above
-        # has already opened one -- where the commit below covers the ALTERs
-        # anyway, so there is nothing to fix.
-        was_autocommit = self.conn.autocommit
-        if was_autocommit:
-            self.conn.autocommit = False
-        try:
-            with self.conn.cursor() as cur:
-                # Fail fast rather than queue ACCESS EXCLUSIVE behind a long read.
-                cur.execute("SET LOCAL lock_timeout = '5000ms'")
-                for name in missing:
-                    cur.execute(
-                        f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
-                        f"{LIFECYCLE_COLUMNS[name]}"
-                    )
-                cur.execute(LIFECYCLE_INDEX)
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        finally:
-            if was_autocommit:
-                self.conn.autocommit = True
+        # All in one _tx: the bound and the all-or-nothing property both come
+        # from sharing a transaction, and a half-migrated table is worse than an
+        # unmigrated one.
+        with _tx(self.conn, lock_timeout_ms=DDL_LOCK_TIMEOUT_MS) as cur:
+            for name in missing:
+                cur.execute(
+                    f"ALTER TABLE dead_letter ADD COLUMN IF NOT EXISTS {name} "
+                    f"{LIFECYCLE_COLUMNS[name]}"
+                )
+
+        # After the columns commit, and through _ensure_index so it gets the
+        # post-probe. Run raw inside the transaction above, a name already taken
+        # by something else absorbed the CREATE via IF NOT EXISTS and this
+        # method logged success with the index absent -- detected one boot later
+        # by the steady-state path, which does re-probe, but a misleading log in
+        # the meantime. The index is deliberately NOT part of the columns'
+        # all-or-nothing set: it depends on them, and if it fails the next boot
+        # creates it, whereas half the columns is the state with no recovery.
+        self._ensure_index("idx_dead_letter_open", LIFECYCLE_INDEX)
 
         log.info("Added dead_letter lifecycle columns", columns=missing)
         return True
 
     def _has_index(self, name: str) -> bool:
-        """Bound through to_regclass, and cheap under a writer's lock."""
+        """Is `name` a valid index ON dead_letter? Shared with schema.py."""
         with self.conn.cursor() as cur:
-            cur.execute("SELECT to_regclass(%s) IS NOT NULL", (name,))
-            return bool(cur.fetchone()[0])
+            return index_present(cur, "dead_letter", name)
 
     def _has_column(self, name: str) -> bool:
         """Bound through to_regclass so it answers about THIS schema's table."""

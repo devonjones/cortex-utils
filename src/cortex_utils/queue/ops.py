@@ -51,9 +51,9 @@ from datetime import date, timedelta
 from typing import Any, Literal
 
 import psycopg2
-import structlog
 from psycopg2.extras import Json
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.retry import (
     DEFAULT_BASE_SECONDS,
     DEFAULT_CAP_SECONDS,
@@ -61,7 +61,7 @@ from cortex_utils.queue.retry import (
     compute_backoff_delay,
 )
 
-log = structlog.get_logger()
+log = get_logger()
 
 DEFAULT_VISIBILITY_TIMEOUT_MIN = 30
 ERROR_MAX_CHARS = 2000
@@ -112,7 +112,9 @@ class PartitionNotAttachedError(PartitionError):
 
 @contextmanager
 def _tx(
-    conn: psycopg2.extensions.connection, commit: bool = True
+    conn: psycopg2.extensions.connection,
+    commit: bool = True,
+    lock_timeout_ms: int | None = None,
 ) -> Iterator[psycopg2.extensions.cursor]:
     """One unit of work: commit on success, roll back before re-raising.
 
@@ -129,7 +131,54 @@ def _tx(
     want to recover to it, and rolling back here would take that choice away.
     Either way the connection is aborted and unusable until the caller rolls
     back, which is the contract they accepted by owning the transaction.
+
+    lock_timeout_ms bounds how long the statements inside will wait for a lock.
+    It lives here, and not at the call sites, because SET LOCAL is a silent
+    no-op under autocommit -- there is no transaction for it to be local to --
+    so every hand-rolled bound was conditional on a connection shape the library
+    does not control. Four sites issued one without the guard and were therefore
+    unbounded on exactly the shape dead_letter's own docstrings call "the
+    connection shape a consumer is most likely to hand us"; dead_letter learned
+    it three separate times and wrote the dance out three times.
+
+    Measured, with the schema advisory lock held elsewhere and the bound at
+    1500ms: a transaction-mode connection raised LockNotAvailable at 1.50s, an
+    autocommit one was still waiting at 12s and died only to a statement_timeout
+    backstop.
     """
+    # psycopg2 refuses to change the session mode inside a transaction, but
+    # under autocommit there is none open to refuse for -- that is the whole
+    # point of the branch. Restored in the finally, including on the error path,
+    # so the caller's connection goes back the way it arrived.
+    if lock_timeout_ms is not None and not commit:
+        # These two cannot both hold. The bound is issued as SET LOCAL in the
+        # committing branch only, so combining them silently produced NO bound
+        # -- while the autocommit flip and its finally-rollback still fired off
+        # lock_timeout_ms alone, destroying the caller's uncommitted work with
+        # no error. Nothing combines them today; this refuses rather than
+        # leaving the trap set, because a bound that is conditional on the
+        # caller's connection shape is the exact defect this parameter exists
+        # to remove. A caller who owns the transaction owns its bound too.
+        raise ValueError(
+            "lock_timeout_ms needs a transaction of its own; with commit=False "
+            "the caller owns the transaction and sets its own bound"
+        )
+    # `is not None`, not truthiness: lock_timeout_ms=0 means "no wait at all" in
+    # Postgres, and reading it as "unbounded" would invert the caller's intent.
+    was_autocommit = lock_timeout_ms is not None and conn.autocommit
+    if was_autocommit:
+        conn.autocommit = False
+    try:
+        yield from _tx_body(conn, commit, lock_timeout_ms)
+    finally:
+        if was_autocommit:
+            conn.rollback()
+            conn.autocommit = True
+
+
+def _tx_body(
+    conn: psycopg2.extensions.connection, commit: bool, lock_timeout_ms: int | None
+) -> Iterator[psycopg2.extensions.cursor]:
     if not commit:
         # No claimed_by guard here deliberately: the only caller that reaches
         # this branch is _insert(), whose statement names no such column. A
@@ -140,6 +189,8 @@ def _tx(
         return
     try:
         with conn.cursor() as cur:
+            if lock_timeout_ms is not None:
+                cur.execute("SET LOCAL lock_timeout = %s", (f"{lock_timeout_ms}ms",))
             yield cur
         conn.commit()
     except psycopg2.errors.UndefinedColumn as exc:
@@ -237,8 +288,7 @@ def ensure_claim_token_column(conn: psycopg2.extensions.connection) -> bool:
     if has_claim_token_column(conn):
         return False
 
-    with _tx(conn) as cur:
-        cur.execute("SET LOCAL lock_timeout = %s", (f"{MIGRATION_LOCK_TIMEOUT_MS}ms",))
+    with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
         cur.execute("ALTER TABLE queue ADD COLUMN IF NOT EXISTS claimed_by TEXT")
     log.info("Added queue.claimed_by")
     return True
@@ -282,6 +332,31 @@ _ATTACHED_SQL = """
     JOIN pg_inherits i ON c.oid = i.inhrelid
     WHERE i.inhparent = to_regclass('queue') AND c.relname = %s
 """
+
+
+def index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bool:
+    """True if `name` is a VALID index ON `table`.
+
+    One implementation, because two drifted. schema.py had this shape and
+    dead_letter.py had `to_regclass(name) IS NOT NULL` -- which proves a name
+    resolves somewhere on the search_path, not that the index is on this table.
+    Under `search_path = app, shared`, an unrelated index of that name in
+    `shared` made the gate answer "present" and the index was never created, on
+    any boot, forever, while the caller logged success. Multi-schema is this
+    package's normal deployment; every live test runs under a SET search_path.
+
+    indisvalid too: an interrupted CREATE INDEX CONCURRENTLY leaves an invalid
+    index that resolves and joins and indexes nothing.
+
+    Takes a cursor rather than a connection so it shares the caller's
+    transaction -- a post-CREATE probe has to see the uncommitted index.
+    """
+    cur.execute(
+        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s) AND i.indisvalid",
+        (name, table),
+    )
+    return cur.fetchone() is not None
 
 
 def require_queue_table(conn: psycopg2.extensions.connection) -> None:
@@ -358,9 +433,7 @@ def _ensure_partition(conn: psycopg2.extensions.connection, target: date, requir
     """
     name = _partition_name(target)
     try:
-        with _tx(conn) as cur:
-            cur.execute("SET LOCAL lock_timeout = %s", (f"{PARTITION_LOCK_TIMEOUT_MS}ms",))
-
+        with _tx(conn, lock_timeout_ms=PARTITION_LOCK_TIMEOUT_MS) as cur:
             # Ask before creating, not only after. Two things depend on knowing
             # whether the partition was already there, and CREATE TABLE IF NOT
             # EXISTS cannot tell us afterwards -- it succeeds either way:

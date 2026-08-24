@@ -899,3 +899,183 @@ def test_boot_releases_the_lock_it_took(conn) -> None:
         )
         assert cur.fetchone()[0] == 0, "boot kept the schema lock"
     conn.commit()
+
+
+def test_a_boot_that_fails_mid_ddl_keeps_its_error_and_its_lock_release(conn) -> None:
+    """The finally-unlock runs on a possibly-ABORTED transaction.
+
+    A clean refusal is not the case -- those happen before any DDL, so the
+    transaction is fine and the unlock works either way. What matters is a
+    failure that reaches the server: psycopg2 then refuses every later
+    statement, so the unlock itself raises InFailedSqlTransaction, replacing
+    the real error with a confusing one AND leaving a SESSION-scoped advisory
+    lock held for the life of the connection -- which serialises every later
+    boot on it behind a lock nobody holds deliberately.
+
+    Measured both directions: without the rollback, DivisionByZero becomes
+    InFailedSqlTransaction and pg_locks shows 1; with it, the original error
+    propagates and the count is 0.
+    """
+    import cortex_utils.queue.schema as sch
+
+    def fails_at_the_server(c, table="queue", extra_indexes=()):
+        with c.cursor() as cur:
+            cur.execute("SELECT 1 / 0")
+
+    original = sch.ensure_queue_table
+    sch.ensure_queue_table = fails_at_the_server
+    try:
+        with pytest.raises(psycopg2.errors.DivisionByZero):
+            sch.ensure_queue_schema(conn)
+    finally:
+        sch.ensure_queue_table = original
+    conn.rollback()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+        assert cur.fetchone()[0] == 0, "the schema lock outlived a failed boot"
+    conn.commit()
+
+
+def test_a_refused_boot_does_not_leak_the_schema_lock(conn) -> None:
+    """The finally-unlock runs on a possibly-aborted transaction. Without a
+    rollback first it raises InFailedSqlTransaction -- replacing the real error
+    with a confusing one AND leaving a SESSION-scoped advisory lock held for
+    the life of the connection, which serialises every later boot on it behind
+    a lock nobody holds deliberately.
+    """
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    # A shape ensure_queue_schema refuses, so it raises partway through.
+    with conn.cursor() as cur:
+        cur.execute(queue_ddl().replace("    priority INT NOT NULL DEFAULT 0,\n", ""))
+    conn.commit()
+
+    with pytest.raises(QueueError):
+        ensure_queue_schema(conn)
+    conn.rollback()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+        )
+        assert cur.fetchone()[0] == 0, "the schema lock outlived a failed boot"
+    conn.commit()
+
+
+def test_a_fresh_schema_is_not_reported_as_a_dead_maintenance_incident(conn) -> None:
+    """The marker exists so the self-heal count means what it says. On the
+    bootstrap path it was saying something false.
+
+    ensure_queue_schema created the table with zero partitions, so the first
+    enqueue self-healed, stamped SELF_HEALED_MARKER, and health().is_healthy
+    read False -- "maintenance is not keeping up" -- for up to retention_days
+    on every new install, while maintenance was fine and simply had not had its
+    2AM turn yet.
+    """
+    from cortex_utils.queue.inspect import health
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    assert ensure_queue_schema(conn) == "created"
+
+    enqueue(conn, "q", {"n": 1})
+
+    got = health(conn)
+    assert got.self_healed_partitions == 0, (
+        "a fresh install routed its first write through the self-heal"
+    )
+    assert got.partition_headroom_days >= 1
+    assert got.is_healthy is True, "a correctly configured fresh install reads unhealthy"
+
+
+@pytest.mark.parametrize("autocommit", [False, True])
+def test_the_boot_lock_wait_is_bounded(conn, autocommit: bool) -> None:
+    """Every DDL statement inside ensure_queue_schema is bounded, but the front
+    door was not -- so a holder wedged BETWEEN its bounded statements blocked
+    every later boot indefinitely. The key is per DATABASE, so a wedged boot in
+    one schema hangs boots in the other.
+
+    Parametrised over connection shape because the first version of this test
+    ran only the non-autocommit one -- precisely the shape the bound already
+    worked on. SET LOCAL is a silent no-op under autocommit, so the whole
+    defence was conditional on a property of the CALLER's connection: measured
+    at the time, bounded at 1.50s in transaction mode and still waiting at 12s
+    under autocommit. _tx now owns the autocommit flip, so this covers every
+    bounded DDL path in the package, not just the boot lock.
+    """
+    import threading
+
+    if autocommit:
+        conn.rollback()
+        conn.autocommit = True
+
+    import cortex_utils.queue.schema as sch
+    from cortex_utils.queue.schema import ensure_queue_schema
+
+    holder = psycopg2.connect(DSN)
+    try:
+        holder.autocommit = True
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")
+
+        outcome: dict[str, object] = {}
+
+        def boot() -> None:
+            try:
+                ensure_queue_schema(conn)
+                outcome["r"] = "returned"
+            except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+                outcome["r"] = exc
+
+        # Turn the production bound down rather than waiting a real minute --
+        # what is being asserted is that the wait is FINITE, and a test that
+        # releases the lock first would pass whether or not it is.
+        original = sch.SCHEMA_LOCK_TIMEOUT_MS
+        sch.SCHEMA_LOCK_TIMEOUT_MS = 1500
+        try:
+            t = threading.Thread(target=boot, daemon=True)
+            t.start()
+            t.join(timeout=25)
+            assert not t.is_alive(), (
+                "still waiting on a lock nobody is going to release -- the boot "
+                "wait is unbounded, and the key is per DATABASE, so this hangs "
+                "the other tenant's boots too"
+            )
+            assert isinstance(outcome["r"], psycopg2.errors.LockNotAvailable), outcome
+        finally:
+            sch.SCHEMA_LOCK_TIMEOUT_MS = original
+    finally:
+        holder.close()
+        if autocommit:
+            conn.autocommit = False
+    conn.rollback()
+
+
+def test_a_plain_queue_table_still_boots(conn) -> None:
+    """A non-partitioned queue is legal and supported. migrate_to_partitioned()
+    exists for it, and ensure_queue_table() accepts it deliberately -- warning
+    with a pointer to migrate-queue rather than failing, so that partitions.py
+    does not later raise about a relation that "is not partitioned" several
+    frames from the thing that could have explained it.
+
+    Boot then created future partitions unconditionally, which raised exactly
+    that error and killed the boot on exactly that supported shape. Nothing saw
+    it: the suite was green with the crash in it, because every other test here
+    builds a partitioned table first.
+    """
+    from cortex_utils.queue.schema import REQUIRED_COLUMNS, ensure_queue_schema
+
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS queue CASCADE")
+        cols = ", ".join(f"{n} {d}" for n, d in REQUIRED_COLUMNS.items())
+        cur.execute(f"CREATE TABLE queue ({cols})")
+    conn.commit()
+
+    assert ensure_queue_schema(conn) == "present"
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('queue')")
+        assert cur.fetchone()[0] == 0, "nothing should be attached to a plain table"
+    conn.rollback()

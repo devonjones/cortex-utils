@@ -7,9 +7,10 @@ import re
 from typing import Literal
 
 import psycopg2
-import structlog
 
-log = structlog.get_logger()
+from cortex_utils.log import get_logger
+
+log = get_logger()
 
 DEFAULT_BASE_SECONDS = 30
 DEFAULT_CAP_SECONDS = 900  # 15 minutes
@@ -42,7 +43,14 @@ _COLUMN_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 def ready_predicate(column: str = "next_attempt_at") -> str:
-    """SQL predicate that matches jobs ready to be claimed.
+    """DEPRECATED. Splices an SQL fragment into a claim query you write yourself.
+
+    That is this library subsidising violations of its own rule -- the one that
+    says cortex_utils owns the SQL that talks to the queue. It exists only
+    because five cortex workers still hand-write their claim, and it should be
+    deleted in the same migration that ports them (cortex-i5jc). Call claim().
+
+    SQL predicate that matches jobs ready to be claimed.
 
     Splice into the `claimable` CTE of a consumer's claim query.
     `column` must be a SQL identifier (alphanumeric/underscore only).
@@ -131,6 +139,15 @@ def fail_or_retry(
             jitter_ratio=jitter_ratio,
         )
         # Release the claim so the row becomes eligible at next_attempt_at.
+        # claimed_by goes with claimed_at: a row back on the pending pile still
+        # carrying the last worker's token is a row certified to someone who no
+        # longer holds it, so a stalled worker's complete() would match and
+        # retire a job the next claimant is mid-flight on.
+        #
+        # Only on this branch. The 'failed' UPDATE above leaves the token as a
+        # record of who last held it, and a failed row is not claimable -- the
+        # one thing that re-pends one in place is triage's repair re-enqueue,
+        # which clears it there.
         cur.execute(
             """
             UPDATE queue
@@ -138,7 +155,8 @@ def fail_or_retry(
                 attempts = %s,
                 last_error = %s,
                 next_attempt_at = clock_timestamp() + (INTERVAL '1 second' * %s),
-                claimed_at = NULL
+                claimed_at = NULL,
+                claimed_by = NULL
             WHERE id = %s
             """,
             (next_attempts, truncated_error, delay_seconds, job_id),

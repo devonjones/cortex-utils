@@ -5,10 +5,11 @@ from collections.abc import Callable
 from typing import Any
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
-import structlog
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 
-logger = structlog.get_logger()
+from cortex_utils.log import get_logger
+
+logger = get_logger()
 
 # Module-level state for idempotent server startup
 _server_lock = threading.Lock()

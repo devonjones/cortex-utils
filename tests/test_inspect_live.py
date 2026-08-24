@@ -560,3 +560,113 @@ def test_the_retry_migration_probe_answers_normally_when_the_table_exists(conn) 
         cur.execute("ALTER TABLE queue DROP COLUMN next_attempt_at")
     conn.commit()
     assert has_next_attempt_at_column(conn) is False, "a real missing column still reads False"
+
+
+def test_resubmit_resolves_the_dedup_key_from_the_row(conn) -> None:
+    """The caller should not have to look up which queue a job is on before it
+    can pick a dedup key -- resubmit already reads queue_name to re-enqueue.
+    Making them fetch it meant a raw SELECT against the queue on their side,
+    which under this package's rule is a gap here, not a boundary.
+    """
+    from cortex_utils.queue.inspect import resubmit
+
+    today = _server_today(conn)
+    _partition(conn, today)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status) "
+            "VALUES ('drain', '{\"video_id\": \"v1\"}'::jsonb, 'failed') RETURNING id"
+        )
+        failed = cur.fetchone()[0]
+    conn.commit()
+
+    # Live work already queued for the same video. With the key resolved from
+    # the row, resubmit must dedup against it; without, it queues a duplicate --
+    # and asserting on a LATER enqueue would pass either way, because that call
+    # carries its own key.
+    assert enqueue(conn, "drain", {"video_id": "v1"}, dedup_key="video_id") is not None
+
+    keys = {"drain": "video_id", "triage": "gmail_id"}
+    assert resubmit(conn, failed, dedup_keys=keys) is None, (
+        "the key was not resolved from the row: it queued a duplicate"
+    )
+
+    with conn.cursor() as cur:
+        # Only the live one: the failed row still carries the same video_id and
+        # is now cancelled, so counting every status would be 2 either way.
+        cur.execute(
+            "SELECT count(*) FROM queue WHERE payload->>'video_id' = 'v1' AND status = 'pending'"
+        )
+        assert cur.fetchone()[0] == 1
+
+
+def test_resubmit_refuses_both_key_forms(conn) -> None:
+    from cortex_utils.queue.inspect import resubmit
+
+    with pytest.raises(QueueError, match="not both"):
+        resubmit(conn, 1, dedup_key="a", dedup_keys={"q": "b"})
+    conn.rollback()
+
+
+def test_resubmit_with_no_key_for_that_queue_still_works(conn) -> None:
+    """A map that does not mention this queue means no dedup, not an error."""
+    from cortex_utils.queue.inspect import resubmit
+
+    today = _server_today(conn)
+    _partition(conn, today)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status) "
+            "VALUES ('other', '{}'::jsonb, 'failed') RETURNING id"
+        )
+        failed = cur.fetchone()[0]
+    conn.commit()
+
+    assert resubmit(conn, failed, dedup_keys={"drain": "video_id"}) is not None
+
+
+def test_partitions_can_cover_yesterday(conn) -> None:
+    """created_at is NOW() on the server, so a producer whose clock is behind
+    can land a row in yesterday. Steady-state maintenance does not want those --
+    retention is about to drop them -- so it is opt-in."""
+    from cortex_utils.queue.partitions import PartitionManager
+
+    today = _server_today(conn)
+    manager = PartitionManager(conn)
+
+    assert manager.create_future_partitions(days_ahead=0) == 1
+    assert manager.partition_exists(today - timedelta(days=1)) is False
+
+    assert manager.create_future_partitions(days_ahead=0, days_back=1) == 1
+    assert manager.partition_exists(today - timedelta(days=1)) is True
+
+
+def test_an_empty_dedup_map_does_not_silently_discard_the_key(conn) -> None:
+    """The guard tested truthiness while resolution tested identity, and they
+    disagreed on {}. No raise, then .get() returns None, the caller's dedup_key
+    is discarded, and a duplicate is enqueued while resubmit returns a new id --
+    success reported on a false belief. An empty map is the likely shape:
+    cfg.get("dedup_keys", {}), or a filtered comprehension.
+    """
+    from cortex_utils.queue.inspect import resubmit
+
+    with pytest.raises(QueueError, match="not both"):
+        resubmit(conn, 1, dedup_key="video_id", dedup_keys={})
+    conn.rollback()
+
+
+def test_a_negative_window_is_refused(conn) -> None:
+    """days_back=-1 skips TODAY's partition and returns 3, which maintain()
+    reports as partitions_created -- while the write path then self-heals and
+    logs "maintenance is not keeping up", which is false and points debugging
+    away from the caller that asked for a window with no today in it."""
+    from cortex_utils.queue.partitions import PartitionError, PartitionManager
+
+    manager = PartitionManager(conn)
+    for kwargs in ({"days_back": -1}, {"days_ahead": -1}):
+        with pytest.raises(PartitionError, match="negative window"):
+            manager.create_future_partitions(**kwargs)
+        conn.rollback()
+
+    today = _server_today(conn)
+    assert manager.partition_exists(today) is False, "nothing was created"

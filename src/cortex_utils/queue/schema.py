@@ -25,13 +25,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import psycopg2
-import structlog
 
+from cortex_utils.log import get_logger
 from cortex_utils.queue.add_retry_columns import add_retry_columns
 from cortex_utils.queue.dead_letter import DeadLetterManager
-from cortex_utils.queue.ops import QueueError, _tx, ensure_claim_token_column
+from cortex_utils.queue.ops import (
+    QueueError,
+    _tx,
+    ensure_claim_token_column,
+    index_present,
+)
+from cortex_utils.queue.partitions import PartitionManager
 
-log = structlog.get_logger()
+log = get_logger()
 
 # What the primitives read and write. The value is the type a fresh table gets;
 # verify_queue_table() checks presence rather than type, because an existing
@@ -71,6 +77,12 @@ _RELKINDS = {
 # The columns ensure_queue_schema() can add to an existing table. Anything else
 # missing is refused rather than half-migrated.
 _MIGRATED_COLUMNS = frozenset({"next_attempt_at", "claimed_by"})
+
+# How long a boot waits for the schema lock. Generous, because legitimate
+# contention here is a fleet redeploy -- but finite, because an indefinite fleet
+# hang is worse than a loud boot failure, and the key is per DATABASE, so one
+# tenant's wedged boot would otherwise hang the other's.
+SCHEMA_LOCK_TIMEOUT_MS = 60_000
 
 VALID_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
 
@@ -210,6 +222,12 @@ def ensure_queue_table(
     a lock and waits on an open writer even when the index is already there, and
     this runs on every boot.
 
+    Your statement is unqualified and resolves through the connection's
+    search_path, same as everything else here. That is what makes composition
+    work -- your index lands in your schema without either side naming it -- but
+    it is worth saying out loud, because when the search_path is wrong the index
+    is built somewhere else and nothing complains.
+
     Passing them here rather than keeping a private migration is the point. A
     consumer that adopts this function and deletes its own DDL otherwise loses
     those indexes silently -- nothing here would put them back, and the absence
@@ -292,31 +310,8 @@ def _ensure_indexes(
 
 
 def _index_present(cur: psycopg2.extensions.cursor, table: str, name: str) -> bool:
-    """True if `name` is an index ON `table`.
-
-    Not to_regclass(name): that proves a name is taken, which is the thing this
-    module refuses to accept as proof elsewhere. A table, a sequence, or an
-    index on some other relation all resolve, and reading any of them as "the
-    index is there" means the CREATE is skipped forever and the index silently
-    never exists. Opening the name space to consumers is what makes that
-    collision realistic rather than theoretical.
-
-    indisvalid for the same reason one step further in: CREATE INDEX ON ONLY a
-    partitioned parent leaves an invalid index, which resolves and joins and
-    would otherwise pass this check forever while indexing nothing.
-
-    Takes a cursor rather than a connection so it shares the caller's
-    transaction. The post-CREATE probe has to see the uncommitted index; opening
-    its own would commit the CREATE before checking it, which is the difference
-    between a mismatch rolling back cleanly and leaving an orphan index under a
-    name no later boot will look for.
-    """
-    cur.execute(
-        "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-        "WHERE c.relname = %s AND i.indrelid = to_regclass(%s) AND i.indisvalid",
-        (name, table),
-    )
-    return cur.fetchone() is not None
+    """Delegates to ops.index_present -- one implementation, because two drifted."""
+    return index_present(cur, table, name)
 
 
 def ensure_queue_schema(
@@ -350,13 +345,32 @@ def ensure_queue_schema(
     catalogue before touching anything, so the common case is the advisory lock,
     a handful of reads, and no table locks.
     """
-    with _tx(conn) as cur:
+    with _tx(conn, lock_timeout_ms=SCHEMA_LOCK_TIMEOUT_MS) as cur:
+        # Bounded. Every DDL statement below runs under a 5s lock_timeout, but
+        # this front door had none -- so a holder that wedges BETWEEN its
+        # bounded statements blocked every later boot indefinitely. And the key
+        # is per DATABASE, not per schema, so a wedged cryo boot would hang
+        # cortex boots: cross-tenant coupling at the one place this package
+        # otherwise keeps tenants apart. Generous, because legitimate contention
+        # here is a fleet redeploy, but finite, because an indefinite fleet hang
+        # is worse than a loud boot failure.
         # Session-scoped, not xact-scoped: the steps below commit individually,
         # and an xact lock would be released by the first one.
         cur.execute("SELECT pg_advisory_lock(hashtext('cortex_queue_schema'))")
     try:
         return _ensure_queue_schema_locked(conn, extra_indexes)
     finally:
+        # The transaction may be aborted -- a step above may have failed
+        # mid-DDL -- and the unlock would then raise InFailedSqlTransaction,
+        # replacing the real error with a confusing one AND leaving a
+        # SESSION-scoped lock held for the life of the connection, which
+        # serialises every later boot on it behind a lock nobody holds
+        # deliberately. Clear the transaction first, and never let this
+        # displace the exception that sent us here.
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 -- a dead connection releases it anyway
+            log.warning("Could not clear the transaction before unlocking")
         with _tx(conn) as cur:
             cur.execute("SELECT pg_advisory_unlock(hashtext('cortex_queue_schema'))")
             if not cur.fetchone()[0]:
@@ -400,4 +414,28 @@ def _ensure_queue_schema_locked(
     # health() reads dead_letter, and drop_partition() archives into it, so a
     # service that never dead-letters anything itself still needs it to exist.
     DeadLetterManager(conn).ensure_table()
+
+    # Today and tomorrow, so a fresh schema does not report itself as a dead
+    # maintenance incident. Without this the table is created with zero
+    # partitions, the first enqueue self-heals, stamps SELF_HEALED_MARKER, and
+    # health().is_healthy reads False -- "maintenance is not keeping up" -- for
+    # up to retention_days on every new install, while maintenance is fine and
+    # simply has not had its 2AM turn yet. The marker exists so the count means
+    # what it says; on the bootstrap path it was saying something false.
+    #
+    # Boot is also the cheapest moment to create them: uncontended, and it
+    # removes the only steady-state path where a correctly configured system
+    # routes writes through the self-heal.
+    # Only when there is something to partition. ensure_queue_table() above
+    # deliberately ACCEPTS a plain queue table -- migrate_to_partitioned() exists
+    # for exactly that, and it warns pointing at migrate-queue rather than
+    # failing -- so calling this unconditionally raised InvalidObjectDefinition
+    # ("queue" is not partitioned) and killed the boot on a configuration forty
+    # lines of this file exist to support.
+    #
+    # Asked of the database rather than read off the _inspect() above, because
+    # that snapshot predates the table this function may have just created.
+    partitions = PartitionManager(conn)
+    if partitions.is_table_partitioned():
+        partitions.create_future_partitions(days_ahead=1)
     return result
