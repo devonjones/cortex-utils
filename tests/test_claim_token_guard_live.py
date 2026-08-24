@@ -27,6 +27,7 @@ from cortex_utils.queue.ops import (  # noqa: E402
     fail_or_retry,
     release,
 )
+from cortex_utils.queue.schema import queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
 
@@ -34,25 +35,12 @@ pytestmark = pytest.mark.skipif(
     not DSN, reason="set CORTEX_TEST_DSN to a throwaway Postgres to run these"
 )
 
-# The queue as it stands before ensure_claim_token_column() has ever run:
-# claimed_at is in the base DDL, claimed_by is what the migration adds.
-PRE_MIGRATION_DDL = """
-CREATE TABLE queue (
-    id BIGSERIAL,
-    queue_name TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    priority INT NOT NULL DEFAULT 0,
-    attempts INT NOT NULL DEFAULT 0,
-    max_attempts INT NOT NULL DEFAULT 3,
-    last_error TEXT,
-    claimed_at TIMESTAMPTZ,
-    next_attempt_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
-"""
+# The queue as it stands before ensure_claim_token_column() has ever run.
+# Derived from the canonical DDL with exactly one column removed, rather than
+# hand-written: the omission is the point of this file, and everything else
+# about the shape should track the real one so a change there is not silently
+# untested here.
+PRE_MIGRATION_DDL = "\n".join(line for line in queue_ddl().splitlines() if "claimed_by" not in line)
 
 
 @pytest.fixture

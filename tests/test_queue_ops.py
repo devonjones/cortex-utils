@@ -92,7 +92,9 @@ class FakeCursor:
         # The queue table exists unless a test says otherwise -- every primitive
         # now checks, and threading that through each fetchone sequence would
         # bury the thing each test is actually about.
-        self._pending_parent = "SELECT to_regclass('queue')" in sql
+        # The guard now asks for the relkind too, since a matview resolves
+        # through to_regclass and carries pg_attribute rows.
+        self._pending_parent = "oid = to_regclass('queue')" in sql and "relkind" in sql
         self._pending_probe = "pg_inherits" in sql
         self._probed = params[0] if (self._pending_probe and params) else None
         if self.preexisting_after_create and sql.strip().startswith("CREATE TABLE"):
@@ -115,7 +117,7 @@ class FakeCursor:
             return (SERVER_TODAY,)
         if self._pending_parent:
             self._pending_parent = False
-            return (None,) if self.no_queue_table else ("queue",)
+            return None if self.no_queue_table else (1,)
         if self._pending_probe:
             self._pending_probe = False
             known = self.created | self.preexisting
