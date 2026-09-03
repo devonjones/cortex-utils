@@ -44,7 +44,9 @@ already follows.
 
 from __future__ import annotations
 
+import os
 import re
+import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -695,6 +697,25 @@ def _insert(
         )
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def worker_identity(service: str) -> str:
+    """A claim token for one worker process: service, host and pid.
+
+    claim() requires a `worker` and deliberately has no default, because a
+    shared one would make every claimant indistinguishable and the token would
+    stop discriminating. That leaves each consumer to invent a format, and four
+    services inventing four formats is the drift this package exists to stop --
+    so the format lives here, once.
+
+    What it has to be: unique per process (host plus pid is), stable for that
+    process's life (both are), and legible in a log line when someone is trying
+    to work out which container is sitting on a job. In a container the hostname
+    is the container id, which is exactly what an operator needs to `docker logs`.
+    """
+    if not service:
+        raise QueueError("service is required; it is what makes the token legible")
+    return f"{service}@{socket.gethostname()}:{os.getpid()}"
 
 
 def claim(

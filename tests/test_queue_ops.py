@@ -1193,3 +1193,28 @@ def test_a_differently_named_column_is_not_mistaken_for_ours() -> None:
 
     exc = type("_U", (psycopg2.errors.UndefinedColumn,), {"diag": _Diag()})(primary)
     assert _reraise_missing_migration(exc) is None, "must fall through to a plain re-raise"
+
+
+def test_worker_identity_is_unique_per_process_and_legible() -> None:
+    """The token has to discriminate, so the format cannot be a shared constant,
+    and it has to be readable, because the first thing an operator does with a
+    stuck job is find out who is holding it.
+
+    Lives in the library so four services do not invent four formats -- the
+    drift this package exists to stop. Pinned because "unique per process" is a
+    property a refactor can quietly lose.
+    """
+    import os
+    import socket
+
+    from cortex_utils.queue.ops import worker_identity
+
+    token = worker_identity("parse-worker")
+    assert token.startswith("parse-worker@"), token
+    assert socket.gethostname() in token, "no host means no way to find the container"
+    assert str(os.getpid()) in token, "no pid means two workers on one host collide"
+    assert worker_identity("parse-worker") == token, "must be stable within a process"
+    assert worker_identity("triage-worker") != token, "must distinguish services"
+
+    with pytest.raises(QueueError, match="service is required"):
+        worker_identity("")
