@@ -441,3 +441,45 @@ def test_complete_can_leave_the_transaction_to_the_caller(conns) -> None:
         cur.execute("SELECT status FROM queue WHERE id = %s", (job_id,))
         assert cur.fetchone()[0] == "completed"
     a.commit()
+
+
+def test_a_pending_row_with_no_attempts_left_is_retired_not_stranded(conns) -> None:
+    """claimable refuses a pending row whose attempts are spent -- correctly --
+    but nothing retired it, so it sat pending forever: never handed out, never
+    failed, never in failures(), and pinning its partition against retention,
+    which skips any partition still holding pending rows. Stuck and invisible.
+
+    Unreachable while a consumer's budget only ever grows, because
+    fail_or_retry never leaves an exhausted row pending. It becomes reachable
+    the moment one is LOWERED -- which is why triage's hand-written claim
+    carried this branch, and why porting triage to claim() needed the library
+    to carry it too.
+    """
+    a, _ = conns
+    with a.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, attempts, max_attempts) "
+            "VALUES ('q', '{}'::jsonb, 'pending', 3, 3) RETURNING id"
+        )
+        stranded = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, attempts, max_attempts) "
+            "VALUES ('q', '{}'::jsonb, 'pending', 1, 3) RETURNING id"
+        )
+        healthy = cur.fetchone()[0]
+    a.commit()
+
+    got = claim(a, "q", worker="w1", limit=10)
+
+    assert [j["id"] for j in got] == [healthy], (
+        "an exhausted row must not be handed out, and a healthy one must be"
+    )
+    with a.cursor() as cur:
+        cur.execute("SELECT status, last_error FROM queue WHERE id = %s", (stranded,))
+        status, err = cur.fetchone()
+    a.commit()
+    assert status == "failed", (
+        f"exhausted pending row left {status!r} -- it will never be claimed, "
+        "never surface in failures(), and will pin its partition forever"
+    )
+    assert err, "retired without saying why"

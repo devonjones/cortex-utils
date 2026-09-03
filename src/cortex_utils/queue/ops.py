@@ -759,6 +759,24 @@ def claim(
                   AND claimed_at < NOW() - (INTERVAL '1 minute' * %(vis)s)
                   AND attempts >= max_attempts
             ),
+            retire_exhausted_pending AS (
+                -- A PENDING row whose attempts are already spent. claimable
+                -- below refuses it, correctly -- but nothing then retired it,
+                -- so it sat pending forever: never handed out, never failed,
+                -- never in failures(), and pinning its partition against
+                -- retention, which skips any partition still holding pending
+                -- rows. Stuck and invisible, which is the worst combination.
+                --
+                -- Normally unreachable, because fail_or_retry never leaves an
+                -- exhausted row pending. It becomes reachable the moment a
+                -- consumer lowers its attempt budget, and triage's hand-written
+                -- claim carried this branch for exactly that reason.
+                UPDATE queue
+                SET status = 'failed', claimed_at = NULL, claimed_by = NULL,
+                    last_error = COALESCE(last_error, 'attempts exhausted')
+                WHERE queue_name = %(q)s AND status = 'pending'
+                  AND attempts >= max_attempts
+            ),
             claimable AS (
                 SELECT id, created_at FROM queue
                 WHERE queue_name = %(q)s AND status = 'pending'
