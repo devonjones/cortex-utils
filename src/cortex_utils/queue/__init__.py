@@ -36,6 +36,7 @@ from cortex_utils.queue.ops import (
     complete,
     enqueue,
     release,
+    retire_stranded,
     worker_identity,
 )
 from cortex_utils.queue.ops import (
@@ -108,6 +109,7 @@ __all__ = [
     "claim",
     "complete",
     "release",
+    "retire_stranded",
     "worker_identity",
     "fail_or_retry",
     # Watch. Read-only, and independent of the workers by design.
