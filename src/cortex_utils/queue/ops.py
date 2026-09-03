@@ -809,9 +809,27 @@ def claim(
         ]
 
 
-def complete(conn: psycopg2.extensions.connection, job_id: int, worker: str) -> bool:
-    """Mark a claimed job done. False if the claim was no longer ours."""
-    with _tx(conn) as cur:
+def complete(
+    conn: psycopg2.extensions.connection,
+    job_id: int,
+    worker: str,
+    commit: bool = True,
+) -> bool:
+    """Mark a claimed job done. False if the claim was no longer ours.
+
+    `commit=False` leaves the transaction to the caller, the same contract
+    enqueue() already offers and for the same reason: a consumer whose job
+    writes its own rows needs the completion to land with them or not at all.
+    Committing here would let the work commit and the completion roll back --
+    or the reverse -- and the job would either run twice or be lost.
+
+    postmark's attachment worker is the case in hand: it inserts the attachment
+    row and completes the job in one transaction, by an explicit policy that
+    each message is processed atomically. Without this it would have had to keep
+    hand-writing the completion, which is the raw queue SQL this package exists
+    to take over.
+    """
+    with _tx(conn, commit=commit) as cur:
         cur.execute(
             "UPDATE queue SET status = 'completed', completed_at = NOW() "
             "WHERE id = %s AND status = 'processing' AND claimed_by = %s",

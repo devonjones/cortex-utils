@@ -28,7 +28,7 @@ import pytest
 
 psycopg2 = pytest.importorskip("psycopg2")
 
-from cortex_utils.queue.ops import claim, enqueue  # noqa: E402
+from cortex_utils.queue.ops import claim, complete, enqueue  # noqa: E402
 from cortex_utils.queue.schema import queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
@@ -403,3 +403,41 @@ def test_a_per_connection_timezone_override_is_reported(conns, capsys) -> None:
         assert "TimeZone" not in capsys.readouterr().err
     finally:
         b.close()
+
+
+def test_complete_can_leave_the_transaction_to_the_caller(conns) -> None:
+    """A consumer whose job writes its own rows needs the completion to land
+    with them or not at all.
+
+    Committing inside complete() would let the work commit and the completion
+    roll back, or the reverse -- the job then either runs twice or is lost.
+    enqueue() has offered this contract for the same reason; complete() did not,
+    so postmark's attachment worker kept hand-writing its completion inside the
+    transaction that inserts the attachment row.
+    """
+    a, _ = conns
+    with a.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, claimed_at, claimed_by) "
+            "VALUES ('q', '{}'::jsonb, 'processing', NOW(), 'w1') RETURNING id"
+        )
+        job_id = cur.fetchone()[0]
+    a.commit()
+
+    assert complete(a, job_id, "w1", commit=False) is True
+    a.rollback()
+
+    with a.cursor() as cur:
+        cur.execute("SELECT status FROM queue WHERE id = %s", (job_id,))
+        assert cur.fetchone()[0] == "processing", (
+            "commit=False must leave the completion to the caller -- rolling "
+            "back has to take it with it"
+        )
+    a.commit()
+
+    assert complete(a, job_id, "w1", commit=False) is True
+    a.commit()
+    with a.cursor() as cur:
+        cur.execute("SELECT status FROM queue WHERE id = %s", (job_id,))
+        assert cur.fetchone()[0] == "completed"
+    a.commit()
