@@ -28,7 +28,7 @@ import pytest
 
 psycopg2 = pytest.importorskip("psycopg2")
 
-from cortex_utils.queue.ops import claim, complete, enqueue  # noqa: E402
+from cortex_utils.queue.ops import claim, complete, enqueue, retire_stranded  # noqa: E402
 from cortex_utils.queue.schema import queue_ddl  # noqa: E402
 
 DSN = os.environ.get("CORTEX_TEST_DSN")
@@ -442,18 +442,44 @@ def test_complete_can_leave_the_transaction_to_the_caller(conns) -> None:
         assert cur.fetchone()[0] == "completed"
     a.commit()
 
+    # And that it still BOUNCES on this path. Asserting only True on both calls
+    # let `held = True if not commit else cur.rowcount > 0` pass the whole
+    # suite -- so the claim-token match, the thing this change exists to enable,
+    # was unasserted wherever commit=False.
+    with a.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, claimed_at, claimed_by) "
+            "VALUES ('q', '{}'::jsonb, 'processing', NOW(), 'w1') RETURNING id"
+        )
+        other = cur.fetchone()[0]
+    a.commit()
+    assert complete(a, other, "impostor", commit=False) is False, (
+        "commit=False must still refuse a claim this worker does not hold"
+    )
+    a.rollback()
+
+    # An autocommit connection has no transaction to withhold, so the UPDATE
+    # commits regardless -- in the losing direction: the caller's work rolls
+    # back and the job stays marked done. Refused, not silent.
+    a.autocommit = True
+    try:
+        with pytest.raises(ValueError, match="needs a transaction to withhold"):
+            complete(a, other, "w1", commit=False)
+    finally:
+        a.autocommit = False
+
 
 def test_a_pending_row_with_no_attempts_left_is_retired_not_stranded(conns) -> None:
-    """claimable refuses a pending row whose attempts are spent -- correctly --
-    but nothing retired it, so it sat pending forever: never handed out, never
-    failed, never in failures(), and pinning its partition against retention,
-    which skips any partition still holding pending rows. Stuck and invisible.
+    """claim() refuses a pending row whose attempts are spent -- correctly --
+    and nothing else retires it, so it sits pending forever: never handed out,
+    never failed, never in failures(), and pinning its partition against
+    retention, which skips any partition holding pending rows.
 
-    Unreachable while a consumer's budget only ever grows, because
-    fail_or_retry never leaves an exhausted row pending. It becomes reachable
-    the moment one is LOWERED -- which is why triage's hand-written claim
-    carried this branch, and why porting triage to claim() needed the library
-    to carry it too.
+    retire_stranded() is the sweep that fixes it, and it deliberately does NOT
+    run inside claim(). It did briefly, and that put an unindexable cross-column
+    scan of the whole pending backlog, with no SKIP LOCKED and no LIMIT, in the
+    hot path of every worker -- see its docstring for the measurements. Here it
+    runs from maintenance, once a night.
     """
     a, _ = conns
     with a.cursor() as cur:
@@ -467,19 +493,32 @@ def test_a_pending_row_with_no_attempts_left_is_retired_not_stranded(conns) -> N
             "VALUES ('q', '{}'::jsonb, 'pending', 1, 3) RETURNING id"
         )
         healthy = cur.fetchone()[0]
+        # Another queue's exhausted row must be left alone.
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status, attempts, max_attempts) "
+            "VALUES ('other', '{}'::jsonb, 'pending', 3, 3) RETURNING id"
+        )
+        elsewhere = cur.fetchone()[0]
     a.commit()
 
     got = claim(a, "q", worker="w1", limit=10)
+    assert [j["id"] for j in got] == [healthy], "an exhausted row must not be handed out"
 
-    assert [j["id"] for j in got] == [healthy], (
-        "an exhausted row must not be handed out, and a healthy one must be"
-    )
+    assert retire_stranded(a, "q") == 1
+
     with a.cursor() as cur:
-        cur.execute("SELECT status, last_error FROM queue WHERE id = %s", (stranded,))
-        status, err = cur.fetchone()
+        cur.execute(
+            "SELECT id, status, last_error FROM queue WHERE id = ANY(%s) ORDER BY id",
+            ([stranded, elsewhere],),
+        )
+        rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
     a.commit()
-    assert status == "failed", (
-        f"exhausted pending row left {status!r} -- it will never be claimed, "
+    assert rows[stranded][0] == "failed", (
+        f"stranded row left {rows[stranded][0]!r} -- it will never be claimed, "
         "never surface in failures(), and will pin its partition forever"
     )
-    assert err, "retired without saying why"
+    assert rows[stranded][1], "retired without saying why"
+    assert rows[elsewhere][0] == "pending", (
+        "the sweep is scoped to one queue_name -- retiring another queue's rows "
+        "is the shape that turns a local fix into a fleet-wide incident"
+    )

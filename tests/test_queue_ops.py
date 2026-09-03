@@ -17,6 +17,7 @@ argued in review and not covered here; ops.py has no live-server coverage today.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -157,18 +158,45 @@ def test_stale_recovery_does_not_consume_an_attempt() -> None:
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
     sql = conn.cur.executed[0][0]
-    reset = sql.split("retire_exhausted")[0]
-    body = reset.split("SET", 1)[1].split("WHERE", 1)[0]
+    body = _cte(sql, "reset_stale").split("SET", 1)[1].split("WHERE", 1)[0]
     assert "attempts" not in body, "stale recovery must not write attempts"
     assert "status = 'pending'" in body
+
+
+def _cte(sql: str, name: str) -> str:
+    """The body of one named CTE, by name rather than by string-splitting.
+
+    The old idiom was `sql.split("retire_exhausted")[1].split("claimable")[0]`.
+    It worked until a CTE was added whose name had an existing one as a PREFIX
+    -- `retire_exhausted_pending` -- at which point the split silently yielded
+    three segments instead of two, the new CTE landed in [2], and three
+    invariant tests stopped covering it without failing. Proven by mutation at
+    the time: deleting `queue_name = %(q)s` from the new CTE left all 498 tests
+    green, while the same deletion in the old one was caught.
+
+    Matching `name AS (` and balancing parentheses cannot drift that way: a new
+    CTE is either asked for by name or not covered, and "not covered" is
+    visible rather than silent.
+    """
+    m = re.search(rf"\b{re.escape(name)}\s+AS\s*\(", sql)
+    assert m, f"no CTE named {name!r} in the statement"
+    depth, start = 1, m.end()
+    for i in range(start, len(sql)):
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[start:i]
+    raise AssertionError(f"unbalanced parentheses after {name!r}")
 
 
 def test_claim_recovers_under_budget_and_retires_only_exhausted() -> None:
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
     sql = conn.cur.executed[0][0]
-    reset = sql.split("retire_exhausted")[0]
-    retire = sql.split("retire_exhausted")[1].split("claimable")[0]
+    reset = _cte(sql, "reset_stale")
+    retire = _cte(sql, "retire_exhausted")
     assert "attempts < max_attempts" in reset
     assert "attempts >= max_attempts" in retire
     assert "status = 'failed'" in retire, "exhausted rows must be retired, not completed"
@@ -550,8 +578,8 @@ def test_stale_recovery_is_scoped_to_this_queue() -> None:
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
     sql = conn.cur.executed[0][0]
-    reset = sql.split("retire_exhausted")[0]
-    retire = sql.split("retire_exhausted")[1].split("claimable")[0]
+    reset = _cte(sql, "reset_stale")
+    retire = _cte(sql, "retire_exhausted")
     assert "queue_name = %(q)s" in reset, "must not recover another queue's rows"
     assert "queue_name = %(q)s" in retire
 
@@ -708,10 +736,7 @@ def test_stale_sweep_targets_expired_processing_rows_only() -> None:
     conn = _conn(fetchall=[])
     claim(conn, "triage", WORKER)
     sql = conn.cur.executed[0][0]
-    for cte in (
-        sql.split("retire_exhausted")[0],
-        sql.split("retire_exhausted")[1].split("claimable")[0],
-    ):
+    for cte in (_cte(sql, "reset_stale"), _cte(sql, "retire_exhausted")):
         assert "status = 'processing'" in cte, "must not touch rows that are not claimed"
         assert "claimed_at < NOW()" in cte, "must target expired claims, not fresh ones"
 
@@ -1215,6 +1240,22 @@ def test_worker_identity_is_unique_per_process_and_legible() -> None:
     assert str(os.getpid()) in token, "no pid means two workers on one host collide"
     assert worker_identity("parse-worker") == token, "must be stable within a process"
     assert worker_identity("triage-worker") != token, "must distinguish services"
+
+    # And that it carries something host and pid cannot supply. This is the
+    # assertion the first version was missing: with the token as
+    # service@host:pid, two containers under `--network host` compute the
+    # IDENTICAL string -- Docker forces the container hostname to the host's,
+    # and each container is still pid 1 in its own PID namespace. Measured on a
+    # real host, both returned `hostname=ares pid=1`. A token two processes
+    # share stops discriminating, which silently defeats every guard built on
+    # claimed_by -- the whole point of the column.
+    service, rest = token.split("@", 1)
+    host, pid, nonce = rest.rsplit(":", 2)
+    assert host == socket.gethostname()
+    assert pid == str(os.getpid())
+    assert len(nonce) == 8 and int(nonce, 16) >= 0, (
+        f"token is {token!r} -- host and pid alone collide across containers"
+    )
 
     with pytest.raises(QueueError, match="service is required"):
         worker_identity("")

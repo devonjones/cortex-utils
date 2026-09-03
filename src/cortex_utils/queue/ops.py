@@ -29,10 +29,14 @@ A failure rolls back before re-raising, so a caller never inherits an aborted
 transaction and never sees its next, unrelated statement fail because of this
 one.
 
-The other operations take no such flag: a claim or a report is the caller's whole
-unit of work, so there is nothing to compose it with. Only enqueue is ever one
-half of something larger. Note also that a job id returned under commit=False is
-not durable until the caller's own commit runs.
+enqueue() and complete() take that flag; the rest do not. A claim is the
+caller's whole unit of work, and so is a failure report -- there is nothing to
+compose those with. The two ends of a job are different: a consumer whose work
+writes its own rows needs the enqueue, or the completion, to land with them or
+not at all. Note also that a job id returned under commit=False is not durable
+until the caller's own commit runs, and that a complete() returning False under
+commit=False obliges the caller to roll back -- the row was not completed, and
+committing their side of it anyway makes the work happen twice.
 
 enqueue() takes commit=False for callers that must land the job atomically with
 their own work -- approving a proposal and queueing its apply job, or moving a
@@ -47,6 +51,7 @@ from __future__ import annotations
 import os
 import re
 import socket
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -199,12 +204,21 @@ def _tx_body(
     conn: psycopg2.extensions.connection, commit: bool, lock_timeout_ms: int | None
 ) -> Iterator[psycopg2.extensions.cursor]:
     if not commit:
-        # No claimed_by guard here deliberately: the only caller that reaches
-        # this branch is _insert(), whose statement names no such column. A
-        # guard that cannot fire reads as protection and is not, and it would
-        # have to re-raise anyway since the caller owns the transaction.
-        with conn.cursor() as cur:
-            yield cur
+        # complete() reaches this branch now, and its statement DOES name
+        # claimed_by -- so the comment that used to sit here, saying the only
+        # caller was _insert() and no guard could fire, became false the moment
+        # commit=False was added to complete(). Without this the caller got a
+        # raw UndefinedColumn instead of the remedy, on a connection left in an
+        # aborted transaction.
+        #
+        # No rollback: the caller owns the transaction and may hold a SAVEPOINT
+        # they want to recover to. Re-raised either way.
+        try:
+            with conn.cursor() as cur:
+                yield cur
+        except psycopg2.errors.UndefinedColumn as exc:
+            _reraise_missing_migration(exc)
+            raise
         return
     try:
         with conn.cursor() as cur:
@@ -699,6 +713,12 @@ def _insert(
         return row[0] if row else None
 
 
+# Drawn once per process, not per call: the token has to be STABLE for the life
+# of the process (a worker that regenerated it would have every later report
+# bounce) as well as unique across processes. A module-level constant is both.
+_PROCESS_NONCE = uuid.uuid4().hex[:8]
+
+
 def worker_identity(service: str) -> str:
     """A claim token for one worker process: service, host and pid.
 
@@ -708,14 +728,75 @@ def worker_identity(service: str) -> str:
     services inventing four formats is the drift this package exists to stop --
     so the format lives here, once.
 
-    What it has to be: unique per process (host plus pid is), stable for that
-    process's life (both are), and legible in a log line when someone is trying
-    to work out which container is sitting on a job. In a container the hostname
-    is the container id, which is exactly what an operator needs to `docker logs`.
+    What it has to be: unique per process, stable for that process's life, and
+    legible in a log line when someone is working out which container is sitting
+    on a job. Under Docker's default networking the hostname is the container
+    id, which is exactly what an operator needs to reach for `docker logs`.
+
+    The random suffix is not decoration. host+pid is NOT unique under
+    containers: with `--network host` (or `--uts=host`, or a duplicate
+    `hostname:` in compose) Docker forces the container's hostname to the
+    host's, while each container is still pid 1 in its own PID namespace. Two
+    workers then compute the identical token -- measured on a real host:
+
+        docker run --rm --network host alpine ... -> hostname=ares pid=1
+        docker run --rm --network host alpine ... -> hostname=ares pid=1
+
+    and a token two processes share stops discriminating, which silently
+    defeats every guard built on claimed_by. Reproduced end to end: A and B both
+    claim, and A's complete() retires the row B is still working on. Kubernetes
+    multi-container pods have the same shape (shared UTS, separate PID
+    namespaces). The suffix also distinguishes successive runs of one container,
+    which host+pid could not.
     """
     if not service:
         raise QueueError("service is required; it is what makes the token legible")
-    return f"{service}@{socket.gethostname()}:{os.getpid()}"
+    return f"{service}@{socket.gethostname()}:{os.getpid()}:{_PROCESS_NONCE}"
+
+
+def retire_stranded(conn: psycopg2.extensions.connection, queue_name: str) -> int:
+    """Fail pending rows whose attempts are already spent. Returns the count.
+
+    claim()'s `claimable` refuses such a row -- correctly -- and nothing else
+    retires it, so it sits pending forever: never handed out, never failed,
+    never in failures(), and pinning its partition against retention, which
+    skips any partition still holding pending rows. Stuck and invisible.
+
+    Deliberately NOT part of claim(). It was, briefly, and that was wrong twice
+    over:
+
+    `attempts >= max_attempts` is a cross-column comparison no index can answer,
+    so it read the whole pending backlog on every claim by every worker. Measured
+    at 200k pending rows: the claim statement went from 0.367ms to 9.084ms, and
+    2062 extra buffers, whether or not the branch had anything to do. A deep
+    pending backlog is a designed state here -- that is what the -100 backfill
+    priority is for -- so the cost was permanent and grew with the queue.
+
+    And it took no SKIP LOCKED and no LIMIT, in the same transaction as the
+    claim. Two workers claiming the same queue serialised behind it, and the
+    event it exists for -- someone lowering an attempt budget -- became a
+    fleet-wide stall that rewrote the whole backlog in one unbounded UPDATE
+    inside the hot path. Measured: two workers, 200k affected rows, 0.03s each
+    before, 1.00s each after.
+
+    Here it runs from maintenance instead, where one scan is free, and it takes
+    a lock_timeout so it cannot sit behind a writer indefinitely.
+    """
+    with _tx(conn, lock_timeout_ms=MIGRATION_LOCK_TIMEOUT_MS) as cur:
+        cur.execute(
+            "UPDATE queue SET status = 'failed', claimed_at = NULL, "
+            "claimed_by = NULL, "
+            "last_error = COALESCE(last_error, 'attempts exhausted') "
+            "WHERE queue_name = %s AND status = 'pending' "
+            "AND attempts >= max_attempts",
+            (queue_name,),
+        )
+        retired = cur.rowcount
+    if retired:
+        # A bulk retire moves work to a terminal state without anyone asking.
+        # Silent, it looks like the jobs were never enqueued.
+        log.warning("Retired stranded jobs", queue_name=queue_name, count=retired)
+    return retired
 
 
 def claim(
@@ -757,24 +838,6 @@ def claim(
                     last_error = COALESCE(last_error, 'attempts exhausted')
                 WHERE queue_name = %(q)s AND status = 'processing'
                   AND claimed_at < NOW() - (INTERVAL '1 minute' * %(vis)s)
-                  AND attempts >= max_attempts
-            ),
-            retire_exhausted_pending AS (
-                -- A PENDING row whose attempts are already spent. claimable
-                -- below refuses it, correctly -- but nothing then retired it,
-                -- so it sat pending forever: never handed out, never failed,
-                -- never in failures(), and pinning its partition against
-                -- retention, which skips any partition still holding pending
-                -- rows. Stuck and invisible, which is the worst combination.
-                --
-                -- Normally unreachable, because fail_or_retry never leaves an
-                -- exhausted row pending. It becomes reachable the moment a
-                -- consumer lowers its attempt budget, and triage's hand-written
-                -- claim carried this branch for exactly that reason.
-                UPDATE queue
-                SET status = 'failed', claimed_at = NULL, claimed_by = NULL,
-                    last_error = COALESCE(last_error, 'attempts exhausted')
-                WHERE queue_name = %(q)s AND status = 'pending'
                   AND attempts >= max_attempts
             ),
             claimable AS (
@@ -846,7 +909,25 @@ def complete(
     each message is processed atomically. Without this it would have had to keep
     hand-writing the completion, which is the raw queue SQL this package exists
     to take over.
+
+    **On a False, the caller must roll back.** The row was not completed, but
+    whatever the caller wrote alongside it is still in their transaction --
+    committing anyway leaves the side effect durable and the job unfinished, so
+    it runs again after the visibility timeout and the side effect happens
+    twice. enqueue(commit=False), the contract this copies, has no equivalent
+    outcome (it returns an id or raises), so reasoning by analogy gets it wrong.
     """
+    if not commit and conn.autocommit:
+        # SET LOCAL is not the only thing autocommit silently voids. With no
+        # transaction open there is nothing for commit=False to withhold: the
+        # UPDATE commits on execute, and it does so in the LOSING direction --
+        # the caller's work rolls back, the job stays marked done, the work is
+        # lost. _tx already refuses the structurally identical trap for
+        # lock_timeout_ms; this one was left set.
+        raise ValueError(
+            "complete(commit=False) needs a transaction to withhold, and this "
+            "connection is in autocommit -- the UPDATE would commit anyway"
+        )
     with _tx(conn, commit=commit) as cur:
         cur.execute(
             "UPDATE queue SET status = 'completed', completed_at = NOW() "

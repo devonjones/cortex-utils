@@ -24,6 +24,8 @@ from cortex_utils.queue.ops import (
     PartitionError,
     PartitionNotAttachedError,
     QueueTableNotFoundError,
+    _tx,
+    retire_stranded,
     server_today,
 )
 
@@ -489,6 +491,12 @@ class PartitionManager:
             "requeued": total_requeued,
         }
 
+    def _queue_names(self) -> list[str]:
+        """Distinct queue_names with pending work, for the stranded sweep."""
+        with _tx(self.conn) as cur:
+            cur.execute("SELECT DISTINCT queue_name FROM queue WHERE status = 'pending'")
+            return [r[0] for r in cur.fetchall()]
+
     def maintain(
         self,
         retention_days: int = 7,
@@ -528,6 +536,14 @@ class PartitionManager:
             # failing. Trading "retention stops silently" for "tomorrow has no
             # partition" is not the trade this fix is making.
             DeadLetterManager(self.conn).ensure_table()
+
+            # Retire pending rows whose attempts are spent, before the drop.
+            # claim() refuses them and nothing else retires them, so they sit
+            # pending forever AND block the drop below -- a partition is kept
+            # back while it holds any pending row. This is where the scan
+            # belongs: once a night, not on every claim by every worker.
+            for queue_name in self._queue_names():
+                retire_stranded(self.conn, queue_name)
 
         drop_result = self.drop_old_partitions(
             retention_days=retention_days,
