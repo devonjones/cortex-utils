@@ -36,6 +36,7 @@ from cortex_utils.queue.ops import (
     complete,
     enqueue,
     release,
+    worker_identity,
 )
 from cortex_utils.queue.ops import (
     ensure_claim_token_column as ensure_claim_token_column,
@@ -107,6 +108,7 @@ __all__ = [
     "claim",
     "complete",
     "release",
+    "worker_identity",
     "fail_or_retry",
     # Watch. Read-only, and independent of the workers by design.
     "health",
