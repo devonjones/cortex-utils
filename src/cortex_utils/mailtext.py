@@ -59,10 +59,6 @@ _HTML_INDICATORS = (
 # a closing tag is not evidence of anything the tag count is trying to measure.
 _TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9]*[^>]*>")
 
-# Strips ANY tag, for the salvage path. Separate from _TAG_RE because stripping
-# and counting want opposite things -- reusing the counting pattern here left
-# every closing tag in the output.
-
 
 def _converter() -> html2text.HTML2Text:
     """A fresh converter per call.
@@ -185,9 +181,12 @@ def to_text(*, body_text: str | None, body_html: str | None) -> str:
     so a positional call site that swapped them would type-check cleanly and
     return confident nonsense; naming them makes the swap visible.
 
-    Never raises: a conversion failure degrades to the raw text rather than
-    propagating. Returns "" when there is nothing usable, so callers can treat
-    "no body" as one case instead of juggling None against empty string.
+    Never raises. A conversion failure is logged, and what it degrades to
+    depends on the part: a mislabelled `text/plain` keeps its raw text, while a
+    failed `text/html` has nothing of its own to fall back to and leaves
+    whatever the other part contributed. Returns "" when nothing is usable, so
+    callers can treat "no body" as one case rather than juggling None against
+    empty string.
     """
     # Best thing seen that no reader would call content -- a bare table rule,
     # say, or the raw markup of a part that would not convert. Returned only if

@@ -264,3 +264,14 @@ class TestFallbackPrecedence:
         rule = "<html><body><div><table><tr><td>-</td></tr></table></div></body></html>"
         ticks = "<p>&#10003; &#10003; &#10007; &#10003; &#10003;</p>"
         assert to_text(body_text=rule, body_html=ticks) == "✓ ✓ ✗ ✓ ✓"
+
+    def test_equal_length_tie_goes_to_the_text_part(self):
+        # `>` not `>=`: on a tie the earlier (text/plain) candidate holds, since
+        # text/plain is the sender's own rendering. Both sides here convert to
+        # exactly 7 characters -- an unequal pair would not exercise the tie at
+        # all, which is how the first version of this test passed while the
+        # `>=` mutant survived it.
+        rule = "<html><body><div><table><tr><td>-</td></tr></table></div></body></html>"
+        crosses = "<p>" + "&#10007;" * 7 + "</p>"
+        assert len(html_to_markdown(rule)) == len(html_to_markdown(crosses)) == 7
+        assert to_text(body_text=rule, body_html=crosses) == html_to_markdown(rule)
