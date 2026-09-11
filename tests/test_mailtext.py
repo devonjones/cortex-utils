@@ -174,24 +174,45 @@ class TestConversionFailureIsSurvivable:
         monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", boom)
         assert to_text(body_text=EMAIL_HTML, body_html=None) == EMAIL_HTML.strip()
 
-    def test_failure_on_html_part_salvages_the_words(self, monkeypatch):
-        # html-only is 71% of the target corpus, so a failure here must not
-        # collapse into the same "" a genuinely empty body returns.
-        def boom(_):
-            raise ValueError("nope")
+    def test_failure_on_html_part_keeps_what_the_text_part_left(self, monkeypatch):
+        # No salvage path any more: the log line carries the failure signal and
+        # there is nothing better to return than whatever body_text gave.
+        # Mislabelled text/plain that converts to symbols only (a tick grid).
+        pixel = (
+            "<html><body><div><table><tr><td>&#10003; &#10003;</td></tr>"
+            "</table></div></body></html>"
+        )
+        real = html_to_markdown
 
-        monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", boom)
-        out = to_text(body_text=None, body_html=EMAIL_HTML)
-        assert "504 consent form" in out
-        assert "<table" not in out and "<div" not in out
+        def only_html_fails(content):
+            if content == EMAIL_HTML:
+                raise ValueError("nope")
+            return real(content)
 
-    def test_failure_on_html_part_decodes_entities_while_salvaging(self, monkeypatch):
+        monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", only_html_fails)
+        out = to_text(body_text=pixel, body_html=EMAIL_HTML)
+        assert "✓ ✓" in out and out != ""
+
+    def test_failure_on_both_parts_returns_the_raw_text(self, monkeypatch):
         monkeypatch.setattr(
             "cortex_utils.mailtext.html_to_markdown",
             lambda _: (_ for _ in ()).throw(ValueError("nope")),
         )
-        out = to_text(body_text=None, body_html="<p>Jos&#233; &amp; Zo&euml;</p>")
-        assert out == "José & Zoë"
+        assert to_text(body_text=EMAIL_HTML, body_html="<p>x</p>") == EMAIL_HTML.strip()
+
+    def test_text_part_failure_still_lets_html_part_try(self, monkeypatch):
+        # code-reviewer round 3: an early return here skipped a perfectly good
+        # body_html whenever the mislabelled text part would not convert.
+        real = html_to_markdown
+
+        def only_text_fails(content):
+            if content == "<div><table><tr><td><body>bad markup here</td></tr></table></div>":
+                raise ValueError("nope")
+            return real(content)
+
+        monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", only_text_fails)
+        bad = "<div><table><tr><td><body>bad markup here</td></tr></table></div>"
+        assert "504 consent form" in to_text(body_text=bad, body_html=EMAIL_HTML)
 
     def test_html_to_markdown_itself_still_raises(self, monkeypatch):
         # The low-level function stays honest; to_text is the forgiving one.
@@ -234,20 +255,12 @@ class TestSymbolOnlyBodiesAreNotDropped:
         assert to_text(body_text=None, body_html="<html><body></body></html>") == ""
 
 
-class TestSalvageStripping:
-    """_tags_stripped is only reached when html2text itself failed."""
+class TestFallbackPrecedence:
+    """Two content-free parts: keep the one carrying more, not the first seen."""
 
-    def test_drops_script_and_style_bodies_not_just_their_tags(self):
-        from cortex_utils.mailtext import _tags_stripped
-
-        out = _tags_stripped(
-            "<style>.a{color:red}</style><p>Meeting at 8</p><script>var x = 1;</script>"
-        )
-        assert out == "Meeting at 8"
-
-    def test_drops_closing_tags_too(self):
-        # The detection regex only matches opening tags; reusing it here left
-        # every "</p>" in the salvaged output.
-        from cortex_utils.mailtext import _tags_stripped
-
-        assert _tags_stripped("<div><p>hello</p></div>") == "hello"
+    def test_richer_content_free_part_wins_regardless_of_order(self):
+        # body_text must look like HTML to be converted at all; body_html is
+        # converted unconditionally, so it can be minimal.
+        rule = "<html><body><div><table><tr><td>-</td></tr></table></div></body></html>"
+        ticks = "<p>&#10003; &#10003; &#10007; &#10003; &#10003;</p>"
+        assert to_text(body_text=rule, body_html=ticks) == "✓ ✓ ✗ ✓ ✓"

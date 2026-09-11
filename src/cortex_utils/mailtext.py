@@ -15,7 +15,6 @@ column.
 from __future__ import annotations
 
 import re
-from html import unescape
 
 import html2text
 
@@ -63,9 +62,6 @@ _TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9]*[^>]*>")
 # Strips ANY tag, for the salvage path. Separate from _TAG_RE because stripping
 # and counting want opposite things -- reusing the counting pattern here left
 # every closing tag in the output.
-_ANY_TAG_RE = re.compile(r"<[^>]*>")
-# Script and style carry code, not prose; their bodies must go with the tags.
-_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def _converter() -> html2text.HTML2Text:
@@ -154,17 +150,6 @@ def _has_content(text: str) -> bool:
     return any(ch.isalnum() for ch in text)
 
 
-def _tags_stripped(html_content: str) -> str:
-    """Last-resort plain text when the markdown converter itself failed.
-
-    Crude by construction -- if html2text could not parse it, the markup is
-    malformed and there is nothing better to do than drop tags, decode
-    entities and collapse whitespace. Gives the reader the words.
-    """
-    text = unescape(_ANY_TAG_RE.sub(" ", _SCRIPT_STYLE_RE.sub(" ", html_content)))
-    return " ".join(text.split())
-
-
 def _try_markdown(content: str, what: str) -> str | None:
     """Convert, or log and report failure. Never raises.
 
@@ -205,33 +190,38 @@ def to_text(*, body_text: str | None, body_html: str | None) -> str:
     "no body" as one case instead of juggling None against empty string.
     """
     # Best thing seen that no reader would call content -- a bare table rule,
-    # say. Returned only if no part does better, because "---" still beats
-    # dropping a body that genuinely is all symbols.
+    # say, or the raw markup of a part that would not convert. Returned only if
+    # no part does better, because it still beats dropping the body entirely.
     fallback = ""
+
+    def better(candidate: str) -> None:
+        # Both are content-free by definition, so there is no principled winner;
+        # longer simply carries more of whatever the message had.
+        nonlocal fallback
+        if len(candidate) > len(fallback):
+            fallback = candidate
 
     if body_text and body_text.strip():
         if not looks_like_html(body_text):
             return body_text.strip()
         converted = _try_markdown(body_text, "mislabelled text/plain")
         if converted is None:
-            # Conversion failed. Raw markup reads badly but beats nothing,
-            # and it is what postmark's call sites did.
-            return body_text.strip()
-        if _has_content(converted):
+            # Would not convert. Keep the raw markup as a floor, but still let
+            # body_html try -- it is usually the richer part anyway.
+            better(body_text.strip())
+        elif _has_content(converted):
             return converted
-        fallback = fallback or converted
+        else:
+            better(converted)
 
     if body_html and body_html.strip():
         converted = _try_markdown(body_html, "text/html")
-        if converted is None:
-            # Symmetric with the branch above: salvage the words rather than
-            # collapsing a failure into the same "" a genuinely empty body
-            # returns. There is no text/plain to fall back to here, and
-            # html-only is the majority of real mail, so this is the path that
-            # matters most.
-            return _tags_stripped(body_html)
-        if _has_content(converted):
-            return converted
-        fallback = fallback or converted
+        if converted is not None:
+            if _has_content(converted):
+                return converted
+            better(converted)
+        # A failure here keeps whatever the text part left. The log line carries
+        # the signal; there is nothing better to return, and the salvage path
+        # that used to live here cost more in edge cases than it ever bought.
 
     return fallback
