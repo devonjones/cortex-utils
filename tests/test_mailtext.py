@@ -2,6 +2,8 @@
 
 import concurrent.futures
 
+import pytest
+
 from cortex_utils.mailtext import html_to_markdown, looks_like_html, to_text
 
 EMAIL_HTML = """
@@ -64,25 +66,27 @@ class TestLooksLikeHtml:
 
 class TestToText:
     def test_prefers_a_real_plain_part(self):
-        assert to_text("Science: 78%", "<p>something else</p>") == "Science: 78%"
+        assert (
+            to_text(body_text="Science: 78%", body_html="<p>something else</p>") == "Science: 78%"
+        )
 
     def test_falls_back_to_html_when_plain_is_empty(self):
         # The 71% case: body_text empty, body_html populated.
-        assert "504 consent form" in to_text("", EMAIL_HTML)
-        assert "504 consent form" in to_text(None, EMAIL_HTML)
+        assert "504 consent form" in to_text(body_text="", body_html=EMAIL_HTML)
+        assert "504 consent form" in to_text(body_text=None, body_html=EMAIL_HTML)
 
     def test_whitespace_only_plain_counts_as_empty(self):
-        assert "504 consent form" in to_text("   \n\t ", EMAIL_HTML)
+        assert "504 consent form" in to_text(body_text="   \n\t ", body_html=EMAIL_HTML)
 
     def test_mislabelled_html_in_the_plain_part_is_converted(self):
         # Otherwise raw markup reaches the reader.
-        out = to_text(EMAIL_HTML, None)
+        out = to_text(body_text=EMAIL_HTML, body_html=None)
         assert "504 consent form" in out
         assert "<table" not in out
 
     def test_nothing_usable_returns_empty_string(self):
-        assert to_text(None, None) == ""
-        assert to_text("", "") == ""
+        assert to_text(body_text=None, body_html=None) == ""
+        assert to_text(body_text="", body_html="") == ""
 
     def test_concurrent_calls_are_safe(self):
         """A shared HTML2Text instance is not usable from two threads at once.
@@ -90,9 +94,11 @@ class TestToText:
         html2text's finish() clears its output buffer per call, so *sequential*
         reuse is fine -- which is why the module-level singleton this code was
         lifted from looked correct. Under real concurrency it is not: two
-        threads feed the same HTMLParser rawdata buffer, and the failure is not
-        a subtle interleave but an AssertionError raised from inside
-        html.parser.
+        threads feed the same HTMLParser rawdata buffer. It fails two ways: most
+        often an AssertionError from inside html.parser, but in every trial
+        some documents also came back with NO exception and words from two
+        different messages mixed together -- silent corruption is the reason
+        this matters, not the loud crash.
 
         Documents here are deliberately large. Short ones complete inside a
         single GIL slice and never preempt, so a small-input version of this
@@ -100,7 +106,85 @@ class TestToText:
         """
         docs = ["<html><body>" + f"<p>m{i}</p>" * 2000 + "</body></html>" for i in range(24)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(lambda d: to_text(None, d), docs))
+            results = list(pool.map(lambda d: to_text(body_text=None, body_html=d), docs))
 
         for i, out in enumerate(results):
             assert set(out.split()) == {f"m{i}"}, f"output {i} was contaminated"
+
+
+class TestBranchesReviewFlagged:
+    """Branches that no earlier test exercised — deleting them passed the suite."""
+
+    def test_too_few_tags_is_not_html(self):
+        # 2 tags and 2 email indicators, but under the 5-tag floor. Without
+        # this, removing the tag-count check broke nothing.
+        assert not looks_like_html("<div><table>" + ("some ordinary prose here " * 5))
+
+    def test_exactly_five_tags_is_the_boundary(self):
+        four = "<div><table><tr><td>" + ("filler text " * 10)
+        five = "<div><table><tr><td><body>" + ("filler text " * 10)
+        assert not looks_like_html(four)
+        assert looks_like_html(five)
+
+    def test_plain_part_converting_to_nothing_falls_through_to_html(self):
+        # A mislabelled text/plain carrying only a tracking pixel converts to
+        # "" — that is not a failure, so the html part should still be tried.
+        pixel = (
+            '<html><body><div><table><tr><td><img src="https://t.test/p.gif">'
+            + ("<!-- spacer -->" * 6)
+            + "</td></tr></table></div></body></html>"
+        )
+        # Faithful conversion yields markdown punctuation, not nothing.
+        assert html_to_markdown(pixel) == "---"
+        assert "504 consent form" in to_text(body_text=pixel, body_html=EMAIL_HTML)
+
+
+class TestEntitiesAreNotTransliterated:
+    """html2text's default rewrites entities to ASCII. Names are not disposable."""
+
+    def test_accented_names_survive_as_entities(self):
+        out = to_text(body_text=None, body_html="<p>Jos&#233; Mu&ntilde;oz, Zo&euml;</p>")
+        assert "José" in out and "Muñoz" in out and "Zoë" in out
+
+    def test_spanish_language_mail_survives(self):
+        # DPS mails families in Spanish; "Reunión" must not arrive as "Reunion".
+        out = to_text(body_text=None, body_html="<p>Reuni&oacute;n el mi&eacute;rcoles</p>")
+        assert out == "Reunión el miércoles"
+
+    def test_literal_utf8_still_survives(self):
+        assert to_text(body_text=None, body_html="<p>Reunión el miércoles</p>") == (
+            "Reunión el miércoles"
+        )
+
+    def test_nbsp_normalised_to_a_plain_space(self):
+        # unicode_snob keeps U+00A0; we normalise it so it does not read as a
+        # stray character in a digest.
+        out = to_text(body_text=None, body_html="<p>Room&nbsp;204&nbsp;at&nbsp;8:15</p>")
+        assert out == "Room 204 at 8:15"
+        assert "\xa0" not in out
+
+
+class TestConversionFailureIsSurvivable:
+    """postmark wrapped every call site; the lift must not drop that."""
+
+    def test_failure_falls_back_to_raw_text(self, monkeypatch):
+        def boom(_):
+            raise AssertionError("html.parser blew up")
+
+        monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", boom)
+        assert to_text(body_text=EMAIL_HTML, body_html=None) == EMAIL_HTML.strip()
+
+    def test_failure_on_html_part_returns_empty_not_an_exception(self, monkeypatch):
+        def boom(_):
+            raise ValueError("nope")
+
+        monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", boom)
+        assert to_text(body_text=None, body_html=EMAIL_HTML) == ""
+
+    def test_html_to_markdown_itself_still_raises(self, monkeypatch):
+        # The low-level function stays honest; to_text is the forgiving one.
+        import cortex_utils.mailtext as m
+
+        monkeypatch.setattr(m, "_converter", lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        with pytest.raises(RuntimeError):
+            m.html_to_markdown("<p>hi</p>")
