@@ -174,12 +174,24 @@ class TestConversionFailureIsSurvivable:
         monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", boom)
         assert to_text(body_text=EMAIL_HTML, body_html=None) == EMAIL_HTML.strip()
 
-    def test_failure_on_html_part_returns_empty_not_an_exception(self, monkeypatch):
+    def test_failure_on_html_part_salvages_the_words(self, monkeypatch):
+        # html-only is 71% of the target corpus, so a failure here must not
+        # collapse into the same "" a genuinely empty body returns.
         def boom(_):
             raise ValueError("nope")
 
         monkeypatch.setattr("cortex_utils.mailtext.html_to_markdown", boom)
-        assert to_text(body_text=None, body_html=EMAIL_HTML) == ""
+        out = to_text(body_text=None, body_html=EMAIL_HTML)
+        assert "504 consent form" in out
+        assert "<table" not in out and "<div" not in out
+
+    def test_failure_on_html_part_decodes_entities_while_salvaging(self, monkeypatch):
+        monkeypatch.setattr(
+            "cortex_utils.mailtext.html_to_markdown",
+            lambda _: (_ for _ in ()).throw(ValueError("nope")),
+        )
+        out = to_text(body_text=None, body_html="<p>Jos&#233; &amp; Zo&euml;</p>")
+        assert out == "José & Zoë"
 
     def test_html_to_markdown_itself_still_raises(self, monkeypatch):
         # The low-level function stays honest; to_text is the forgiving one.
@@ -188,3 +200,54 @@ class TestConversionFailureIsSurvivable:
         monkeypatch.setattr(m, "_converter", lambda: (_ for _ in ()).throw(RuntimeError("x")))
         with pytest.raises(RuntimeError):
             m.html_to_markdown("<p>hi</p>")
+
+
+class TestSymbolOnlyBodiesAreNotDropped:
+    """_has_content gates fallthrough, not returnability."""
+
+    def test_symbol_only_html_is_returned_when_nothing_else_exists(self):
+        # A checkmark attendance grid is that message's content. Dropping it
+        # because it has no alphanumerics would lose the whole body.
+        out = to_text(body_text=None, body_html="<p>&#10003; &#10003; &#10007; &#10003;</p>")
+        assert out == "✓ ✓ ✗ ✓"
+
+    def test_symbol_only_still_loses_to_a_part_with_real_content(self):
+        pixel = (
+            '<html><body><div><table><tr><td><img src="https://t.test/p.gif">'
+            + ("<!-- spacer -->" * 6)
+            + "</td></tr></table></div></body></html>"
+        )
+        assert "504 consent form" in to_text(body_text=pixel, body_html=EMAIL_HTML)
+
+    def test_html_part_converting_to_punctuation_is_returned_as_last_resort(self):
+        # test-coverage-reviewer proved deleting the body_html _has_content
+        # check left every test green; this pins the branch.
+        pixel = (
+            '<html><body><div><table><tr><td><img src="https://t.test/p.gif">'
+            + ("<!-- spacer -->" * 6)
+            + "</td></tr></table></div></body></html>"
+        )
+        assert html_to_markdown(pixel) == "---"
+        assert to_text(body_text=None, body_html=pixel) == "---"
+
+    def test_truly_nothing_is_still_empty(self):
+        assert to_text(body_text=None, body_html="<html><body></body></html>") == ""
+
+
+class TestSalvageStripping:
+    """_tags_stripped is only reached when html2text itself failed."""
+
+    def test_drops_script_and_style_bodies_not_just_their_tags(self):
+        from cortex_utils.mailtext import _tags_stripped
+
+        out = _tags_stripped(
+            "<style>.a{color:red}</style><p>Meeting at 8</p><script>var x = 1;</script>"
+        )
+        assert out == "Meeting at 8"
+
+    def test_drops_closing_tags_too(self):
+        # The detection regex only matches opening tags; reusing it here left
+        # every "</p>" in the salvaged output.
+        from cortex_utils.mailtext import _tags_stripped
+
+        assert _tags_stripped("<div><p>hello</p></div>") == "hello"

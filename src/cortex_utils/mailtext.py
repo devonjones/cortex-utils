@@ -15,6 +15,7 @@ column.
 from __future__ import annotations
 
 import re
+from html import unescape
 
 import html2text
 
@@ -55,7 +56,16 @@ _HTML_INDICATORS = (
     'class="',
 )
 
+# Counts OPENING tags, for detection only. Deliberately does not match "</p>":
+# a closing tag is not evidence of anything the tag count is trying to measure.
 _TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9]*[^>]*>")
+
+# Strips ANY tag, for the salvage path. Separate from _TAG_RE because stripping
+# and counting want opposite things -- reusing the counting pattern here left
+# every closing tag in the output.
+_ANY_TAG_RE = re.compile(r"<[^>]*>")
+# Script and style carry code, not prose; their bodies must go with the tags.
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def _converter() -> html2text.HTML2Text:
@@ -131,14 +141,28 @@ def looks_like_html(text: str) -> bool:
 
 
 def _has_content(text: str) -> bool:
-    """Whether converted output carries anything a person would read.
+    """Whether converted output is worth preferring over another MIME part.
 
     An image-only or table-skeleton email converts to markdown punctuation --
-    "---" for a bare table, say -- which is non-empty but says nothing. Treating
-    it as content means a digest shows a rule where a body should be, and hides
-    the other MIME part that may actually carry the message.
+    "---" for a bare table, say -- which is non-empty but says nothing, and
+    would hide the other part that may carry the actual message.
+
+    This decides FALLTHROUGH ONLY, never whether output is returnable. A body
+    that is legitimately all symbols (a checkmark attendance grid, an ASCII
+    diagram) is still that message's content when no other part does better.
     """
     return any(ch.isalnum() for ch in text)
+
+
+def _tags_stripped(html_content: str) -> str:
+    """Last-resort plain text when the markdown converter itself failed.
+
+    Crude by construction -- if html2text could not parse it, the markup is
+    malformed and there is nothing better to do than drop tags, decode
+    entities and collapse whitespace. Gives the reader the words.
+    """
+    text = unescape(_ANY_TAG_RE.sub(" ", _SCRIPT_STYLE_RE.sub(" ", html_content)))
+    return " ".join(text.split())
 
 
 def _try_markdown(content: str, what: str) -> str | None:
@@ -149,10 +173,13 @@ def _try_markdown(content: str, what: str) -> str | None:
     empty result means this part genuinely carried no readable content and the
     caller should try the next one.
 
-    Broad catch on purpose: html2text fails in various ways on malformed HTML,
-    including an AssertionError from inside html.parser. The input here is an
-    email body from an arbitrary sender, so one bad message must not take down
-    the worker processing the mailbox.
+    Broad catch on purpose, but not because malformed HTML is known to raise:
+    a fuzz over ~3000 adversarial inputs found no single-threaded failure, and
+    the AssertionError this module's tests provoke from html.parser needs a
+    shared converter, which `_converter()` no longer permits. The reason is
+    weaker and sufficient -- a third-party parser over input from arbitrary
+    senders, where one bad message must not take down the worker draining a
+    mailbox.
     """
     try:
         return html_to_markdown(content)
@@ -177,23 +204,34 @@ def to_text(*, body_text: str | None, body_html: str | None) -> str:
     propagating. Returns "" when there is nothing usable, so callers can treat
     "no body" as one case instead of juggling None against empty string.
     """
+    # Best thing seen that no reader would call content -- a bare table rule,
+    # say. Returned only if no part does better, because "---" still beats
+    # dropping a body that genuinely is all symbols.
+    fallback = ""
+
     if body_text and body_text.strip():
-        if looks_like_html(body_text):
-            converted = _try_markdown(body_text, "mislabelled text/plain")
-            if converted is None:
-                # Conversion failed. Raw markup reads badly but beats nothing,
-                # and it is what postmark's call sites did.
-                return body_text.strip()
-            if _has_content(converted):
-                return converted
-            # Converted cleanly to nothing a person would read (a tracking
-            # pixel, a bare table skeleton). Try body_html instead.
-        else:
+        if not looks_like_html(body_text):
             return body_text.strip()
+        converted = _try_markdown(body_text, "mislabelled text/plain")
+        if converted is None:
+            # Conversion failed. Raw markup reads badly but beats nothing,
+            # and it is what postmark's call sites did.
+            return body_text.strip()
+        if _has_content(converted):
+            return converted
+        fallback = fallback or converted
 
     if body_html and body_html.strip():
         converted = _try_markdown(body_html, "text/html")
-        if converted is not None and _has_content(converted):
+        if converted is None:
+            # Symmetric with the branch above: salvage the words rather than
+            # collapsing a failure into the same "" a genuinely empty body
+            # returns. There is no text/plain to fall back to here, and
+            # html-only is the majority of real mail, so this is the path that
+            # matters most.
+            return _tags_stripped(body_html)
+        if _has_content(converted):
             return converted
+        fallback = fallback or converted
 
-    return ""
+    return fallback
