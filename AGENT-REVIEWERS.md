@@ -13,6 +13,9 @@
       "overlaps_with": "pr-test-analyzer",
       "reason": "Different lenses: test-coverage-reviewer enforces hard rules (touched code must be covered; mocking discipline; missing assertions; skip-without-reason). pr-test-analyzer scores behavioral gaps on a criticality 1-10 axis. Both contribute independent signal during review loops."
     }
+  },
+  "bots": {
+    "gemini": false
   }
 }
 ```
