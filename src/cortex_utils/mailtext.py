@@ -1,0 +1,233 @@
+"""Turn an email body into readable plain text.
+
+Lifted out of postmark's duckdb_api so a second consumer does not become a third
+implementation. postmark had two already -- this one, and a BeautifulSoup
+`get_text()` in `postmark/email/parser.py` -- and cortex-school needs the same
+thing because 71% of the mail it reads (646 of 910 school emails) has an empty
+`body_text` and only `body_html`.
+
+`body_text` being empty is not a bug to repair upstream: those messages
+genuinely have no `text/plain` part. Derived plaintext is a different value from
+the stored one, so it is computed at read time rather than backfilled into the
+column.
+"""
+
+from __future__ import annotations
+
+import re
+
+import html2text
+
+from cortex_utils.log import get_logger
+
+# Library-side logger: writes to stderr and never calls structlog.configure(),
+# so importing this module cannot hijack a consumer's logging setup.
+log = get_logger()
+
+# Patterns that suggest code or configuration rather than an HTML email. Checked
+# first, because a JSON body full of angle brackets should not be run through a
+# markdown converter.
+_CODE_PATTERNS = (
+    "<?xml",  # XML declaration
+    "<configuration>",  # Config files
+    "<project>",  # Maven/build files
+    '{"',  # JSON (not HTML)
+    "{{",  # Template variables
+    "<template>",  # Template files
+)
+
+# Email-specific HTML patterns. General HTML/XML markup is deliberately not
+# enough on its own -- see looks_like_html().
+_HTML_INDICATORS = (
+    "<!doctype html",
+    "<html",
+    "<head>",
+    "<body",
+    "<div",
+    "<table",
+    "<tr>",
+    "<td",
+    "cellpadding=",  # Table attributes common in email HTML
+    "cellspacing=",
+    "bgcolor=",
+    'align="center"',  # Email layout patterns
+    'style="',  # Inline styles (common in emails)
+    'class="',
+)
+
+# Counts OPENING tags, for detection only. Deliberately does not match "</p>":
+# a closing tag is not evidence of anything the tag count is trying to measure.
+_TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9]*[^>]*>")
+
+
+def _converter() -> html2text.HTML2Text:
+    """A fresh converter per call.
+
+    HTML2Text accumulates output on the instance, so a module-level singleton
+    corrupts concurrent callers -- which the original home for this code
+    (postmark's duckdb_api, a FastAPI app whose sync `def` routes run in
+    uvicorn's thread pool) could do. Construction only sets attributes, so
+    per-call costs nothing worth measuring and removes the shared mutable state
+    entirely.
+    """
+    h = html2text.HTML2Text()
+    h.ignore_links = False  # Keep link URLs as markdown [text](url)
+    h.ignore_images = True  # Skip image references
+    h.ignore_emphasis = False  # Keep **bold** and *italic* markdown
+    h.body_width = 0  # Don't wrap lines
+    h.single_line_break = True  # More compact output
+    # Keep real characters instead of ASCII approximations. Off by default,
+    # html2text renders entities down to ASCII: "Reuni&oacute;n" arrives as
+    # "Reunion" and "Jos&#233;" as "Jose", while the same characters sent as
+    # literal UTF-8 survive -- so a name is mangled or not depending only on
+    # how the sender encoded it. Districts mail in Spanish and people's names
+    # carry accents; silently rewriting them is not an acceptable default.
+    h.unicode_snob = True
+    return h
+
+
+def html_to_markdown(html_content: str) -> str:
+    """Convert HTML to markdown. Links kept, images dropped, no line wrapping.
+
+    Raises whatever html2text raises. `to_text()` is the forgiving entry point;
+    this one stays honest so a caller that wants to know can.
+    """
+    if not html_content:
+        return ""
+    # unicode_snob keeps &nbsp; as U+00A0, which reads as a space but breaks
+    # naive equality and looks like a stray character in a digest. Normalise it
+    # here rather than giving up the rest of what unicode_snob preserves.
+    return _converter().handle(html_content).replace("\xa0", " ").strip()
+
+
+def looks_like_html(text: str) -> bool:
+    """Whether text labelled `text/plain` is actually HTML.
+
+    Some senders mislabel HTML as text/plain, so plain-text parts cannot be
+    trusted to be plain. Thresholds are conservative on purpose -- a false
+    positive mangles genuinely plain text, which is worse than leaving some
+    mislabelled HTML unconverted:
+
+    - at least 50 chars (shorter cannot be meaningful HTML)
+    - only the first 8KB is sampled (some mail carries long tracking URLs first)
+    - 5+ tags, to avoid tripping on a small XML or code snippet
+    - 2+ email-specific indicators on top of that
+    - excluded outright if it looks like XML, JSON, or a template
+    """
+    if not text or len(text) < 50:
+        return False
+
+    sample = text[:8000]
+    if "<" not in sample:
+        return False
+
+    sample_lower = sample.lower()
+    if any(pattern in sample_lower for pattern in _CODE_PATTERNS):
+        return False
+
+    if len(_TAG_RE.findall(sample)) < 5:
+        return False
+
+    indicators = sum(1 for ind in _HTML_INDICATORS if ind in sample_lower)
+    return indicators >= 2
+
+
+def _has_content(text: str) -> bool:
+    """Whether converted output is worth preferring over another MIME part.
+
+    An image-only or table-skeleton email converts to markdown punctuation --
+    "---" for a bare table, say -- which is non-empty but says nothing, and
+    would hide the other part that may carry the actual message.
+
+    This decides FALLTHROUGH ONLY, never whether output is returnable. A body
+    that is legitimately all symbols (a checkmark attendance grid, an ASCII
+    diagram) is still that message's content when no other part does better.
+    """
+    return any(ch.isalnum() for ch in text)
+
+
+def _try_markdown(content: str, what: str) -> str | None:
+    """Convert, or log and report failure. Never raises.
+
+    Returns None for "conversion failed" and "" for "converted to nothing".
+    They are different, and what the caller does with None is the caller's
+    business -- `to_text` keeps the raw text for a mislabelled text/plain, and
+    has nothing of its own to keep for a text/html. An empty result means the
+    part genuinely carried no readable content, so the next part should be tried.
+
+    Broad catch on purpose, but not because malformed HTML is known to raise:
+    a fuzz over ~3000 adversarial inputs found no single-threaded failure, and
+    the AssertionError this module's tests provoke from html.parser needs a
+    shared converter, which `_converter()` no longer permits. The reason is
+    weaker and sufficient -- a third-party parser over input from arbitrary
+    senders, where one bad message must not take down the worker draining a
+    mailbox.
+    """
+    try:
+        return html_to_markdown(content)
+    except Exception as e:  # noqa: BLE001 - see docstring
+        # type(e).__name__ matters: html.parser raises bare asserts, so str(e)
+        # alone logs an empty string and the line says nothing at all.
+        log.warning(
+            "html2text conversion failed",
+            part=what,
+            error=f"{type(e).__name__}: {e}",
+        )
+        return None
+
+
+def to_text(*, body_text: str | None, body_html: str | None) -> str:
+    """Best readable text for a message, from whichever parts exist.
+
+    The order matters. A real `text/plain` part is the sender's own rendering and
+    beats anything derived, but only once it has been checked for being HTML in
+    disguise -- so a mislabelled part falls through to conversion rather than
+    reaching a reader as raw markup.
+
+    Keyword-only. Both arguments are nullable strings read from adjacent columns,
+    so a positional call site that swapped them would type-check cleanly and
+    return confident nonsense; naming them makes the swap visible.
+
+    Never raises. A conversion failure is logged, and what it degrades to
+    depends on the part: a mislabelled `text/plain` keeps its raw text, while a
+    failed `text/html` has nothing of its own to fall back to and leaves
+    whatever the other part contributed. Returns "" when nothing is usable, so
+    callers can treat "no body" as one case rather than juggling None against
+    empty string.
+    """
+    # Best thing seen that no reader would call content -- a bare table rule,
+    # say, or the raw markup of a part that would not convert. Returned only if
+    # no part does better, because it still beats dropping the body entirely.
+    fallback = ""
+
+    def better(candidate: str) -> None:
+        # Both are content-free by definition, so there is no principled winner;
+        # longer simply carries more of whatever the message had.
+        nonlocal fallback
+        if len(candidate) > len(fallback):
+            fallback = candidate
+
+    if body_text and body_text.strip():
+        if not looks_like_html(body_text):
+            return body_text.strip()
+        converted = _try_markdown(body_text, "mislabelled text/plain")
+        if converted is None:
+            # Would not convert. Keep the raw markup as a floor, but still let
+            # body_html try -- it is usually the richer part anyway.
+            better(body_text.strip())
+        elif _has_content(converted):
+            return converted
+        else:
+            better(converted)
+
+    if body_html and body_html.strip():
+        converted = _try_markdown(body_html, "text/html")
+        if converted is not None:
+            if _has_content(converted):
+                return converted
+            better(converted)
+        # A failure here keeps whatever the text part left. The log line carries
+        # the signal; there is nothing better to return, and the salvage path
+        # that used to live here cost more in edge cases than it ever bought.
+
+    return fallback
