@@ -45,6 +45,18 @@ class TestLooksLikeHtml:
     def test_too_short_to_judge(self):
         assert not looks_like_html("<html><body><div><p>hi</p></div></body></html>"[:49])
 
+    def test_fifty_char_floor_is_the_boundary(self):
+        # Everything else passes (5 tags, 5 indicators, no code pattern), so
+        # only the length gate decides. The earlier "too short" test never
+        # reached this boundary: its input was 46 chars and failed the tag
+        # count anyway, so shifting the constant survived mutation.
+        markup = "<div><table><tr><td><body>"
+        just_under = markup + "x" * (49 - len(markup))
+        exactly_at = markup + "x" * (50 - len(markup))
+        assert len(just_under) == 49 and len(exactly_at) == 50
+        assert not looks_like_html(just_under)
+        assert looks_like_html(exactly_at)
+
     def test_no_angle_brackets_short_circuits(self):
         assert not looks_like_html("a plain sentence repeated. " * 10)
 

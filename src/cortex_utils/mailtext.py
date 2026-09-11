@@ -150,9 +150,10 @@ def _try_markdown(content: str, what: str) -> str | None:
     """Convert, or log and report failure. Never raises.
 
     Returns None for "conversion failed" and "" for "converted to nothing".
-    They are different: a failure means fall back to the raw text, while an
-    empty result means this part genuinely carried no readable content and the
-    caller should try the next one.
+    They are different, and what the caller does with None is the caller's
+    business -- `to_text` keeps the raw text for a mislabelled text/plain, and
+    has nothing of its own to keep for a text/html. An empty result means the
+    part genuinely carried no readable content, so the next part should be tried.
 
     Broad catch on purpose, but not because malformed HTML is known to raise:
     a fuzz over ~3000 adversarial inputs found no single-threaded failure, and
@@ -165,7 +166,13 @@ def _try_markdown(content: str, what: str) -> str | None:
     try:
         return html_to_markdown(content)
     except Exception as e:  # noqa: BLE001 - see docstring
-        log.warning("html2text failed, falling back to raw text", part=what, error=str(e))
+        # type(e).__name__ matters: html.parser raises bare asserts, so str(e)
+        # alone logs an empty string and the line says nothing at all.
+        log.warning(
+            "html2text conversion failed",
+            part=what,
+            error=f"{type(e).__name__}: {e}",
+        )
         return None
 
 
