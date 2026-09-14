@@ -816,12 +816,26 @@ def backfill() -> None:
 
 
 @backfill.command("walk")
-@click.option("--gateway", default=bw.DEFAULT_GATEWAY, help="Gateway base URL")
+@click.option(
+    "--gateway",
+    envvar=bw.GATEWAY_ENV,
+    required=True,
+    help=f"Gateway base URL (or set ${bw.GATEWAY_ENV}). No default: this repo is "
+    "public and must not carry homelab addresses.",
+)
 @click.option("--months", default=1, help="Window size per run, in months")
-@click.option("--seed", type=click.DateTime(["%Y-%m-%d"]), default=None,
-              help="Watermark to start from when no windowed job exists")
-@click.option("--floor", type=click.DateTime(["%Y-%m-%d"]), default=None,
-              help="Stop once the watermark reaches this date")
+@click.option(
+    "--seed",
+    type=click.DateTime(["%Y-%m-%d"]),
+    default=None,
+    help="Watermark to start from when no windowed job exists",
+)
+@click.option(
+    "--floor",
+    type=click.DateTime(["%Y-%m-%d"]),
+    default=None,
+    help="Stop once the watermark reaches this date",
+)
 @click.option("--dry-run", is_flag=True, help="Show the window without queueing")
 def backfill_walk(gateway: str, months: int, seed, floor, dry_run: bool) -> None:
     """Queue one month-window of historical ingest, walking backwards.

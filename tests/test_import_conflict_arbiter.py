@@ -37,17 +37,23 @@ def _importer_sql() -> str:
     assert against code only.
     """
     return "\n".join(
-        re.sub(r"#.*$", "", line)
-        for line in IMPORTER.read_text(encoding="utf-8").splitlines()
+        re.sub(r"#.*$", "", line) for line in IMPORTER.read_text(encoding="utf-8").splitlines()
     )
 
 
-def _migration_sql() -> str:
+def _migration_sql() -> str | None:
+    """Sibling postmark migrations, or None when they aren't checked out.
+
+    cortex-utils CI does a single `actions/checkout@v4` of THIS repo, so
+    `../postmark/migrations` exists only in Devon's multi-repo working copy.
+    The cross-repo tests below therefore cannot run in CI -- which is exactly
+    why the load-bearing assertion (`test_mapping_upsert_targets_the_partial_
+    unique_index`) deliberately does NOT depend on them. It reads importer.py
+    alone and always runs.
+    """
     if not MIGRATIONS.is_dir():
-        pytest.skip(f"migrations not present at {MIGRATIONS} (partial checkout)")
-    return "\n".join(
-        p.read_text(encoding="utf-8") for p in sorted(MIGRATIONS.glob("*.sql"))
-    )
+        return None
+    return "\n".join(p.read_text(encoding="utf-8") for p in sorted(MIGRATIONS.glob("*.sql")))
 
 
 def test_no_upsert_names_a_constraint_the_migrations_do_not_create() -> None:
@@ -58,20 +64,18 @@ def test_no_upsert_names_a_constraint_the_migrations_do_not_create() -> None:
     so naming one is a sign the code is describing a table that no longer
     exists.
     """
-    named = re.findall(
-        r"ON\s+CONFLICT\s+ON\s+CONSTRAINT\s+(\w+)", _importer_sql(), re.IGNORECASE
-    )
+    named = re.findall(r"ON\s+CONFLICT\s+ON\s+CONSTRAINT\s+(\w+)", _importer_sql(), re.IGNORECASE)
     if not named:
-        return
+        return  # nothing named at all -- the state this PR establishes
 
     migrations = _migration_sql()
+    if migrations is None:
+        pytest.skip("sibling postmark/migrations not checked out (expected in CI)")
     missing = [
         name
         for name in named
         if not re.search(rf"CONSTRAINT\s+{re.escape(name)}\s+UNIQUE", migrations, re.I)
-        and not re.search(
-            rf"ADD\s+CONSTRAINT\s+{re.escape(name)}\b", migrations, re.I
-        )
+        and not re.search(rf"ADD\s+CONSTRAINT\s+{re.escape(name)}\b", migrations, re.I)
     ]
     assert not missing, (
         f"importer.py names constraint(s) {missing} that no migration creates. "
@@ -104,8 +108,14 @@ def test_mapping_upsert_targets_the_partial_unique_index() -> None:
 
 
 def test_migrations_still_define_that_partial_index() -> None:
-    """Guard the other direction: don't drop the index the importer relies on."""
+    """Guard the other direction: don't drop the index the importer relies on.
+
+    Cross-repo, so it skips in CI. `test_upsert_arbiter_matches_the_vendored_
+    index_shape` below covers the same ground without the sibling checkout.
+    """
     migrations = _migration_sql()
+    if migrations is None:
+        pytest.skip("sibling postmark/migrations not checked out (expected in CI)")
     assert re.search(
         r"CREATE\s+UNIQUE\s+INDEX[^;]*?ON\s+triage_email_mappings\w*\s*"
         r"\(\s*mapping_type\s*,\s*email_address\s*\)[^;]*?"
@@ -115,4 +125,37 @@ def test_migrations_still_define_that_partial_index() -> None:
     ), (
         "no migration creates the partial unique index on "
         "(mapping_type, email_address) WHERE deleted_at IS NULL"
+    )
+
+
+# The expected arbiter, vendored so CI enforces it without a sibling checkout.
+# Must stay in sync with postmark migration 003 (creates it) and 004 (drops the
+# stray named constraint that used to shadow it).
+EXPECTED_INDEX = "idx_email_mappings_active"
+EXPECTED_COLUMNS = ("mapping_type", "email_address")
+EXPECTED_PREDICATE = "deleted_at IS NULL"
+
+
+def test_upsert_arbiter_matches_the_vendored_index_shape() -> None:
+    """Runs everywhere, including CI. This is the one that actually guards.
+
+    The two cross-repo tests above skip without a postmark checkout, so if the
+    invariant lived only there, cortex-apd6 could recur with CI green -- the
+    exact failure mode this file exists to prevent.
+    """
+    sql = _importer_sql()
+    match = re.search(
+        r"ON\s+CONFLICT\s*\(([^)]*)\)\s*WHERE\s+([^\n]+?)\s*$",
+        sql,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    assert match, "mapping upsert must infer an arbiter by columns + predicate"
+
+    columns = tuple(c.strip() for c in match.group(1).split(","))
+    assert columns == EXPECTED_COLUMNS, (
+        f"arbiter columns {columns} != {EXPECTED_COLUMNS} from migration 003"
+    )
+    assert EXPECTED_PREDICATE.lower() in match.group(2).lower(), (
+        f"arbiter predicate must be '{EXPECTED_PREDICATE}' -- uniqueness holds "
+        "over live rows only, so a soft-deleted mapping can be recreated"
     )
