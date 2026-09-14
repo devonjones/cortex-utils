@@ -16,6 +16,7 @@ import click
 import psycopg2
 import structlog
 
+from cortex_utils import backfill_walker as bw
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
 from cortex_utils.config import Config
 from cortex_utils.health.watchdog import Watchdog, parse_peers
@@ -803,3 +804,41 @@ def parse_duration(s: str) -> timedelta:
 
 if __name__ == "__main__":
     main()
+
+
+# --- Backfill Commands ---
+
+
+@main.group()
+def backfill() -> None:
+    """Historical Gmail ingest."""
+    pass
+
+
+@backfill.command("walk")
+@click.option("--gateway", default=bw.DEFAULT_GATEWAY, help="Gateway base URL")
+@click.option("--months", default=1, help="Window size per run, in months")
+@click.option("--seed", type=click.DateTime(["%Y-%m-%d"]), default=None,
+              help="Watermark to start from when no windowed job exists")
+@click.option("--floor", type=click.DateTime(["%Y-%m-%d"]), default=None,
+              help="Stop once the watermark reaches this date")
+@click.option("--dry-run", is_flag=True, help="Show the window without queueing")
+def backfill_walk(gateway: str, months: int, seed, floor, dry_run: bool) -> None:
+    """Queue one month-window of historical ingest, walking backwards.
+
+    Intended to run nightly. Queues at most one job per run and skips entirely
+    while a previous one is still pending or running, so it cannot pile up
+    behind a slow Gmail backfill or starve the live queue.
+    """
+    try:
+        click.echo(
+            bw.walk(
+                gateway=gateway,
+                months=months,
+                seed=seed.date() if seed else bw.DEFAULT_SEED,
+                floor=floor.date() if floor else bw.DEFAULT_FLOOR,
+                dry_run=dry_run,
+            )
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
