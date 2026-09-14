@@ -1,0 +1,118 @@
+"""The upsert arbiter in importer.py must exist in the migrations.
+
+This is the regression guard for cortex-apd6. `import_yaml_to_db` upserted
+email mappings with `ON CONFLICT ON CONSTRAINT unique_email_mapping`. That
+constraint is created by postmark migration 002 on the OLD config-versioned
+table over three columns, and migration 003 explicitly DROPs it while building
+the replacement table -- which gets only a partial unique index instead.
+
+So nothing in the repo ever created the constraint the code named. Every config
+import worked solely because a production database had it hand-added, out of
+band. `PUT /config` on a database built from these migrations failed outright,
+and the divergence was invisible until someone tried it.
+
+Naming a database object in SQL is a promise that a migration creates it. These
+tests check the promise statically -- no database required -- so the build fails
+instead of a deploy.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+IMPORTER = REPO / "utils" / "src" / "cortex_utils" / "triage_config" / "importer.py"
+MIGRATIONS = REPO / "postmark" / "migrations"
+
+
+def _importer_sql() -> str:
+    """importer.py with `#` comments stripped.
+
+    The fix for cortex-apd6 documents the old broken clause verbatim in a
+    comment, so a naive substring search over the raw file matches the prose
+    explaining the bug rather than any executable SQL. Strip comments and
+    assert against code only.
+    """
+    return "\n".join(
+        re.sub(r"#.*$", "", line)
+        for line in IMPORTER.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def _migration_sql() -> str:
+    if not MIGRATIONS.is_dir():
+        pytest.skip(f"migrations not present at {MIGRATIONS} (partial checkout)")
+    return "\n".join(
+        p.read_text(encoding="utf-8") for p in sorted(MIGRATIONS.glob("*.sql"))
+    )
+
+
+def test_no_upsert_names_a_constraint_the_migrations_do_not_create() -> None:
+    """Any `ON CONFLICT ON CONSTRAINT <name>` must be created by a migration.
+
+    Prefer inferring the arbiter by column list + predicate. A partial unique
+    index -- which is what this schema uses -- has no constraint name to cite,
+    so naming one is a sign the code is describing a table that no longer
+    exists.
+    """
+    named = re.findall(
+        r"ON\s+CONFLICT\s+ON\s+CONSTRAINT\s+(\w+)", _importer_sql(), re.IGNORECASE
+    )
+    if not named:
+        return
+
+    migrations = _migration_sql()
+    missing = [
+        name
+        for name in named
+        if not re.search(rf"CONSTRAINT\s+{re.escape(name)}\s+UNIQUE", migrations, re.I)
+        and not re.search(
+            rf"ADD\s+CONSTRAINT\s+{re.escape(name)}\b", migrations, re.I
+        )
+    ]
+    assert not missing, (
+        f"importer.py names constraint(s) {missing} that no migration creates. "
+        "Either add the migration or infer the arbiter by columns + predicate."
+    )
+
+
+def test_mapping_upsert_targets_the_partial_unique_index() -> None:
+    """The arbiter must match idx_email_mappings_active from migration 003.
+
+    That index is UNIQUE (mapping_type, email_address) WHERE deleted_at IS NULL.
+    The predicate is the load-bearing part: uniqueness holds over LIVE rows
+    only, so a soft-deleted mapping can be recreated. An unconditional arbiter
+    would wrongly block that.
+    """
+    sql = _importer_sql()
+    assert "ON CONFLICT ON CONSTRAINT unique_email_mapping" not in sql, (
+        "unique_email_mapping does not exist on triage_email_mappings; "
+        "migration 003 drops it. See cortex-apd6."
+    )
+    assert re.search(
+        r"ON\s+CONFLICT\s*\(\s*mapping_type\s*,\s*email_address\s*\)\s*"
+        r"WHERE\s+deleted_at\s+IS\s+NULL",
+        sql,
+        re.IGNORECASE,
+    ), (
+        "mapping upsert must infer the partial unique index: "
+        "ON CONFLICT (mapping_type, email_address) WHERE deleted_at IS NULL"
+    )
+
+
+def test_migrations_still_define_that_partial_index() -> None:
+    """Guard the other direction: don't drop the index the importer relies on."""
+    migrations = _migration_sql()
+    assert re.search(
+        r"CREATE\s+UNIQUE\s+INDEX[^;]*?ON\s+triage_email_mappings\w*\s*"
+        r"\(\s*mapping_type\s*,\s*email_address\s*\)[^;]*?"
+        r"WHERE\s+deleted_at\s+IS\s+NULL",
+        migrations,
+        re.IGNORECASE | re.DOTALL,
+    ), (
+        "no migration creates the partial unique index on "
+        "(mapping_type, email_address) WHERE deleted_at IS NULL"
+    )
