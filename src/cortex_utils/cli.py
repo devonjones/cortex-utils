@@ -9,7 +9,7 @@ Usage:
 
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import click
@@ -836,8 +836,21 @@ def backfill() -> None:
     default=None,
     help="Stop once the watermark reaches this date",
 )
+@click.option(
+    "--overlap-days",
+    default=1,
+    help="Extend each window past the seam into already-ingested days. Cheap "
+    "(existing messages skip all downstream work) and re-syncs their labels.",
+)
 @click.option("--dry-run", is_flag=True, help="Show the window without queueing")
-def backfill_walk(gateway: str, months: int, seed, floor, dry_run: bool) -> None:
+def backfill_walk(
+    gateway: str,
+    months: int,
+    seed: datetime | None,
+    floor: datetime | None,
+    overlap_days: int,
+    dry_run: bool,
+) -> None:
     """Queue one month-window of historical ingest, walking backwards.
 
     Intended to run nightly. Queues at most one job per run and skips entirely
@@ -851,6 +864,7 @@ def backfill_walk(gateway: str, months: int, seed, floor, dry_run: bool) -> None
                 months=months,
                 seed=seed.date() if seed else bw.DEFAULT_SEED,
                 floor=floor.date() if floor else bw.DEFAULT_FLOOR,
+                overlap_days=overlap_days,
                 dry_run=dry_run,
             )
         )

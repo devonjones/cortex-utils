@@ -113,6 +113,7 @@ def walk(
     floor: date = DEFAULT_FLOOR,
     dry_run: bool = False,
     stale_after_hours: int = 24,
+    overlap_days: int = 1,
 ) -> str:
     """Queue one window, or explain why it did not. Returns a status line.
 
@@ -157,7 +158,20 @@ def walk(
         return f"done: watermark {upper} has reached the floor {floor}"
 
     lower = max(month_before(upper, months), floor)
-    payload = {"after": lower.isoformat(), "before": upper.isoformat()}
+
+    # Extend the window FORWARD past the seam into already-ingested days.
+    # Gmail's after:/before: are date-granular and timezone-sensitive, so a
+    # message near midnight on the seam could otherwise land in neither
+    # window. Re-covering the seam is cheap: verified in gmail_sync.py that a
+    # message already in emails_raw skips the body store, the attachment
+    # extraction, the emails_raw insert and every downstream enqueue -- it
+    # costs one Gmail messages.get plus a label UPDATE, and that UPDATE is a
+    # side benefit, refreshing label_ids for mail we already hold.
+    #
+    # The watermark still advances to `lower`, not to the overlapped bound,
+    # so overlap never slows the walk.
+    fetch_upper = upper + timedelta(days=max(overlap_days, 0))
+    payload = {"after": lower.isoformat(), "before": fetch_upper.isoformat()}
     if dry_run:
         return f"dry-run: would queue {payload}"
 

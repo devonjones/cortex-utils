@@ -64,11 +64,16 @@ def test_watermark_is_the_earliest_windowed_job() -> None:
     assert current_watermark(jobs, seed) == date(2024, 9, 1)
 
 
-def test_windows_tile_without_gaps_or_overlap() -> None:
-    """Walk a year and check the windows abut exactly.
+def test_windows_tile_without_gaps() -> None:
+    """Walk a year and check the windows leave no gap.
 
-    Gmail's after: is inclusive and before: exclusive, so each window's lower
-    bound must equal the previous window's upper bound.
+    They may OVERLAP: `walk()` extends each window forward past the seam by
+    `overlap_days` on purpose, because Gmail's date filters are timezone
+    sensitive and a message near midnight on the seam could otherwise fall in
+    neither window. What must never happen is a gap -- a month nothing covers.
+
+    The watermark tracks `after_date`, which overlap does not move, so the
+    walk still advances exactly one window per run.
     """
     seed = date(2025, 1, 1)
     jobs: list[dict[str, str | None]] = []  # all completed
@@ -153,3 +158,61 @@ def test_stale_detection() -> None:
     assert not _is_stale(None, 24)
     assert not _is_stale("not-a-date", 24)
     assert not _is_stale(old, 0)  # disabled
+
+
+# --- overlap at the seam -----------------------------------------------------
+
+
+def test_overlap_extends_the_window_forward_not_backward() -> None:
+    """Overlap must re-cover already-ingested days, not un-ingested ones.
+
+    Extending `before` forward re-reads the seam we just crossed (cheap: those
+    messages skip every downstream step). Extending `after` backward would
+    instead eat into the NEXT window and still leave the seam exposed.
+    """
+    from cortex_utils.backfill_walker import walk
+
+    captured: dict[str, str] = {}
+
+    def fake_get(url: str) -> dict[str, object]:
+        return {"jobs": []}
+
+    import cortex_utils.backfill_walker as bw
+
+    original = bw._get
+    bw._get = fake_get  # type: ignore[assignment]
+    try:
+        msg = walk(gateway="http://x", seed=date(2025, 1, 1), dry_run=True, overlap_days=1)
+    finally:
+        bw._get = original  # type: ignore[assignment]
+
+    assert "'after': '2024-12-01'" in msg, "the window's start must not shift"
+    assert "'before': '2025-01-02'" in msg, "the window's end must extend past the seam"
+    captured.clear()
+
+
+def test_overlap_zero_restores_exact_tiling() -> None:
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.backfill_walker import walk
+
+    original = bw._get
+    bw._get = lambda url: {"jobs": []}  # type: ignore[assignment]
+    try:
+        msg = walk(gateway="http://x", seed=date(2025, 1, 1), dry_run=True, overlap_days=0)
+    finally:
+        bw._get = original  # type: ignore[assignment]
+    assert "'before': '2025-01-01'" in msg
+
+
+def test_negative_overlap_is_clamped_to_zero() -> None:
+    """A negative overlap would SHRINK the window and create a real gap."""
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.backfill_walker import walk
+
+    original = bw._get
+    bw._get = lambda url: {"jobs": []}  # type: ignore[assignment]
+    try:
+        msg = walk(gateway="http://x", seed=date(2025, 1, 1), dry_run=True, overlap_days=-5)
+    finally:
+        bw._get = original  # type: ignore[assignment]
+    assert "'before': '2025-01-01'" in msg, "negative overlap must not shrink the window"
