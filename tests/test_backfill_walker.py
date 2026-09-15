@@ -303,3 +303,64 @@ def test_healthy_in_flight_job_skips_quietly() -> None:
     recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     msg = _walk_with_jobs([{"id": "j4", "status": "running", "created_at": recent}])
     assert msg.startswith("skip:")
+
+
+# --- walk()'s in-flight guard and floor: the round 4 findings ----------------
+#
+# test_in_flight_job_does_not_advance_the_watermark (above) LOOKS like it
+# covers the busy guard, but it exercises current_watermark(), never walk().
+# Two mutants survived the 22-test suite as a result:
+#
+#   * `status in ("pending", "running")` -> `status == "running"` permits a
+#     second concurrent Gmail backfill and lets a job wedged in `pending`
+#     bypass the staleness guard entirely.
+#   * the floor comparison `upper <= floor` -> `upper < floor` produces a
+#     zero-width window, re-queued nightly forever, watermark pinned at the
+#     floor, reporting success every run.
+
+
+def test_a_pending_job_blocks_the_walk_not_just_a_running_one() -> None:
+    """`pending` is in-flight too: it is queued work Gmail has not finished."""
+    from datetime import UTC, datetime, timedelta
+
+    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    msg = _walk_with_jobs([{"id": "p1", "status": "pending", "created_at": recent}])
+    assert msg.startswith("skip:"), "a pending job must stop the walker queueing another"
+    assert "pending" in msg
+
+
+def test_a_wedged_pending_job_raises_like_a_wedged_running_one() -> None:
+    """The staleness guard must cover `pending`, not only `running`.
+
+    A job stuck in `pending` is the likelier wedge -- it means nothing ever
+    picked the work up.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import pytest
+
+    old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    with pytest.raises(RuntimeError, match="stalled"):
+        _walk_with_jobs([{"id": "p2", "status": "pending", "created_at": old}])
+
+
+def test_the_walk_stops_at_the_floor_rather_than_queueing_empty_windows() -> None:
+    """At the floor, the walker must report done and queue nothing.
+
+    With `<` instead of `<=`, reaching the floor exactly yields
+    lower == upper == floor: a zero-width window queued every night forever,
+    each run exiting 0 as though it had made progress.
+    """
+    floor = date(2002, 1, 1)
+    jobs = [_job(floor.isoformat(), "2002-02-01")]
+    msg = _walk_with_jobs(jobs, floor=floor, dry_run=True)
+    assert msg.startswith("done:"), f"expected done at the floor, got {msg!r}"
+    assert "floor" in msg
+
+
+def test_the_window_is_clamped_to_the_floor_never_crossing_it() -> None:
+    """A month-step that would overshoot the floor must stop AT it."""
+    floor = date(2002, 1, 1)
+    jobs = [_job("2002-01-15", "2002-02-15")]
+    msg = _walk_with_jobs(jobs, floor=floor, dry_run=True)
+    assert "'after': '2002-01-01'" in msg, f"window must clamp to the floor, got {msg!r}"

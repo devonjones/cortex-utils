@@ -802,10 +802,6 @@ def parse_duration(s: str) -> timedelta:
         raise ValueError(f"Invalid duration format: {s}. Use e.g., 24h, 7d, 30m")
 
 
-if __name__ == "__main__":
-    main()
-
-
 # --- Backfill Commands ---
 
 
@@ -878,3 +874,12 @@ def backfill_walk(
         )
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e
+
+
+# Must stay LAST. Everything above registers commands on `main`; running it
+# from the middle of the file means `python -m cortex_utils.cli` dispatches
+# against a half-built group and reports "No such command 'backfill'", while
+# the console entry point -- which imports the module fully, then calls main()
+# -- works. The two diverge silently, which is how this shipped.
+if __name__ == "__main__":
+    main()

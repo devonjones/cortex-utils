@@ -291,3 +291,38 @@ def test_the_conftest_fixture_restores_a_configuration_it_found() -> None:
         assert "restored" in sink.getvalue()
     finally:
         structlog.reset_defaults()
+
+
+def test_python_m_exposes_every_command_group() -> None:
+    """`python -m cortex_utils.cli` must dispatch the same commands as the
+    console script.
+
+    Round 4 review: the `backfill` group was defined BELOW
+    `if __name__ == "__main__": main()`, so running the module dispatched
+    against a half-built group -- `backfill walk` reported "No such command"
+    while `cortex-utils backfill walk` worked. The ofelia job uses the console
+    script, so the divergence was invisible from the deployment.
+
+    Asserting the group is reachable, not merely listed: `--help` on the leaf
+    is what proves the registration actually completed.
+    """
+    import subprocess
+    import sys
+
+    listed = subprocess.run(
+        [sys.executable, "-m", "cortex_utils.cli", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert "backfill" in listed.stdout, (
+        "the backfill group is missing from `python -m` -- a command is "
+        "registered after main() is invoked"
+    )
+
+    leaf = subprocess.run(
+        [sys.executable, "-m", "cortex_utils.cli", "backfill", "walk", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert leaf.returncode == 0, f"backfill walk --help failed: {leaf.stderr}"
+    assert "--gateway" in leaf.stdout

@@ -146,6 +146,12 @@ def test_migrations_still_define_that_partial_index() -> None:
 # The expected arbiter, vendored so CI enforces it without a sibling checkout.
 # Must stay in sync with postmark migration 003 (creates it) and 004 (drops the
 # stray named constraint that used to shadow it).
+#
+# COLUMNS and PREDICATE are what the upsert actually infers, and are asserted
+# against importer.py below with no checkout required. INDEX is the name, which
+# Postgres does not use for inference at all -- it is checked against the
+# migrations by test_the_migrations_create_the_arbiter_under_the_expected_name,
+# which therefore skips in CI.
 EXPECTED_INDEX = "idx_email_mappings_active"
 EXPECTED_COLUMNS = ("mapping_type", "email_address")
 EXPECTED_PREDICATE = "deleted_at IS NULL"
@@ -173,4 +179,41 @@ def test_upsert_arbiter_matches_the_vendored_index_shape() -> None:
     assert EXPECTED_PREDICATE.lower() in match.group(2).lower(), (
         f"arbiter predicate must be '{EXPECTED_PREDICATE}' -- uniqueness holds "
         "over live rows only, so a soft-deleted mapping can be recreated"
+    )
+
+
+def test_the_migrations_create_the_arbiter_under_the_expected_name() -> None:
+    """EXPECTED_INDEX must name a real index, not just sit in a constant.
+
+    Round 4 review: EXPECTED_INDEX was never read, while the comment above it
+    promised a sync check against migrations 003 and 004. The shape assertions
+    match on columns and predicate, which is the right way to check an
+    arbiter -- Postgres infers a partial unique index by shape, not by name --
+    but it leaves the name unverified, so the constant could drift from the
+    schema and nothing would notice.
+
+    Cross-repo, so it skips in CI like its two siblings. The name is only
+    load-bearing for humans reading migration 004's assertions and for
+    `CREATE UNIQUE INDEX IF NOT EXISTS`, which no-ops on a same-named index;
+    the shape tests remain the ones that guard the upsert itself.
+    """
+    migrations = _migration_sql()
+    if migrations is None:
+        pytest.skip("sibling postmark/migrations not checked out (expected in CI)")
+
+    assert re.search(
+        rf"CREATE\s+UNIQUE\s+INDEX(\s+IF\s+NOT\s+EXISTS)?\s+{re.escape(EXPECTED_INDEX)}\b",
+        migrations,
+        re.IGNORECASE,
+    ), f"no migration creates an index named {EXPECTED_INDEX}"
+
+    columns = r"\s*,\s*".join(re.escape(c) for c in EXPECTED_COLUMNS)
+    assert re.search(
+        rf"CREATE\s+UNIQUE\s+INDEX(\s+IF\s+NOT\s+EXISTS)?\s+{re.escape(EXPECTED_INDEX)}\b"
+        rf"[^;]*?\(\s*{columns}\s*\)[^;]*?WHERE\s+{re.escape(EXPECTED_PREDICATE)}",
+        migrations,
+        re.IGNORECASE | re.DOTALL,
+    ), (
+        f"{EXPECTED_INDEX} exists in the migrations but not with the shape the "
+        f"importer infers: ({', '.join(EXPECTED_COLUMNS)}) WHERE {EXPECTED_PREDICATE}"
     )
