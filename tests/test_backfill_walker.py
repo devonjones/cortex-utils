@@ -198,3 +198,108 @@ def test_negative_overlap_is_clamped_to_zero() -> None:
     finally:
         bw._get = original  # type: ignore[assignment]
     assert "'before': '2025-01-01'" in msg, "negative overlap must not shrink the window"
+
+
+# --- job age: the round 2 finding -------------------------------------------
+#
+# _job_age_hours() returns None for "cannot determine", and walk() RAISES on
+# None. An earlier version returned False ("not stale") for an unreadable
+# timestamp, which quietly reintroduced the silent stall the guard exists to
+# close: a wedged job whose timestamp we cannot read would be skipped every
+# night forever behind a routine-looking exit 0.
+
+
+def test_job_age_is_measured_in_hours() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from cortex_utils.backfill_walker import _job_age_hours
+
+    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    assert 0.9 < (_job_age_hours(recent) or 0) < 1.1
+    assert 47 < (_job_age_hours(old) or 0) < 49
+
+
+def test_undeterminable_age_returns_none_not_zero() -> None:
+    from cortex_utils.backfill_walker import _job_age_hours
+
+    assert _job_age_hours(None) is None
+    assert _job_age_hours("") is None
+    assert _job_age_hours("not-a-date") is None
+
+
+def test_defensive_timestamp_parsing_is_actually_exercised() -> None:
+    """The Z-suffix and naive branches are unreachable today; pin them anyway.
+
+    The API serialises created_at as tz-aware ISO, so neither fires. An
+    untested fallback is one that stops working silently the day it is first
+    needed.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from cortex_utils.backfill_walker import _job_age_hours
+
+    ts = datetime.now(UTC) - timedelta(hours=3)
+    z_suffix = ts.replace(tzinfo=None).isoformat() + "Z"
+    naive = ts.replace(tzinfo=None).isoformat()
+    assert 2.9 < (_job_age_hours(z_suffix) or 0) < 3.1
+    assert 2.9 < (_job_age_hours(naive) or 0) < 3.1, "naive is assumed UTC"
+
+
+def test_future_timestamp_reports_negative_age() -> None:
+    """Clock disagreement with the database, surfaced rather than swallowed."""
+    from datetime import UTC, datetime, timedelta
+
+    from cortex_utils.backfill_walker import _job_age_hours
+
+    future = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+    age = _job_age_hours(future)
+    assert age is not None and age < 0
+
+
+def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.backfill_walker import walk
+
+    original = bw._get
+    bw._get = lambda url: {"jobs": jobs}  # type: ignore[assignment]
+    try:
+        return walk(gateway="http://x", seed=date(2025, 1, 1), **kw)  # type: ignore[arg-type]
+    finally:
+        bw._get = original  # type: ignore[assignment]
+
+
+def test_in_flight_job_with_unreadable_timestamp_raises() -> None:
+    """No quiet skip when we cannot prove the job is healthy."""
+    import pytest
+
+    with pytest.raises(RuntimeError, match="cannot be read"):
+        _walk_with_jobs([{"id": "j1", "status": "running", "created_at": "garbage"}])
+
+
+def test_future_dated_in_flight_job_raises_about_clock_skew() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import pytest
+
+    future = (datetime.now(UTC) + timedelta(hours=5)).isoformat()
+    with pytest.raises(RuntimeError, match="FUTURE"):
+        _walk_with_jobs([{"id": "j2", "status": "running", "created_at": future}])
+
+
+def test_wedged_job_raises_once_past_the_threshold() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    import pytest
+
+    old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    with pytest.raises(RuntimeError, match="stalled"):
+        _walk_with_jobs([{"id": "j3", "status": "running", "created_at": old}])
+
+
+def test_healthy_in_flight_job_skips_quietly() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    msg = _walk_with_jobs([{"id": "j4", "status": "running", "created_at": recent}])
+    assert msg.startswith("skip:")
