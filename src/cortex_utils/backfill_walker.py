@@ -68,7 +68,30 @@ def _post(url: str, payload: dict[str, str]) -> dict[str, Any]:
 
 
 def current_watermark(jobs: list[dict[str, Any]], seed: date) -> date:
-    """Earliest `after_date` among windowed jobs, else the seed.
+    """How far back history has been walked CONTIGUOUSLY from the seed.
+
+    Not `min(after_date)`. A global minimum trusts any completed window
+    anywhere, and the table does not record who created a job, so an operator
+    catching up an old month hijacks the frontier:
+
+        walker at 2024-11-01, someone hand-queues 2010-03-01..2010-03-08
+        min() -> 2010-03-01, next window 2010-02
+        => 2010-04 .. 2024-10 are now unreachable, permanently and silently
+
+    All nine jobs in the live table are hand-created and six are bounded, so
+    this is real; it is harmless today only because their minimum happens to
+    equal DEFAULT_SEED. A global minimum has the same blind spot for a GAP
+    between the walker's own windows -- a month whose job failed, was
+    cancelled, or never ran is stepped straight over.
+
+    So the frontier is walked instead: start at the seed and follow completed
+    windows that actually abut, stopping at the first month nothing covers.
+    Anything disconnected below the chain is ignored, and a gap is re-walked
+    rather than skipped. The chain terminates because every step strictly
+    lowers the bound.
+
+    `before_date >= upper` rather than `== upper`, because walk() deliberately
+    extends each window forward past the seam by `overlap_days`.
 
     Two filters, both load-bearing:
 
@@ -88,26 +111,46 @@ def current_watermark(jobs: list[dict[str, Any]], seed: date) -> date:
     AttributeError or ValueError -- an unhandled traceback out of a cron job,
     which is a worse failure than a loud RuntimeError saying what arrived.
     """
-    windowed = []
+
+    def bounds(job: dict[str, Any]) -> tuple[date, date] | None:
+        """(after, before) for a completed windowed job, else None."""
+        if not (job.get("after_date") and job.get("before_date")):
+            return None
+        if job.get("status") != "completed":
+            return None
+        try:
+            return (
+                date.fromisoformat(str(job["after_date"])),
+                date.fromisoformat(str(job["before_date"])),
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"backfill job {job.get('id', 'unknown')} has unreadable dates "
+                f"(after={job.get('after_date')!r}, before={job.get('before_date')!r}): "
+                f"refusing to guess the watermark, which decides which month is "
+                f"ingested next"
+            ) from exc
+
+    windows = []
     for job in jobs:
         if not isinstance(job, dict):
             raise RuntimeError(
                 f"unexpected entry in the gateway's job list: expected an "
                 f"object, got {type(job).__name__} ({job!r:.60})"
             )
-        if not (job.get("after_date") and job.get("before_date")):
-            continue
-        if job.get("status") != "completed":
-            continue
-        try:
-            windowed.append(date.fromisoformat(str(job["after_date"])))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"backfill job {job.get('id', 'unknown')} has an unreadable "
-                f"after_date ({job['after_date']!r}): refusing to guess the "
-                f"watermark, which decides which month is ingested next"
-            ) from exc
-    return min(windowed) if windowed else seed
+        window = bounds(job)
+        if window is not None:
+            windows.append(window)
+
+    upper = seed
+    while True:
+        # Deepest window that reaches back from where we are. Deepest rather
+        # than any, so a months>1 run is not undone by a smaller overlapping
+        # window recorded alongside it.
+        reaching = [after for after, before in windows if before >= upper and after < upper]
+        if not reaching:
+            return upper
+        upper = min(reaching)
 
 
 def _job_age_hours(created_at: str | None) -> float | None:

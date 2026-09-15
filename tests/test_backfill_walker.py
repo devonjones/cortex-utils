@@ -54,14 +54,45 @@ def test_open_ended_jobs_do_not_move_the_watermark() -> None:
     assert current_watermark(jobs, seed) == seed
 
 
-def test_watermark_is_the_earliest_windowed_job() -> None:
+def test_watermark_follows_the_contiguous_chain_and_stops_at_a_gap() -> None:
+    """Not the global minimum -- the frontier of what is actually covered.
+
+    These windows cover 2024-11, 2024-12 and 2024-09, leaving 2024-10 with
+    nothing. min(after_date) reports 2024-09-01, declaring October ingested
+    when it never was and never revisiting it. The chain stops at 2024-11-01,
+    so the next run re-walks October.
+    """
     seed = date(2025, 1, 1)
     jobs = [
         _job("2024-11-01", "2024-12-01"),
-        _job("2024-09-01", "2024-10-01"),
+        _job("2024-09-01", "2024-10-01"),  # disconnected: 2024-10 is a hole
         _job("2024-12-01", "2025-01-01"),
     ]
-    assert current_watermark(jobs, seed) == date(2024, 9, 1)
+    assert current_watermark(jobs, seed) == date(2024, 11, 1)
+
+
+def test_an_unrelated_old_window_cannot_hijack_the_watermark() -> None:
+    """The table does not record who created a job.
+
+    An operator catching up an old month leaves a completed bounded window
+    far below the frontier. Under min() that becomes the watermark and every
+    month between it and the real frontier is silently unreachable -- the
+    walker reports normal progress and exits 0 forever.
+
+    All nine jobs in the live table are hand-created and six are bounded, so
+    this is a real shape, not a hypothetical.
+    """
+    seed = date(2025, 1, 1)
+    walker_windows = [
+        _job("2024-12-01", "2025-01-01"),
+        _job("2024-11-01", "2024-12-01"),
+    ]
+    assert current_watermark(walker_windows, seed) == date(2024, 11, 1)
+
+    hand_queued = _job("2010-03-01", "2010-03-08")
+    assert current_watermark([*walker_windows, hand_queued], seed) == date(2024, 11, 1), (
+        "a disconnected operator window must not become the frontier"
+    )
 
 
 def test_windows_tile_without_gaps() -> None:
@@ -131,8 +162,11 @@ def test_only_completed_windows_count_among_a_mix() -> None:
         _job("2024-11-01", "2024-12-01", "failed"),  # gap: must be retried
         _job("2024-10-01", "2024-11-01", "completed"),  # must NOT mask the gap
     ]
-    # The failed month is the frontier, not the older completed one behind it.
-    assert current_watermark(jobs, seed) == date(2024, 10, 1)
+    # The failed month IS the frontier, not the older completed one behind it.
+    # min() returned 2024-10-01 here -- stepping over the failed November
+    # entirely, which is what this test's comment always said must not happen
+    # while its assertion asserted the opposite.
+    assert current_watermark(jobs, seed) == date(2024, 12, 1)
 
 
 def test_missing_status_does_not_advance_the_watermark() -> None:
@@ -286,7 +320,10 @@ def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
     bw._get = lambda url: {"jobs": jobs}  # type: ignore[assignment]
     bw._post = fake_post  # type: ignore[assignment]
     try:
-        return walk(gateway="http://x", seed=date(2025, 1, 1), **kw)  # type: ignore[arg-type]
+        # seed is a default here, not a fixed value: the floor tests need to
+        # seed at the chain, since a window disconnected from the seed no
+        # longer establishes the frontier.
+        return walk(gateway="http://x", **{"seed": date(2025, 1, 1), **kw})  # type: ignore[arg-type]
     finally:
         bw._get = original_get  # type: ignore[assignment]
         bw._post = original_post  # type: ignore[assignment]
@@ -381,8 +418,10 @@ def test_the_walk_stops_at_the_floor_rather_than_queueing_empty_windows() -> Non
     each run exiting 0 as though it had made progress.
     """
     floor = date(2002, 1, 1)
+    # Seeded AT the chain, not 23 years above it: a window disconnected from
+    # the seed no longer sets the frontier, which is the point of the chain.
     jobs = [_job(floor.isoformat(), "2002-02-01")]
-    msg = _walk_with_jobs(jobs, floor=floor, dry_run=True)
+    msg = _walk_with_jobs(jobs, seed=date(2002, 2, 1), floor=floor, dry_run=True)
     assert msg.startswith("done:"), f"expected done at the floor, got {msg!r}"
     assert "floor" in msg
 
@@ -391,7 +430,7 @@ def test_the_window_is_clamped_to_the_floor_never_crossing_it() -> None:
     """A month-step that would overshoot the floor must stop AT it."""
     floor = date(2002, 1, 1)
     jobs = [_job("2002-01-15", "2002-02-15")]
-    msg = _walk_with_jobs(jobs, floor=floor, dry_run=True)
+    msg = _walk_with_jobs(jobs, seed=date(2002, 2, 15), floor=floor, dry_run=True)
     assert "'after': '2002-01-01'" in msg, f"window must clamp to the floor, got {msg!r}"
 
 
@@ -558,7 +597,7 @@ def test_a_malformed_gateway_payload_raises_runtimeerror_not_a_traceback() -> No
     with pytest.raises(RuntimeError, match="expected an object"):
         _walk_with_jobs(["not-a-dict"])  # type: ignore[list-item]
 
-    with pytest.raises(RuntimeError, match="unreadable after_date"):
+    with pytest.raises(RuntimeError, match="unreadable dates"):
         _walk_with_jobs(
             [
                 {
@@ -577,10 +616,26 @@ def test_a_non_iso_after_date_does_not_silently_seed_the_watermark() -> None:
 
     from cortex_utils.backfill_walker import current_watermark
 
-    with pytest.raises(RuntimeError, match="unreadable after_date"):
+    with pytest.raises(RuntimeError, match="unreadable dates"):
         current_watermark(
             # NOT an int like 20241201: date.fromisoformat accepts the basic
             # "YYYYMMDD" form, so that parses fine. A list is unambiguous.
             [{"id": "j1", "status": "completed", "after_date": ["2024-12-01"], "before_date": "x"}],
             date(2025, 1, 1),
         )
+
+
+def test_current_watermark_rejects_a_non_dict_entry_on_its_own() -> None:
+    """Round 7 found this guard's mutant surviving the whole suite.
+
+    walk() validates shape before current_watermark ever runs, so every test
+    that went through walk() was really exercising walk()'s guard. This calls
+    current_watermark directly -- it is public API, imported by name in these
+    tests and reachable independently of walk().
+    """
+    import pytest
+
+    from cortex_utils.backfill_walker import current_watermark
+
+    with pytest.raises(RuntimeError, match="expected an object"):
+        current_watermark(["not-a-dict"], date(2025, 1, 1))  # type: ignore[list-item]
