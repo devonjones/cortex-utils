@@ -144,8 +144,10 @@ def test_migrations_still_define_that_partial_index() -> None:
 
 
 # The expected arbiter, vendored so CI enforces it without a sibling checkout.
-# Must stay in sync with postmark migration 003 (creates it) and 004 (drops the
-# stray named constraint that used to shadow it).
+# Must stay in sync with postmark migration 003 -- which RENAMES
+# idx_email_mappings_unique_active to this name rather than creating it -- and
+# 004, which drops the stray named constraint that used to shadow it and
+# re-creates this index idempotently.
 #
 # COLUMNS and PREDICATE are what the upsert actually infers, and are asserted
 # against importer.py below with no checkout required. INDEX is the name, which
@@ -183,7 +185,7 @@ def test_upsert_arbiter_matches_the_vendored_index_shape() -> None:
 
 
 def test_the_migrations_create_the_arbiter_under_the_expected_name() -> None:
-    """EXPECTED_INDEX must name a real index, not just sit in a constant.
+    """EXPECTED_INDEX must name an index some migration actually establishes.
 
     Round 4 review: EXPECTED_INDEX was never read, while the comment above it
     promised a sync check against migrations 003 and 004. The shape assertions
@@ -201,11 +203,16 @@ def test_the_migrations_create_the_arbiter_under_the_expected_name() -> None:
     if migrations is None:
         pytest.skip("sibling postmark/migrations not checked out (expected in CI)")
 
+    # CREATE or RENAME TO. Migration 003 does not create this name -- it
+    # renames idx_email_mappings_unique_active to it (003:178). Only 004's
+    # idempotent re-create matches the CREATE form, so a CREATE-only assertion
+    # would silently start depending on 004 rather than on the index existing.
     assert re.search(
-        rf"CREATE\s+UNIQUE\s+INDEX(\s+IF\s+NOT\s+EXISTS)?\s+{re.escape(EXPECTED_INDEX)}\b",
+        rf"(CREATE\s+UNIQUE\s+INDEX(\s+IF\s+NOT\s+EXISTS)?\s+{re.escape(EXPECTED_INDEX)}\b"
+        rf"|RENAME\s+TO\s+{re.escape(EXPECTED_INDEX)}\b)",
         migrations,
         re.IGNORECASE,
-    ), f"no migration creates an index named {EXPECTED_INDEX}"
+    ), f"no migration creates or renames an index to {EXPECTED_INDEX}"
 
     columns = r"\s*,\s*".join(re.escape(c) for c in EXPECTED_COLUMNS)
     assert re.search(

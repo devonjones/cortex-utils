@@ -257,16 +257,39 @@ def test_future_timestamp_reports_negative_age() -> None:
     assert age is not None and age < 0
 
 
+# Every _walk_with_jobs call records what walk() tried to QUEUE, so a test can
+# assert on the walker's decision rather than on an exception from the network.
+_posted: list[dict[str, object]] = []
+
+
 def _walk_with_jobs(jobs: list[dict[str, object]], **kw: object) -> str:
+    """Run walk() against a canned job list, with the gateway fully stubbed.
+
+    _post is stubbed, not merely left to fail. Without it, a mutant that
+    wrongly lets the walker proceed dies on a DNS lookup for "http://x"
+    instead of on an assertion -- the test goes red, so the mutation looks
+    killed, but it would go red just as readily if _post broke for an
+    unrelated reason, and the failure says nothing about the behaviour under
+    test. Round 5 review caught that the round 4 mutation evidence rested on
+    this.
+    """
     import cortex_utils.backfill_walker as bw
     from cortex_utils.backfill_walker import walk
 
-    original = bw._get
+    _posted.clear()
+
+    def fake_post(url: str, payload: dict[str, str]) -> dict[str, object]:
+        _posted.append({"url": url, "payload": dict(payload)})
+        return {"id": "queued-1", "status": "pending"}
+
+    original_get, original_post = bw._get, bw._post
     bw._get = lambda url: {"jobs": jobs}  # type: ignore[assignment]
+    bw._post = fake_post  # type: ignore[assignment]
     try:
         return walk(gateway="http://x", seed=date(2025, 1, 1), **kw)  # type: ignore[arg-type]
     finally:
-        bw._get = original  # type: ignore[assignment]
+        bw._get = original_get  # type: ignore[assignment]
+        bw._post = original_post  # type: ignore[assignment]
 
 
 def test_in_flight_job_with_unreadable_timestamp_raises() -> None:
@@ -327,6 +350,7 @@ def test_a_pending_job_blocks_the_walk_not_just_a_running_one() -> None:
     msg = _walk_with_jobs([{"id": "p1", "status": "pending", "created_at": recent}])
     assert msg.startswith("skip:"), "a pending job must stop the walker queueing another"
     assert "pending" in msg
+    assert _posted == [], "nothing may be queued while a job is in flight"
 
 
 def test_a_wedged_pending_job_raises_like_a_wedged_running_one() -> None:
@@ -342,6 +366,7 @@ def test_a_wedged_pending_job_raises_like_a_wedged_running_one() -> None:
     old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
     with pytest.raises(RuntimeError, match="stalled"):
         _walk_with_jobs([{"id": "p2", "status": "pending", "created_at": old}])
+    assert _posted == [], "a wedged job must not be followed by a second queue"
 
 
 def test_the_walk_stops_at_the_floor_rather_than_queueing_empty_windows() -> None:

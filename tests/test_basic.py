@@ -309,15 +309,25 @@ def test_python_m_exposes_every_command_group() -> None:
     import subprocess
     import sys
 
+    # Enumerate, don't spot-check. Naming one group only proves that group is
+    # registered: the next command appended below the __main__ block -- the
+    # natural place to add one -- would reproduce the bug with this test still
+    # green. Importing the module runs every decorator, so main.commands is
+    # the full set; `python -m` must expose all of it.
+    from cortex_utils.cli import main as _main
+
     listed = subprocess.run(
         [sys.executable, "-m", "cortex_utils.cli", "--help"],
         capture_output=True,
         text=True,
     )
-    assert "backfill" in listed.stdout, (
-        "the backfill group is missing from `python -m` -- a command is "
-        "registered after main() is invoked"
+    assert listed.returncode == 0, listed.stderr
+    missing = sorted(name for name in _main.commands if name not in listed.stdout)
+    assert not missing, (
+        f"registered but not reachable via `python -m`: {missing}. A command "
+        "is defined after main() is invoked."
     )
+    assert "backfill" in _main.commands, "backfill group vanished from the CLI entirely"
 
     leaf = subprocess.run(
         [sys.executable, "-m", "cortex_utils.cli", "backfill", "walk", "--help"],

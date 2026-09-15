@@ -183,7 +183,15 @@ def walk(
                 f"{oldest.get('created_at')} (> {stale_after_hours}h): the "
                 f"walker is stalled until it is cancelled or completed"
             )
-        return f"skip: {len(busy)} job(s) still {busy[0]['status']} (id {busy[0]['id']})"
+        # .get, not []: this function's documented contract is that it returns
+        # a string or raises RuntimeError, and cli.py catches only that. A job
+        # dict missing a key would otherwise leak a KeyError straight past the
+        # handler -- an unhandled traceback out of a nightly cron job, for a
+        # field that is only being used to build a log line.
+        return (
+            f"skip: {len(busy)} job(s) still {busy[0].get('status', 'in flight')} "
+            f"(id {busy[0].get('id', 'unknown')})"
+        )
 
     upper = current_watermark(jobs, seed)
     if upper <= floor:
