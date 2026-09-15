@@ -23,9 +23,24 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
-IMPORTER = REPO / "utils" / "src" / "cortex_utils" / "triage_config" / "importer.py"
-MIGRATIONS = REPO / "postmark" / "migrations"
+# Locate importer.py by IMPORTING it, not by guessing a path. The previous
+# version did `parents[2] / "utils" / "src" / ...`, which assumed the checkout
+# directory is named "utils" -- true in Devon's multi-repo tree, false in CI,
+# where actions/checkout names it "cortex-utils". The result was three tests
+# failing with FileNotFoundError rather than asserting anything.
+#
+# Exactly the disease this file was rewritten to cure one commit earlier: a
+# test coupled to one machine's directory layout. The module object knows
+# where it lives; nothing else has to.
+import cortex_utils.triage_config.importer as _importer_module
+
+IMPORTER = Path(_importer_module.__file__)
+
+# The sibling postmark checkout genuinely only exists in the multi-repo tree,
+# so this one IS a guess -- and _migration_sql() returns None when it misses,
+# which the cross-repo tests below skip on. parents[1] is this repo's root
+# whatever it is called.
+MIGRATIONS = Path(__file__).resolve().parents[1].parent / "postmark" / "migrations"
 
 
 def _importer_sql() -> str:
