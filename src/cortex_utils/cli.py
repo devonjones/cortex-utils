@@ -819,7 +819,12 @@ def backfill() -> None:
     help=f"Gateway base URL (or set ${bw.GATEWAY_ENV}). No default: this repo is "
     "public and must not carry homelab addresses.",
 )
-@click.option("--months", default=1, help="Window size per run, in months")
+@click.option(
+    "--months",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Window size per run, in months",
+)
 @click.option(
     "--seed",
     type=click.DateTime(["%Y-%m-%d"]),

@@ -56,6 +56,47 @@ def _importer_sql() -> str:
     )
 
 
+def _migration_files() -> list[Path] | None:
+    """The migration files in apply order, or None when not checked out."""
+    if not MIGRATIONS.is_dir():
+        return None
+    return sorted(MIGRATIONS.glob("*.sql"))
+
+
+def _index_is_dropped_after_being_established(name: str) -> bool:
+    """True if a later migration drops `name` without re-establishing it.
+
+    Concatenating every migration and searching the text is ORDER-FREE, so a
+    future `DROP INDEX idx_email_mappings_active` in migration 005 leaves this
+    file's assertions green with the arbiter gone -- cortex-apd6 recurring one
+    migration later, in the tests written to prevent it. Position matters.
+    """
+    files = _migration_files()
+    if files is None:
+        return False
+
+    establishes = re.compile(
+        rf"(CREATE\s+UNIQUE\s+INDEX(\s+CONCURRENTLY)?(\s+IF\s+NOT\s+EXISTS)?"
+        rf"\s+{re.escape(name)}\b|RENAME\s+TO\s+{re.escape(name)}\b)",
+        re.IGNORECASE,
+    )
+    drops = re.compile(
+        rf"DROP\s+INDEX(\s+CONCURRENTLY)?(\s+IF\s+EXISTS)?\s+"
+        rf"(\w+\.)?{re.escape(name)}\b",
+        re.IGNORECASE,
+    )
+
+    live = False
+    for path in files:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            code = re.sub(r"--.*$", "", line)
+            if establishes.search(code):
+                live = True
+            elif drops.search(code):
+                live = False
+    return not live
+
+
 def _migration_sql() -> str | None:
     """Sibling postmark migrations, or None when they aren't checked out.
 
@@ -214,13 +255,26 @@ def test_the_migrations_create_the_arbiter_under_the_expected_name() -> None:
         re.IGNORECASE,
     ), f"no migration creates or renames an index to {EXPECTED_INDEX}"
 
-    columns = r"\s*,\s*".join(re.escape(c) for c in EXPECTED_COLUMNS)
-    assert re.search(
-        rf"CREATE\s+UNIQUE\s+INDEX(\s+IF\s+NOT\s+EXISTS)?\s+{re.escape(EXPECTED_INDEX)}\b"
-        rf"[^;]*?\(\s*{columns}\s*\)[^;]*?WHERE\s+{re.escape(EXPECTED_PREDICATE)}",
-        migrations,
-        re.IGNORECASE | re.DOTALL,
-    ), (
-        f"{EXPECTED_INDEX} exists in the migrations but not with the shape the "
-        f"importer infers: ({', '.join(EXPECTED_COLUMNS)}) WHERE {EXPECTED_PREDICATE}"
+    assert not _index_is_dropped_after_being_established(EXPECTED_INDEX), (
+        f"a migration DROPs {EXPECTED_INDEX} after it is established and never "
+        "re-creates it. The upsert arbiter would not exist at runtime, and the "
+        "text-search assertions in this file would still pass -- cortex-apd6, "
+        "one migration later."
     )
+
+    # NOT a combined name-and-shape regex. Migration 003 creates this index
+    # under its PRE-RENAME name (idx_email_mappings_unique_active) and renames
+    # it afterwards, so requiring the CREATE to carry the final name means only
+    # 004's idempotent re-create can ever satisfy it. Removing 004's re-create
+    # as redundant would then fail this with "exists but not with the shape the
+    # importer infers" -- which would be false, and would send the next person
+    # looking for a schema problem that isn't there.
+    #
+    # The two properties are checked separately and honestly:
+    #   * this name is established and not later dropped -- asserted above
+    #   * SOME migration creates the right shape on this table -- asserted by
+    #     test_migrations_still_define_that_partial_index, which matches 003's
+    #     CREATE under either name
+    # and the shape the upsert actually infers is pinned against importer.py
+    # by test_upsert_arbiter_matches_the_vendored_index_shape, which needs no
+    # checkout and runs in CI.

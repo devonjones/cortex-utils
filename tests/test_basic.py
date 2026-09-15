@@ -306,6 +306,7 @@ def test_python_m_exposes_every_command_group() -> None:
     Asserting the group is reachable, not merely listed: `--help` on the leaf
     is what proves the registration actually completed.
     """
+    import re
     import subprocess
     import sys
 
@@ -322,7 +323,14 @@ def test_python_m_exposes_every_command_group() -> None:
         text=True,
     )
     assert listed.returncode == 0, listed.stderr
-    missing = sorted(name for name in _main.commands if name not in listed.stdout)
+    # Anchor on the listing ROW, not a bare substring. `queue` is a real
+    # command today and also appears inside `migrate-queue` and
+    # `drop-old-queue`, so a substring test vouches for it without it being
+    # registered. Round 6 review proved it: a group named `operations`
+    # stranded below the __main__ block stayed green, because `queue
+    # Queue operations.` contains the word.
+    rows = re.findall(r"^\s{2,}([\w-]+)\s{2,}", listed.stdout, re.MULTILINE)
+    missing = sorted(name for name in _main.commands if name not in rows)
     assert not missing, (
         f"registered but not reachable via `python -m`: {missing}. A command "
         "is defined after main() is invoked."

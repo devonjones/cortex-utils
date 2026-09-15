@@ -348,9 +348,13 @@ def test_a_pending_job_blocks_the_walk_not_just_a_running_one() -> None:
 
     recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     msg = _walk_with_jobs([{"id": "p1", "status": "pending", "created_at": recent}])
+    # _posted first: it is the thing that matters, and asserting it after
+    # startswith("skip:") makes it unreachable-when-failing -- any mutant that
+    # queues trips the string check first, so the _posted line never runs and
+    # is not coverage. Round 6 review flagged it as decoration.
+    assert _posted == [], f"nothing may be queued while a job is in flight: {_posted}"
     assert msg.startswith("skip:"), "a pending job must stop the walker queueing another"
     assert "pending" in msg
-    assert _posted == [], "nothing may be queued while a job is in flight"
 
 
 def test_a_wedged_pending_job_raises_like_a_wedged_running_one() -> None:
@@ -389,3 +393,194 @@ def test_the_window_is_clamped_to_the_floor_never_crossing_it() -> None:
     jobs = [_job("2002-01-15", "2002-02-15")]
     msg = _walk_with_jobs(jobs, floor=floor, dry_run=True)
     assert "'after': '2002-01-01'" in msg, f"window must clamp to the floor, got {msg!r}"
+
+
+# --- CLI option pass-through: the round 6 finding ----------------------------
+#
+# The options were parsed and never asserted on, so the wiring between click
+# and walk() was free. Two mutations left all 425 tests green:
+#
+#   * dry_run=dry_run -> dry_run=True, which means the nightly walker can
+#     never queue anything, ever, while logging "would queue ..." and exiting
+#     0 -- indistinguishable from a healthy run in the ofelia log.
+#   * seed and floor swapped, which walks the wrong direction entirely.
+#
+# test_dead_letter.py:444 already makes this exact point: asserting only on
+# --help passes while the value is parsed and dropped.
+
+
+def test_cli_options_reach_walk_unswapped() -> None:
+    from click.testing import CliRunner
+
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.cli import main
+
+    captured: dict[str, object] = {}
+
+    def fake_walk(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "dry-run: captured"
+
+    original = bw.walk
+    bw.walk = fake_walk  # type: ignore[assignment]
+    try:
+        result = CliRunner().invoke(
+            main,
+            [
+                "backfill",
+                "walk",
+                "--gateway",
+                "http://gw.example",
+                "--months",
+                "3",
+                "--seed",
+                "2025-06-01",
+                "--floor",
+                "2003-04-05",
+                "--overlap-days",
+                "2",
+                "--stale-after-hours",
+                "7",
+            ],
+        )
+    finally:
+        bw.walk = original  # type: ignore[assignment]
+
+    assert result.exit_code == 0, result.output
+    assert captured["gateway"] == "http://gw.example"
+    assert captured["months"] == 3
+    assert captured["seed"] == date(2025, 6, 1), "seed and floor must not be swapped"
+    assert captured["floor"] == date(2003, 4, 5)
+    assert captured["overlap_days"] == 2
+    assert captured["stale_after_hours"] == 7
+    assert captured["dry_run"] is False, (
+        "the nightly walker must be able to queue: a hardcoded dry_run=True "
+        "logs 'would queue ...' and exits 0 forever, looking healthy"
+    )
+
+
+def test_cli_dry_run_flag_is_honoured() -> None:
+    from click.testing import CliRunner
+
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.cli import main
+
+    captured: dict[str, object] = {}
+
+    def fake_walk(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "dry-run: captured"
+
+    original = bw.walk
+    bw.walk = fake_walk  # type: ignore[assignment]
+    try:
+        result = CliRunner().invoke(
+            main, ["backfill", "walk", "--gateway", "http://gw.example", "--dry-run"]
+        )
+    finally:
+        bw.walk = original  # type: ignore[assignment]
+
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is True
+
+
+def test_cli_defaults_match_the_walker_defaults() -> None:
+    """Omitted options must land on the module's defaults, not click's Nones."""
+    from click.testing import CliRunner
+
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.cli import main
+
+    captured: dict[str, object] = {}
+
+    def fake_walk(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "ok"
+
+    original = bw.walk
+    bw.walk = fake_walk  # type: ignore[assignment]
+    try:
+        result = CliRunner().invoke(main, ["backfill", "walk", "--gateway", "http://gw"])
+    finally:
+        bw.walk = original  # type: ignore[assignment]
+
+    assert result.exit_code == 0, result.output
+    assert captured["seed"] == bw.DEFAULT_SEED
+    assert captured["floor"] == bw.DEFAULT_FLOOR
+
+
+def test_months_must_be_at_least_one() -> None:
+    """--months 0 pins the watermark; --months -1 raises out of month_before.
+
+    A zero-month window queues a 1-day window nightly forever with the
+    watermark never moving -- the floor bug reachable through a flag. A
+    negative one escapes as ValueError('month must be in 1..12') from
+    month_before, past cli.py's RuntimeError handler.
+    """
+    from click.testing import CliRunner
+
+    import cortex_utils.backfill_walker as bw
+    from cortex_utils.cli import main
+
+    # Stub walk(), or these pass for the wrong reason: an unstubbed run fails
+    # on the network before validation is ever reached, so exit_code != 0
+    # proves nothing about --months.
+    original = bw.walk
+    bw.walk = lambda **kw: "ok"  # type: ignore[assignment]
+    try:
+        for bad in ("0", "-1"):
+            result = CliRunner().invoke(
+                main, ["backfill", "walk", "--gateway", "http://gw", "--months", bad]
+            )
+            assert result.exit_code != 0, f"--months {bad} must be rejected"
+            assert "months" in result.output.lower(), (
+                f"--months {bad} must be rejected BY VALIDATION, not incidentally: "
+                f"{result.output!r}"
+            )
+        ok = CliRunner().invoke(
+            main, ["backfill", "walk", "--gateway", "http://gw", "--months", "1"]
+        )
+        assert ok.exit_code == 0, ok.output
+    finally:
+        bw.walk = original  # type: ignore[assignment]
+
+
+def test_a_malformed_gateway_payload_raises_runtimeerror_not_a_traceback() -> None:
+    """walk() promises string-or-RuntimeError; cli.py catches only that.
+
+    The gateway's payload is untrusted shape. A non-dict entry or an
+    unreadable after_date would otherwise escape as AttributeError/ValueError
+    -- an unhandled traceback out of a nightly cron job, which says far less
+    than a RuntimeError naming what arrived.
+    """
+    import pytest
+
+    with pytest.raises(RuntimeError, match="expected an object"):
+        _walk_with_jobs(["not-a-dict"])  # type: ignore[list-item]
+
+    with pytest.raises(RuntimeError, match="unreadable after_date"):
+        _walk_with_jobs(
+            [
+                {
+                    "id": "j9",
+                    "status": "completed",
+                    "after_date": "not-a-date",
+                    "before_date": "2025-01-01",
+                }
+            ]
+        )
+
+
+def test_a_non_iso_after_date_does_not_silently_seed_the_watermark() -> None:
+    """Refusing beats guessing: this value decides which month is ingested."""
+    import pytest
+
+    from cortex_utils.backfill_walker import current_watermark
+
+    with pytest.raises(RuntimeError, match="unreadable after_date"):
+        current_watermark(
+            # NOT an int like 20241201: date.fromisoformat accepts the basic
+            # "YYYYMMDD" form, so that parses fine. A list is unambiguous.
+            [{"id": "j1", "status": "completed", "after_date": ["2024-12-01"], "before_date": "x"}],
+            date(2025, 1, 1),
+        )

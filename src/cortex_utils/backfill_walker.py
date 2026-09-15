@@ -80,12 +80,33 @@ def current_watermark(jobs: list[dict[str, Any]], seed: date) -> date:
       watermark past a month that was never fetched -- silently, and
       permanently, since nothing ever revisits it. Excluding them means the
       next run retries that window, which is the behaviour we want.
+
+    Everything the gateway sends is treated as untrusted shape. This runs
+    nightly under ofelia with nobody watching, and `walk()` documents
+    string-or-RuntimeError, which is all `cli.py` catches: a job that is not a
+    dict, or an `after_date` that is not an ISO date, would otherwise escape as
+    AttributeError or ValueError -- an unhandled traceback out of a cron job,
+    which is a worse failure than a loud RuntimeError saying what arrived.
     """
-    windowed = [
-        date.fromisoformat(j["after_date"])
-        for j in jobs
-        if j.get("after_date") and j.get("before_date") and j.get("status") == "completed"
-    ]
+    windowed = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            raise RuntimeError(
+                f"unexpected entry in the gateway's job list: expected an "
+                f"object, got {type(job).__name__} ({job!r:.60})"
+            )
+        if not (job.get("after_date") and job.get("before_date")):
+            continue
+        if job.get("status") != "completed":
+            continue
+        try:
+            windowed.append(date.fromisoformat(str(job["after_date"])))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"backfill job {job.get('id', 'unknown')} has an unreadable "
+                f"after_date ({job['after_date']!r}): refusing to guess the "
+                f"watermark, which decides which month is ingested next"
+            ) from exc
     return min(windowed) if windowed else seed
 
 
@@ -150,6 +171,17 @@ def walk(
             f"unexpected response from {gateway}/sync/backfill: "
             f"expected a 'jobs' list, got {type(jobs).__name__}"
         )
+
+    # Validate shape BEFORE touching any entry. The busy filter below is the
+    # first thing that reads a job, so a non-dict entry escapes here as
+    # AttributeError -- ahead of current_watermark's identical guard, and past
+    # cli.py, which catches only RuntimeError.
+    for entry in jobs:
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f"unexpected entry in the gateway's job list: expected an "
+                f"object, got {type(entry).__name__} ({entry!r:.60})"
+            )
 
     # One at a time. Gmail backfill is slow and shares workers with live mail;
     # a pile-up would starve incoming.
