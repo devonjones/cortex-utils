@@ -291,3 +291,56 @@ def test_the_conftest_fixture_restores_a_configuration_it_found() -> None:
         assert "restored" in sink.getvalue()
     finally:
         structlog.reset_defaults()
+
+
+def test_python_m_exposes_every_command_group() -> None:
+    """`python -m cortex_utils.cli` must dispatch the same commands as the
+    console script.
+
+    Round 4 review: the `backfill` group was defined BELOW
+    `if __name__ == "__main__": main()`, so running the module dispatched
+    against a half-built group -- `backfill walk` reported "No such command"
+    while `cortex-utils backfill walk` worked. The ofelia job uses the console
+    script, so the divergence was invisible from the deployment.
+
+    Asserting the group is reachable, not merely listed: `--help` on the leaf
+    is what proves the registration actually completed.
+    """
+    import re
+    import subprocess
+    import sys
+
+    # Enumerate, don't spot-check. Naming one group only proves that group is
+    # registered: the next command appended below the __main__ block -- the
+    # natural place to add one -- would reproduce the bug with this test still
+    # green. Importing the module runs every decorator, so main.commands is
+    # the full set; `python -m` must expose all of it.
+    from cortex_utils.cli import main as _main
+
+    listed = subprocess.run(
+        [sys.executable, "-m", "cortex_utils.cli", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert listed.returncode == 0, listed.stderr
+    # Anchor on the listing ROW, not a bare substring. `queue` is a real
+    # command today and also appears inside `migrate-queue` and
+    # `drop-old-queue`, so a substring test vouches for it without it being
+    # registered. Round 6 review proved it: a group named `operations`
+    # stranded below the __main__ block stayed green, because `queue
+    # Queue operations.` contains the word.
+    rows = re.findall(r"^\s{2,}([\w-]+)\s{2,}", listed.stdout, re.MULTILINE)
+    missing = sorted(name for name in _main.commands if name not in rows)
+    assert not missing, (
+        f"registered but not reachable via `python -m`: {missing}. A command "
+        "is defined after main() is invoked."
+    )
+    assert "backfill" in _main.commands, "backfill group vanished from the CLI entirely"
+
+    leaf = subprocess.run(
+        [sys.executable, "-m", "cortex_utils.cli", "backfill", "walk", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert leaf.returncode == 0, f"backfill walk --help failed: {leaf.stderr}"
+    assert "--gateway" in leaf.stdout

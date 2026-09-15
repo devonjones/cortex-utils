@@ -9,13 +9,14 @@ Usage:
 
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import click
 import psycopg2
 import structlog
 
+from cortex_utils import backfill_walker as bw
 from cortex_utils.alerter import AlerterDaemon, DiscordClient, run_alerter
 from cortex_utils.config import Config
 from cortex_utils.health.watchdog import Watchdog, parse_peers
@@ -801,5 +802,89 @@ def parse_duration(s: str) -> timedelta:
         raise ValueError(f"Invalid duration format: {s}. Use e.g., 24h, 7d, 30m")
 
 
+# --- Backfill Commands ---
+
+
+@main.group()
+def backfill() -> None:
+    """Historical Gmail ingest."""
+    pass
+
+
+@backfill.command("walk")
+@click.option(
+    "--gateway",
+    envvar=bw.GATEWAY_ENV,
+    required=True,
+    help=f"Gateway base URL (or set ${bw.GATEWAY_ENV}). No default: this repo is "
+    "public and must not carry homelab addresses.",
+)
+@click.option(
+    "--months",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Window size per run, in months",
+)
+@click.option(
+    "--seed",
+    type=click.DateTime(["%Y-%m-%d"]),
+    default=None,
+    help="Watermark to start from when no windowed job exists",
+)
+@click.option(
+    "--floor",
+    type=click.DateTime(["%Y-%m-%d"]),
+    default=None,
+    help="Stop once the watermark reaches this date",
+)
+@click.option(
+    "--overlap-days",
+    default=1,
+    help="Extend each window past the seam into already-ingested days. Cheap "
+    "(existing messages skip all downstream work) and re-syncs their labels.",
+)
+@click.option(
+    "--stale-after-hours",
+    default=24,
+    help="Raise if an in-flight job has been running longer than this. Keep it "
+    "comfortably above any clock skew between this host and the database.",
+)
+@click.option("--dry-run", is_flag=True, help="Show the window without queueing")
+def backfill_walk(
+    gateway: str,
+    months: int,
+    seed: datetime | None,
+    floor: datetime | None,
+    overlap_days: int,
+    stale_after_hours: int,
+    dry_run: bool,
+) -> None:
+    """Queue one month-window of historical ingest, walking backwards.
+
+    Intended to run nightly. Queues at most one job per run and skips entirely
+    while a previous one is still pending or running, so it cannot pile up
+    behind a slow Gmail backfill or starve the live queue.
+    """
+    try:
+        click.echo(
+            bw.walk(
+                gateway=gateway,
+                months=months,
+                seed=seed.date() if seed else bw.DEFAULT_SEED,
+                floor=floor.date() if floor else bw.DEFAULT_FLOOR,
+                overlap_days=overlap_days,
+                stale_after_hours=stale_after_hours,
+                dry_run=dry_run,
+            )
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+
+# Must stay LAST. Everything above registers commands on `main`; running it
+# from the middle of the file means `python -m cortex_utils.cli` dispatches
+# against a half-built group and reports "No such command 'backfill'", while
+# the console entry point -- which imports the module fully, then calls main()
+# -- works. The two diverge silently, which is how this shipped.
 if __name__ == "__main__":
     main()

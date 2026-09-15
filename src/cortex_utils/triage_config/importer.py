@@ -450,6 +450,17 @@ def import_yaml_to_db(
 
         # 6. UPSERT email mappings to global table (not versioned)
         # Note: Re-enqueue logic handled by API endpoints, not here
+        #
+        # The arbiter is the PARTIAL unique index idx_email_mappings_active
+        # (mapping_type, email_address) WHERE deleted_at IS NULL, created by
+        # migration 003. It must be inferred by column list + predicate, not
+        # named: this table has no named unique constraint.
+        #
+        # This previously said `ON CONFLICT ON CONSTRAINT unique_email_mapping`,
+        # a constraint that migration 002 created on the OLD (config-versioned,
+        # 3-column) table and that migration 003 explicitly drops. No migration
+        # creates it on the current table, so the upsert only worked against a
+        # production DB where someone had hand-added it. See cortex-apd6.
         upsert_sql = """
             INSERT INTO triage_email_mappings (
                 mapping_type,
@@ -461,7 +472,7 @@ def import_yaml_to_db(
                 created_at,
                 updated_at
             ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-            ON CONFLICT ON CONSTRAINT unique_email_mapping
+            ON CONFLICT (mapping_type, email_address) WHERE deleted_at IS NULL
             DO UPDATE SET
                 label = EXCLUDED.label,
                 archive = EXCLUDED.archive,
