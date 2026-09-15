@@ -842,6 +842,12 @@ def backfill() -> None:
     help="Extend each window past the seam into already-ingested days. Cheap "
     "(existing messages skip all downstream work) and re-syncs their labels.",
 )
+@click.option(
+    "--stale-after-hours",
+    default=24,
+    help="Raise if an in-flight job has been running longer than this. Keep it "
+    "comfortably above any clock skew between this host and the database.",
+)
 @click.option("--dry-run", is_flag=True, help="Show the window without queueing")
 def backfill_walk(
     gateway: str,
@@ -849,6 +855,7 @@ def backfill_walk(
     seed: datetime | None,
     floor: datetime | None,
     overlap_days: int,
+    stale_after_hours: int,
     dry_run: bool,
 ) -> None:
     """Queue one month-window of historical ingest, walking backwards.
@@ -865,6 +872,7 @@ def backfill_walk(
                 seed=seed.date() if seed else bw.DEFAULT_SEED,
                 floor=floor.date() if floor else bw.DEFAULT_FLOOR,
                 overlap_days=overlap_days,
+                stale_after_hours=stale_after_hours,
                 dry_run=dry_run,
             )
         )

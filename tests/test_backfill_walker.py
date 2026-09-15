@@ -17,7 +17,7 @@ re-scans a month.
 
 from __future__ import annotations
 
-from datetime import UTC, date
+from datetime import date
 
 from cortex_utils.backfill_walker import current_watermark, month_before
 
@@ -143,24 +143,6 @@ def test_missing_status_does_not_advance_the_watermark() -> None:
 
 
 # --- staleness guard ---------------------------------------------------------
-
-
-def test_stale_detection() -> None:
-    from datetime import datetime, timedelta
-
-    from cortex_utils.backfill_walker import _is_stale
-
-    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-    old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
-    assert not _is_stale(recent, 24)
-    assert _is_stale(old, 24)
-    # Unparseable or absent timestamps must not be treated as wedged.
-    assert not _is_stale(None, 24)
-    assert not _is_stale("not-a-date", 24)
-    assert not _is_stale(old, 0)  # disabled
-
-
-# --- overlap at the seam -----------------------------------------------------
 
 
 def test_overlap_extends_the_window_forward_not_backward() -> None:

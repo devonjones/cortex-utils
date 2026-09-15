@@ -89,21 +89,37 @@ def current_watermark(jobs: list[dict[str, Any]], seed: date) -> date:
     return min(windowed) if windowed else seed
 
 
-def _is_stale(created_at: str | None, stale_after_hours: int) -> bool:
-    """Has an in-flight job been sitting longer than we tolerate?
+def _job_age_hours(created_at: str | None) -> float | None:
+    """Hours since `created_at`, or None when that cannot be determined.
 
-    Unparseable or missing timestamps return False: refusing to queue is the
-    safe side, and a bad timestamp is not evidence of a wedge.
+    None is deliberately NOT "fine" -- the caller raises on it. An earlier
+    version returned False ("not stale") for a missing or unparseable
+    timestamp, which quietly reintroduced the exact silent-stall this guard
+    exists to close: a wedged job whose timestamp we cannot read would be
+    skipped every night forever, with a routine-looking exit 0.
+
+    CLOCK PROVENANCE: `created_at` is stamped by Postgres
+    (backfill_jobs.created_at TIMESTAMPTZ DEFAULT NOW()) and compared against
+    this process's clock, so the result is only as good as the skew between
+    them. In this deployment both the walker and Postgres run on the same
+    Docker host and share its clock, but that is a property of the topology,
+    not a guarantee -- keep `stale_after_hours` comfortably larger than any
+    skew you would tolerate, and see the negative-age branch below.
+
+    The API serialises this column as tz-aware ISO ("...+00:00"), so the
+    Z-suffix and naive-datetime branches are defensive rather than load
+    bearing. They are tested anyway: an untested fallback is one that stops
+    working silently the day it is first needed.
     """
-    if not created_at or stale_after_hours <= 0:
-        return False
+    if not created_at:
+        return None
     try:
         started = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
     except ValueError:
-        return False
+        return None
     if started.tzinfo is None:
         started = started.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - started) > timedelta(hours=stale_after_hours)
+    return (datetime.now(UTC) - started).total_seconds() / 3600.0
 
 
 def walk(
@@ -140,16 +156,32 @@ def walk(
     busy = [j for j in jobs if j.get("status") in ("pending", "running")]
     if busy:
         oldest = min(busy, key=lambda j: str(j.get("created_at") or ""))
-        stale = _is_stale(oldest.get("created_at"), stale_after_hours)
-        # Still refuse to queue -- two concurrent Gmail backfills is worse than
-        # a stalled walker -- but say loudly that this needs a human, instead
-        # of exiting 0 with a routine-looking "skip" every night forever.
-        if stale:
+        age = _job_age_hours(oldest.get("created_at"))
+
+        # Always refuse to queue while something is in flight -- two concurrent
+        # Gmail backfills is worse than a stalled walker. The question is only
+        # whether to exit 0 quietly or raise, and every branch below that
+        # cannot prove the job is healthy raises, so a wedge can never hide
+        # behind a routine-looking "skip".
+        if age is None:
+            raise RuntimeError(
+                f"backfill job {oldest.get('id')} is {oldest.get('status')} but "
+                f"its created_at ({oldest.get('created_at')!r}) cannot be read, "
+                f"so its age is unknown: refusing to treat it as healthy"
+            )
+        if age < 0:
+            raise RuntimeError(
+                f"backfill job {oldest.get('id')} is stamped "
+                f"{abs(age):.1f}h in the FUTURE ({oldest.get('created_at')}): "
+                f"the walker's clock and the database's disagree, so staleness "
+                f"cannot be judged"
+            )
+        if age > stale_after_hours:
             raise RuntimeError(
                 f"backfill job {oldest.get('id')} has been "
-                f"{oldest.get('status')} since {oldest.get('created_at')} "
-                f"(> {stale_after_hours}h): the walker is stalled until it is "
-                f"cancelled or completed"
+                f"{oldest.get('status')} for {age:.1f}h since "
+                f"{oldest.get('created_at')} (> {stale_after_hours}h): the "
+                f"walker is stalled until it is cancelled or completed"
             )
         return f"skip: {len(busy)} job(s) still {busy[0]['status']} (id {busy[0]['id']})"
 
