@@ -881,6 +881,100 @@ def backfill_walk(
         raise click.ClickException(str(e)) from e
 
 
+# --- Cortex introspection (Ollama tool-use) ---
+
+
+@main.group()
+def introspect() -> None:
+    """Ask a local model about one message, letting it query cortex."""
+    pass
+
+
+@introspect.command("instances")
+def introspect_instances() -> None:
+    """List the cortex instances configured in this environment."""
+    from cortex_utils.introspect import known_instance_names, resolve
+
+    names = known_instance_names()
+    if not names:
+        raise click.ClickException(
+            "no instances configured. Set CORTEX_INSTANCE_<NAME>_URL "
+            "(and _TOKEN where the gateway requires one)."
+        )
+    for name in names:
+        inst = resolve(name)
+        click.echo(f"{inst.name}\t{inst.base_url}\ttoken={'yes' if inst.has_token else 'no'}")
+
+
+@introspect.command("ask")
+@click.option("--instance", required=True, help="Which cortex. Never inferred, never defaulted.")
+@click.option("--gmail-id", required=True, help="The one message the model may ask about.")
+@click.option(
+    "--model", default="qwen2.5:7b", show_default=True, help="Ollama model (must support tools)."
+)
+@click.option(
+    "--ollama-url",
+    envvar="OLLAMA_URL",
+    required=True,
+    help="Ollama base URL (or set $OLLAMA_URL). No default: this repo is public.",
+)
+@click.option("--max-tool-calls", type=click.IntRange(min=1), default=8, show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Emit the full result as JSON.")
+@click.option("-v", "--verbose", is_flag=True, help="Show each tool call as it happens.")
+@click.argument("question")
+def introspect_ask(
+    instance: str,
+    gmail_id: str,
+    model: str,
+    ollama_url: str,
+    max_tool_calls: int,
+    as_json: bool,
+    verbose: bool,
+    question: str,
+) -> None:
+    """Ask QUESTION about one message, with cortex lookups available to the model.
+
+    The instance and the message are bound here, by us. The model chooses which
+    tool to call, never what it points at -- see docs/agent-isolation.md.
+    """
+    import json as _json
+
+    from cortex_utils.introspect import CortexClient, CortexReadError, CortexTools, ask, resolve
+
+    try:
+        inst = resolve(instance)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+    tools = CortexTools(CortexClient(inst), gmail_id)
+    if verbose:
+        click.echo(
+            f"instance={inst.name} url={inst.base_url} token={'yes' if inst.has_token else 'no'}"
+        )
+
+    try:
+        result = ask(
+            tools,
+            question,
+            ollama_url=ollama_url,
+            model=model,
+            max_tool_calls=max_tool_calls,
+            verbose=verbose,
+        )
+    except (CortexReadError, RuntimeError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
+
+    if as_json:
+        click.echo(_json.dumps(result, indent=2, default=str))
+        return
+    if result.get("error"):
+        raise click.ClickException(result["error"])
+    click.echo(result["answer"])
+    if result["tool_calls"]:
+        used = ", ".join(c["tool"] for c in result["tool_calls"])
+        click.echo(f"\n[looked up: {used}]", err=True)
+
+
 # Must stay LAST. Everything above registers commands on `main`; running it
 # from the middle of the file means `python -m cortex_utils.cli` dispatches
 # against a half-built group and reports "No such command 'backfill'", while
