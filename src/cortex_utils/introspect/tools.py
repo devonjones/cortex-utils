@@ -55,13 +55,26 @@ class CortexTools:
 
     def _msg(self) -> dict[str, Any]:
         if self._message is None:
-            self._message = self._client.get(f"/emails/{self._gmail_id}")
+            # quote() here too. gmail_id is bound by Python rather than the
+            # model, so it is not the same exposure as the From: header -- but
+            # it is the same SHAPE, and the argument for the other site was
+            # that inexpressibility beats trusting the source.
+            self._message = self._client.get(f"/emails/{quote(self._gmail_id, safe='')}")
         return self._message
 
     def _sender(self) -> str:
         sender = (self._msg() or {}).get("from_addr") or ""
         if not sender:
             raise CortexReadError(f"message {self._gmail_id} has no from_addr to look up")
+        try:
+            # Surface a lone surrogate HERE as one failed tool result, rather
+            # than letting quote() raise UnicodeEncodeError out of ask() and
+            # kill the whole question. JSON can carry one, so mail can.
+            sender.encode("utf-8")
+        except UnicodeEncodeError as e:
+            raise CortexReadError(
+                f"message {self._gmail_id} has an unencodable from_addr: {e}"
+            ) from e
         return sender
 
     def _known_labels(self) -> list[str]:
@@ -168,9 +181,12 @@ class CortexTools:
             raise ToolRefusalError(f"no such tool {name!r}; available: {', '.join(sorted(impl))}")
 
         args = dict(arguments or {})
-        # Record BEFORE executing. Appending after the call recorded only
-        # successes, and the budget test in session reads this as a count of
-        # attempts -- a refusal or an error still spent a request.
+        # Record BEFORE executing, so the count is of ATTEMPTS: appending
+        # after the call recorded only successes, and session's budget test
+        # reads this. Note an unknown tool name raises above this line and is
+        # therefore NOT counted -- correct, since nothing was requested of the
+        # gateway, but it does mean this is a count of dispatches reached, not
+        # of tool_calls the model emitted.
         self.calls.append({"tool": name, "arguments": args})
         if name == "label_sample":
             label = args.get("label")

@@ -55,6 +55,21 @@ def _chat(
         raise RuntimeError(f"cannot reach ollama at {ollama_url}: {e}") from e
 
 
+def _final_answer(ollama_url, model, messages, timeout, trace, tools_impl, budget=False):
+    """One last turn offering NO tools, so the caller gets an answer.
+
+    Re-offering tools with the budget spent just invites another call.
+    """
+    final = _chat(ollama_url, model, messages, [], timeout)
+    return {
+        "answer": ((final.get("message") or {}).get("content") or "").strip(),
+        "tool_calls": trace,
+        "instance": tools_impl._client.instance.name,
+        "gmail_id": tools_impl._gmail_id,
+        "budget_exhausted": budget,
+    }
+
+
 def ask(
     tools_impl: CortexTools,
     question: str,
@@ -80,14 +95,33 @@ def ask(
 
     while True:
         reply = _chat(ollama_url, model, messages, specs, timeout)
-        msg = reply.get("message") or {}
+        msg = reply.get("message")
+        if not isinstance(msg, dict):
+            # `message` absent or not an object. Without this, .get() raises
+            # AttributeError straight out of ask() and the CLI -- the same
+            # shape as the InvalidURL escape this PR already fixed once.
+            msg = {}
         raw_calls = msg.get("tool_calls") or []
+        if not isinstance(raw_calls, list):
+            # `tool_calls: 7` iterates to a TypeError otherwise.
+            raw_calls = []
         calls = [c for c in raw_calls if isinstance(c, dict)]
 
         if raw_calls and not calls:
             # It meant to call something; every entry was malformed. Returning
             # here would hand back that message's content, which is empty --
             # the caller gets nothing and no reason. Say so and let it retry.
+            #
+            # SPEND BUDGET FOR IT. Without this the branch is a free turn and a
+            # model that keeps emitting malformed calls loops forever: 501
+            # requests under a budget of 2, measured. The commit that made the
+            # budget count calls added this path directly above it and left it
+            # outside the accounting -- the fix's own blind spot.
+            spent += 1
+            if spent >= max_tool_calls:
+                return _final_answer(
+                    ollama_url, model, messages, timeout, trace, tools_impl, budget=True
+                )
             messages.append(msg)
             messages.append(
                 {
@@ -159,19 +193,37 @@ def ask(
             )
 
         if spent >= max_tool_calls:
-            # One final turn with the budget spent, so the model answers from
-            # what it already has rather than the caller getting nothing.
-            final = _chat(ollama_url, model, messages, [], timeout)
-            return {
-                "answer": ((final.get("message") or {}).get("content") or "").strip(),
-                "tool_calls": trace,
-                "instance": tools_impl._client.instance.name,
-                "gmail_id": tools_impl._gmail_id,
-                "budget_exhausted": True,
-            }
+            return _final_answer(
+                ollama_url, model, messages, timeout, trace, tools_impl, budget=True
+            )
 
 
-_CONTROL = {c: None for c in range(0x20) if c not in (0x09,)} | {0x7F: None}
+# C0, DEL, the C1 block, and the bidi overrides. The tab exemption that used
+# to live here was dead: str.split() eats tabs before translate() ever sees
+# them, so the docstring's promise that "tabs survive" was false. U+202E
+# (RIGHT-TO-LEFT OVERRIDE) is the one that matters beyond ANSI -- it reverses
+# displayed text, so a sender can make a label read backwards in a terminal.
+_CONTROL = (
+    {c: None for c in range(0x20)}
+    | {0x7F: None}
+    | {c: None for c in range(0x80, 0xA0)}
+    | {
+        c: None
+        for c in (
+            0x200E,
+            0x200F,
+            0x202A,
+            0x202B,
+            0x202C,
+            0x202D,
+            0x202E,
+            0x2066,
+            0x2067,
+            0x2068,
+            0x2069,
+        )
+    }
+)
 
 
 def flatten_for_terminal(text: str, limit: int = 4000) -> str:
@@ -185,9 +237,12 @@ def flatten_for_terminal(text: str, limit: int = 4000) -> str:
 
     An answer here IS a model's reasoning over a subject and body, so a
     subject carrying ANSI or a bare carriage return could overwrite the line
-    the operator just read. Tabs survive; everything below 0x20 does not.
+    the operator just read, and a bidi override could reverse it.
+
+    Accepts non-str: the callers pass model output, which is whatever came
+    back over JSON.
     """
-    if not text:
+    if text is None or text == "":
         return ""
     collapsed = " ".join(str(text).split())
     return collapsed.translate(_CONTROL)[:limit]

@@ -474,3 +474,155 @@ def test_an_unusable_url_is_a_cortex_read_error_not_a_traceback() -> None:
     client._opener = type("O", (), {"open": staticmethod(boom)})()
     with pytest.raises(CortexReadError, match="not a usable URL"):
         client.get("/emails/sender/a%20b@c.com/classifications")
+
+
+def test_a_model_emitting_only_malformed_tool_calls_terminates(monkeypatch) -> None:
+    """The branch that tells the model 'those were malformed' must spend budget.
+
+    It did not, so it was a free turn: a model that keeps emitting malformed
+    calls looped forever -- 501 requests under a budget of 2, measured. The
+    commit that made the budget count CALLS added this path directly above it
+    and left it outside the accounting.
+    """
+    from cortex_utils.introspect.session import ask
+
+    junk = {"tool_calls": ["not-a-dict", None, 7]}
+    calls = {"n": 0}
+
+    import cortex_utils.introspect.session as sess
+
+    def counting_chat(url, model, messages, tools, timeout):
+        calls["n"] += 1
+        assert calls["n"] < 50, f"loop did not terminate: {calls['n']} ollama calls"
+        if not tools:
+            return {"message": {"content": "forced"}}
+        return {"message": dict(junk)}
+
+    monkeypatch.setattr(sess, "_chat", counting_chat)
+    result = ask(_tools(), "q", ollama_url="http://o", model="m", max_tool_calls=2)
+    assert result["answer"] == "forced"
+    assert result.get("budget_exhausted") is True
+    assert calls["n"] <= 4, f"took {calls['n']} ollama calls for a budget of 2"
+
+
+def test_a_malformed_ollama_reply_does_not_crash(monkeypatch) -> None:
+    """`message` missing or not an object, and tool_calls not a list."""
+    import cortex_utils.introspect.session as sess
+    from cortex_utils.introspect.session import ask
+
+    for bad_reply in (
+        {},  # no message at all
+        {"message": "a string"},  # message not an object
+        {"message": 7},
+        {"message": {"tool_calls": 7}},  # tool_calls not a list
+        {"message": {"tool_calls": "abc"}},
+    ):
+        seq = [bad_reply, {"message": {"content": "recovered"}}]
+
+        def chat(url, model, messages, tools, timeout, _s=seq):
+            return _s.pop(0) if _s else {"message": {"content": "recovered"}}
+
+        monkeypatch.setattr(sess, "_chat", chat)
+        # must not raise
+        ask(_tools(), "q", ollama_url="http://o", model="m", max_tool_calls=2)
+
+
+# --- the redirect handler: round 2 found it had zero tests -------------------
+
+
+def _redirect_handler():
+    from cortex_utils.introspect.client import _NoCrossHostRedirect
+
+    return _NoCrossHostRedirect()
+
+
+@pytest.mark.parametrize(
+    "start,target,allowed",
+    [
+        ("https://gw:8097/config", "https://gw:8097/config/", True),
+        ("https://gw:8097/config", "/config/", True),
+        ("https://gw:8097/config", "https://evil.example/x", False),
+        ("https://gw:8097/config", "http://gw:8097/config", False),  # TLS downgrade
+        ("https://gw:8097/config", "https://gw:9999/config", False),  # other port
+        ("http://gw:8097/config", "http://other:8097/config", False),
+    ],
+)
+def test_redirects_leaving_the_origin_are_refused(start, target, allowed) -> None:
+    """Scheme AND host: comparing netloc alone let https->http walk the bearer
+    token out of TLS on the same host."""
+    import urllib.error
+    import urllib.request
+
+    h = _redirect_handler()
+    req = urllib.request.Request(start)
+    req.add_header("Authorization", "Bearer secret")
+
+    class Hdrs(dict):
+        def get_all(self, *a, **k):
+            return []
+
+    if allowed:
+        out = h.redirect_request(req, None, 302, "Found", Hdrs(), target)
+        assert out is None or out.full_url
+    else:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            h.redirect_request(req, None, 302, "Found", Hdrs(), target)
+        assert "Authorization header would go with it" in str(ei.value.reason)
+
+
+def test_the_probe_does_not_fail_open_when_a_redirect_is_refused() -> None:
+    """A probe that cannot complete has verified nothing."""
+    import urllib.error
+
+    client = CortexClient(Instance("personal", "https://gw", "tok"))
+
+    def refused(*a, **k):
+        raise urllib.error.HTTPError(
+            "https://evil/x", 302, "refusing to follow a redirect ...", {}, None
+        )
+
+    client._opener = type("O", (), {"open": staticmethod(refused)})()
+    with pytest.raises(CortexReadError, match="cannot verify gating"):
+        client.verify_instance()
+
+
+def test_flatten_strips_bidi_and_c1_not_just_ansi() -> None:
+    """U+202E reverses displayed text; the C1 block is control too.
+
+    The tab exemption this replaces was dead code: str.split() eats tabs
+    before translate() sees them, so the docstring's "tabs survive" was false.
+    """
+    from cortex_utils.introspect.session import flatten_for_terminal
+
+    assert "\u202e" not in flatten_for_terminal("safe\u202ederevnu")
+    assert "\u0085" not in flatten_for_terminal("a\u0085b")
+    assert "\u2066" not in flatten_for_terminal("a\u2066b")
+    assert "\u009b" not in flatten_for_terminal("a\u009bb")
+    # non-str input must not raise
+    assert flatten_for_terminal(None) == ""
+    assert flatten_for_terminal(12345) == "12345"
+    assert flatten_for_terminal(["a", "b"])
+
+
+def test_the_gmail_id_site_is_quoted_too() -> None:
+    """The sibling interpolation the first fix missed."""
+    c = FakeClient()
+    CortexTools(c, "../../config").dispatch("message_details", {})
+    first = c.paths[0]
+    assert first.split("/") == ["", "emails", first.split("/")[2]], (
+        f"gmail_id escaped its segment: {first!r}"
+    )
+
+
+def test_an_unencodable_sender_is_a_tool_error_not_a_crash() -> None:
+    """A lone surrogate would raise UnicodeEncodeError out of ask()."""
+
+    class SurrogateClient(FakeClient):
+        def get(self, path, params=None):
+            if path.startswith("/emails/") and path.count("/") == 2:
+                return dict(MESSAGE, from_addr="bad\udcffsender@example.com")
+            return super().get(path, params)
+
+    tools = CortexTools(SurrogateClient(), "abc123")
+    with pytest.raises(CortexReadError, match="unencodable from_addr"):
+        tools.dispatch("sender_history", {})

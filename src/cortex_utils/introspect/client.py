@@ -37,14 +37,29 @@ class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old_host = urllib.parse.urlsplit(req.full_url).netloc
-        new_host = urllib.parse.urlsplit(newurl).netloc
-        if new_host and new_host != old_host:
+        # Resolve first. CPython's http_error_302 urljoins before calling us,
+        # so in practice newurl is absolute -- but a handler that only works
+        # when its caller pre-normalises is one refactor from silently
+        # comparing "" against a real host and allowing everything.
+        newurl = urllib.parse.urljoin(req.full_url, newurl)
+        old_parts = urllib.parse.urlsplit(req.full_url)
+        new_parts = urllib.parse.urlsplit(newurl)
+
+        # Compare SCHEME as well as host. Comparing netloc alone allowed
+        # https -> http on the same host, which walks the bearer token out of
+        # TLS onto the wire -- a downgrade is a credential disclosure even
+        # though the host never changed.
+        old_origin = (old_parts.scheme, old_parts.netloc)
+        new_origin = (new_parts.scheme or old_parts.scheme, new_parts.netloc or old_parts.netloc)
+
+        if new_origin != old_origin:
             raise urllib.error.HTTPError(
                 newurl,
                 code,
-                f"refusing to follow a redirect off {old_host} to {new_host}: "
-                "the Authorization header would go with it",
+                f"refusing to follow a redirect off "
+                f"{old_origin[0]}://{old_origin[1]} to "
+                f"{new_origin[0]}://{new_origin[1]}: the Authorization header "
+                "would go with it",
                 headers,
                 fp,
             )
@@ -86,10 +101,23 @@ class CortexClient:
             with self._opener.open(req, timeout=self._timeout) as resp:
                 code = resp.status
         except urllib.error.HTTPError as e:
-            return None if e.code in (401, 403) else None
-        except (urllib.error.URLError, OSError, http.client.InvalidURL):
+            if 300 <= e.code < 400:
+                # Our own redirect handler refused this. Do NOT swallow it:
+                # a probe that cannot complete has verified nothing, and
+                # returning here would fail OPEN on exactly the case the
+                # handler exists to catch.
+                raise CortexReadError(
+                    f"{self._instance.name}: cannot verify gating -- {e.reason}"
+                ) from e
+            # 401/403 is the expected, correct answer: the gateway IS gated.
+            # Any other status (404, 5xx) says nothing either way about
+            # gating, so it is not this check's business to judge.
             return
-        if code == 200:
+        except (urllib.error.URLError, OSError, http.client.InvalidURL):
+            # Unreachable or unusable: a real read will surface that with a
+            # better message than a probe can.
+            return
+        if 200 <= code < 300:
             raise CortexReadError(
                 f"{self._instance.name}: a token is configured, but "
                 f"{self._instance.base_url}{probe_path} answers WITHOUT one. "
