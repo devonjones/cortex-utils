@@ -730,3 +730,86 @@ def test_the_gating_probe_sends_no_credential() -> None:
         f"the probe sent a credential: {list(headers)}"
     )
     assert "super-secret" not in str(headers)
+
+
+def test_no_redirect_actually_refuses_every_redirect() -> None:
+    """Pin the BODY, not just the installation.
+
+    Round 3 fixed "handler installed but its logic untested" for
+    _NoCrossHostRedirect; this is the exact inverse, introduced by that same
+    commit. Emptying _NoRedirect's body leaves the whole suite green, because
+    test_the_client_actually_installs_the_redirect_handler only checks the
+    class is present. Against a real server that mutant reproduces the round 3
+    P2: a correctly gated gateway reported as ungated.
+    """
+    import urllib.request
+
+    from cortex_utils.introspect.client import _NoRedirect
+
+    h = _NoRedirect()
+
+    class Hdrs(dict):
+        def get_all(self, *a, **k):
+            return []
+
+    req = urllib.request.Request("https://gw:8097/config")
+    for code in (301, 302, 303, 307, 308):
+        for target in (
+            "https://gw:8097/config/",  # same origin
+            "/config/",  # relative
+            "https://evil.example/x",  # cross host
+            "//evil.example/x",  # protocol relative
+        ):
+            assert h.redirect_request(req, None, code, "m", Hdrs(), target) is None, (
+                f"_NoRedirect followed a {code} to {target!r}; the probe must "
+                "never follow a redirect, or a gated gateway that redirects to "
+                "a login page is reported as ungated"
+            )
+
+
+def test_the_probe_tests_actually_reach_their_stub() -> None:
+    """Guard against the probe tests passing vacuously.
+
+    Those tests assert over state a stub populates. If the stub is never
+    reached -- a rename, a refactor that stops calling the probe -- the
+    assertions are trivially true and observe nothing.
+    """
+    reached = {"n": 0}
+
+    class Counting:
+        @staticmethod
+        def open(req, timeout=None):
+            reached["n"] += 1
+            import urllib.error
+
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    client = CortexClient(Instance("personal", "https://gw", "tok"))
+    client._probe_opener = Counting()
+    client.verify_instance()
+    assert reached["n"] == 1, (
+        f"verify_instance made {reached['n']} probe requests; the probe tests "
+        "assert over a stub that must actually be called"
+    )
+
+
+def test_url_construction_failures_are_read_errors_not_tracebacks() -> None:
+    """Pin the try-hoist.
+
+    urlencode raises on a lone surrogate, which a gateway-supplied label can
+    carry. Built outside the try, that escaped get() as a raw traceback.
+    Hoisting it back out leaves the suite green without this.
+    """
+    client = CortexClient(Instance("personal", "https://gw", "tok"))
+
+    # Stub the opener so this cannot pass on an unrelated failure. Without it,
+    # raises(CortexReadError) asserts only "something went wrong" -- and get()
+    # funnels URLError/OSError/ValueError into CortexReadError, so it passed on
+    # a DNS lookup for host "gw" rather than on the surrogate. It was also one
+    # search-domain wildcard away from opening a real TCP connection.
+    def unreachable(*a, **k):
+        pytest.fail("get() reached the opener; the surrogate must fail during URL construction")
+
+    client._opener = type("O", (), {"open": staticmethod(unreachable)})()
+    with pytest.raises(CortexReadError, match="surrogates not allowed"):
+        client.get("/emails/", {"label": "bad\udcfflabel"})
