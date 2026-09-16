@@ -160,15 +160,9 @@ def test_a_401_names_the_instance_and_suggests_the_right_cause() -> None:
     def boom(*a, **k):
         raise urllib.error.HTTPError("http://gw/x", 401, "Unauthorized", {}, None)
 
-    import urllib.request
-
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = boom  # type: ignore[assignment]
-    try:
-        with pytest.raises(CortexReadError, match="other deployment"):
-            client.get("/emails/")
-    finally:
-        urllib.request.urlopen = orig  # type: ignore[assignment]
+    client._opener = type("O", (), {"open": staticmethod(boom)})()
+    with pytest.raises(CortexReadError, match="other deployment"):
+        client.get("/emails/")
 
 
 def test_the_client_cannot_be_pointed_off_its_instance() -> None:
@@ -408,7 +402,6 @@ def test_a_gated_instance_pointed_at_an_ungated_gateway_is_refused() -> None:
     the work gateway would read work mail while every log line said
     "personal" -- the exact cross-contamination this module is shaped around.
     """
-    import urllib.request
 
     client = CortexClient(Instance("personal", "http://actually-work", "a-token"))
 
@@ -421,26 +414,18 @@ def test_a_gated_instance_pointed_at_an_ungated_gateway_is_refused() -> None:
         def __exit__(self, *a):
             return False
 
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = lambda *a, **k: Resp()  # type: ignore[assignment]
-    try:
-        with pytest.raises(CortexReadError, match="answers WITHOUT one"):
-            client.verify_instance()
-    finally:
-        urllib.request.urlopen = orig  # type: ignore[assignment]
+    client._opener = type("O", (), {"open": staticmethod(lambda *a, **k: Resp())})()
+    with pytest.raises(CortexReadError, match="answers WITHOUT one"):
+        client.verify_instance()
 
 
 def test_an_ungated_instance_is_not_probed() -> None:
     """Work has no token today; that is configuration, not an error."""
-    import urllib.request
 
     called = []
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = lambda *a, **k: called.append(1)  # type: ignore[assignment]
-    try:
-        CortexClient(Instance("work", "http://work", None)).verify_instance()
-    finally:
-        urllib.request.urlopen = orig  # type: ignore[assignment]
+    c = CortexClient(Instance("work", "http://work", None))
+    c._opener = type("O", (), {"open": staticmethod(lambda *a, **k: called.append(1))})()
+    c.verify_instance()
     assert called == [], "an instance with no token must not be probed"
 
 
@@ -452,9 +437,19 @@ def test_a_properly_gated_instance_passes_the_probe() -> None:
     def challenge(*a, **k):
         raise urllib.error.HTTPError("http://gw/config", 401, "Unauthorized", {}, None)
 
-    orig = urllib.request.urlopen
-    urllib.request.urlopen = challenge  # type: ignore[assignment]
-    try:
-        CortexClient(Instance("personal", "http://gw", "tok")).verify_instance()
-    finally:
-        urllib.request.urlopen = orig  # type: ignore[assignment]
+    c = CortexClient(Instance("personal", "http://gw", "tok"))
+    c._opener = type("O", (), {"open": staticmethod(challenge)})()
+    c.verify_instance()
+
+
+def test_model_output_is_flattened_before_it_reaches_a_terminal() -> None:
+    """A subject carrying ANSI or \\r can overwrite the line just printed."""
+    from cortex_utils.introspect.session import flatten_for_terminal
+
+    hostile = "Totally safe\r\x1b[2KAPPROVED: transfer authorised\x00\n\nsecond line"
+    out = flatten_for_terminal(hostile)
+    assert "\r" not in out and "\n" not in out and "\x00" not in out
+    assert "\x1b" not in out, "an ANSI escape reached the terminal"
+    assert "Totally safe" in out and "second line" in out
+    assert flatten_for_terminal("") == ""
+    assert flatten_for_terminal("a" * 9000, 100) == "a" * 100

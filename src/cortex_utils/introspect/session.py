@@ -150,7 +150,10 @@ def ask(
 
             trace.append({"tool": name, "arguments": args, "ok": ok})
             if verbose:
-                print(f"  -> {name}({json.dumps(args)}) {'ok' if ok else 'refused/error'}")
+                # Arguments come from the model, which read attacker text.
+                shown = flatten_for_terminal(json.dumps(args, default=str), 200)
+                status = "ok" if ok else "refused/error"
+                print(f"  -> {flatten_for_terminal(name, 60)}({shown}) {status}")
             messages.append(
                 {"role": "tool", "name": name, "content": json.dumps(result, default=str)[:4000]}
             )
@@ -166,3 +169,25 @@ def ask(
                 "gmail_id": tools_impl._gmail_id,
                 "budget_exhausted": True,
             }
+
+
+_CONTROL = {c: None for c in range(0x20) if c not in (0x09,)} | {0x7F: None}
+
+
+def flatten_for_terminal(text: str, limit: int = 4000) -> str:
+    """Strip control characters and collapse newlines before printing.
+
+    agent-isolation.md, "What to assert, in code": anything
+    attacker-influenced that reaches a human -- a subject line, a sender
+    address, a model's reasoning -- is control-character stripped and newline
+    collapsed before it is printed or posted, because a forged row in a
+    routing table is how a human is made to approve the wrong thing.
+
+    An answer here IS a model's reasoning over a subject and body, so a
+    subject carrying ANSI or a bare carriage return could overwrite the line
+    the operator just read. Tabs survive; everything below 0x20 does not.
+    """
+    if not text:
+        return ""
+    collapsed = " ".join(str(text).split())
+    return collapsed.translate(_CONTROL)[:limit]

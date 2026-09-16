@@ -168,6 +168,10 @@ class CortexTools:
             raise ToolRefusalError(f"no such tool {name!r}; available: {', '.join(sorted(impl))}")
 
         args = dict(arguments or {})
+        # Record BEFORE executing. Appending after the call recorded only
+        # successes, and the budget test in session reads this as a count of
+        # attempts -- a refusal or an error still spent a request.
+        self.calls.append({"tool": name, "arguments": args})
         if name == "label_sample":
             label = args.get("label")
             if not isinstance(label, str):
@@ -179,7 +183,6 @@ class CortexTools:
             # trying to steer a target it does not own.
             result = impl[name]()
 
-        self.calls.append({"tool": name, "arguments": args})
         return result
 
 

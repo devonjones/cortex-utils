@@ -940,6 +940,7 @@ def introspect_ask(
     import json as _json
 
     from cortex_utils.introspect import CortexClient, CortexReadError, CortexTools, ask, resolve
+    from cortex_utils.introspect.session import flatten_for_terminal
 
     try:
         inst = resolve(instance)
@@ -978,9 +979,11 @@ def introspect_ask(
         return
     if result.get("error"):
         raise click.ClickException(result["error"])
-    click.echo(result["answer"])
+    # Flatten before printing: the answer is a model's reasoning over an
+    # attacker-controlled subject and body. See agent-isolation.md.
+    click.echo(flatten_for_terminal(result["answer"]))
     if result["tool_calls"]:
-        used = ", ".join(c["tool"] for c in result["tool_calls"])
+        used = ", ".join(flatten_for_terminal(str(c["tool"]), 60) for c in result["tool_calls"])
         click.echo(f"\n[looked up: {used}]", err=True)
 
 

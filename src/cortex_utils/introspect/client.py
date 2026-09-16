@@ -26,6 +26,31 @@ from cortex_utils.introspect.instances import Instance
 DEFAULT_TIMEOUT = 20
 
 
+class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that would carry the bearer token to another host.
+
+    urlopen follows 3xx by default, and CPython's redirect_request strips only
+    content-length and content-type -- Authorization rides along. A gateway
+    that can be made to 302 (a proxy misconfiguration, a compromised route)
+    would hand this instance's credential to wherever it points. A credential
+    cannot be target-constrained, so the target is constrained instead.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_host = urllib.parse.urlsplit(req.full_url).netloc
+        new_host = urllib.parse.urlsplit(newurl).netloc
+        if new_host and new_host != old_host:
+            raise urllib.error.HTTPError(
+                newurl,
+                code,
+                f"refusing to follow a redirect off {old_host} to {new_host}: "
+                "the Authorization header would go with it",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class CortexReadError(RuntimeError):
     """A read failed. Carries no credential material."""
 
@@ -36,6 +61,7 @@ class CortexClient:
     def __init__(self, instance: Instance, timeout: int = DEFAULT_TIMEOUT) -> None:
         self._instance = instance
         self._timeout = timeout
+        self._opener = urllib.request.build_opener(_NoCrossHostRedirect)
 
     @property
     def instance(self) -> Instance:
@@ -57,7 +83,7 @@ class CortexClient:
             return
         req = urllib.request.Request(self._instance.base_url + probe_path, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with self._opener.open(req, timeout=self._timeout) as resp:
                 code = resp.status
         except urllib.error.HTTPError as e:
             return None if e.code in (401, 403) else None
@@ -102,7 +128,7 @@ class CortexClient:
             req.add_header("Authorization", f"Bearer {self._instance.token}")
 
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with self._opener.open(req, timeout=self._timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code == 401:
