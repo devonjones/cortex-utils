@@ -70,6 +70,18 @@ class CortexReadError(RuntimeError):
     """A read failed. Carries no credential material."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect. Used only by the gating probe.
+
+    A redirect is not an answer to "are you gated". A gated gateway that
+    answers /config with a same-origin 302 to a /login that returns 200 would
+    otherwise look ungated and abort a correct configuration.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class CortexClient:
     """Bound to exactly one instance for its whole life."""
 
@@ -77,6 +89,7 @@ class CortexClient:
         self._instance = instance
         self._timeout = timeout
         self._opener = urllib.request.build_opener(_NoCrossHostRedirect)
+        self._probe_opener = urllib.request.build_opener(_NoRedirect)
 
     @property
     def instance(self) -> Instance:
@@ -96,26 +109,37 @@ class CortexClient:
         """
         if not self._instance.requires_token:
             return
+        # The probe does NOT follow redirects. A gated gateway that answers
+        # /config with a same-origin 302 to /login, where /login returns 200,
+        # would otherwise look UNGATED and abort a correct configuration. A
+        # redirect is not an answer to "are you gated", so treat it as one of
+        # the inconclusive cases rather than guessing from where it leads.
         req = urllib.request.Request(self._instance.base_url + probe_path, method="GET")
         try:
-            with self._opener.open(req, timeout=self._timeout) as resp:
+            with self._probe_opener.open(req, timeout=self._timeout) as resp:
                 code = resp.status
-        except urllib.error.HTTPError as e:
-            if 300 <= e.code < 400:
-                # Our own redirect handler refused this. Do NOT swallow it:
-                # a probe that cannot complete has verified nothing, and
-                # returning here would fail OPEN on exactly the case the
-                # handler exists to catch.
-                raise CortexReadError(
-                    f"{self._instance.name}: cannot verify gating -- {e.reason}"
-                ) from e
+        except urllib.error.HTTPError:
             # 401/403 is the expected, correct answer: the gateway IS gated.
-            # Any other status (404, 5xx) says nothing either way about
-            # gating, so it is not this check's business to judge.
+            # Everything else -- 3xx, 404, 5xx -- says nothing either way, so
+            # it is not this check's business to judge. One return, because
+            # two arms doing the same thing is a trap for whoever later makes
+            # one of them log or count and does not notice the other diverge.
+            #
+            # ponytail: a same-origin 3xx is treated as inconclusive, so an
+            # UNGATED gateway that redirects /config to a 200 (trailing-slash
+            # normalisation, the common shape) escapes detection. Accepted
+            # knowingly: following the redirect instead made a GATED gateway
+            # that redirects to a login page look ungated, which aborts a
+            # correct configuration -- a false positive an operator cannot
+            # work around. Upgrade path if it ever bites: re-probe the
+            # same-origin Location once and raise only if it answers 200 with
+            # JSON.
             return
-        except (urllib.error.URLError, OSError, http.client.InvalidURL):
-            # Unreachable or unusable: a real read will surface that with a
-            # better message than a probe can.
+        except (urllib.error.URLError, OSError, http.client.InvalidURL, ValueError):
+            # ValueError belongs here for the same reason it is in get(): our
+            # OWN urlsplit(newurl) raises it on a hostile Location header, and
+            # without it that escapes past the CLI as a traceback. A probe is
+            # the one call that must never be louder than the read it guards.
             return
         if 200 <= code < 300:
             raise CortexReadError(
@@ -145,17 +169,21 @@ class CortexClient:
         if "://" in path or "\\" in path:
             raise ValueError(f"path must not be a URL, got {path!r}")
 
-        url = self._instance.base_url + path
-        if params:
-            clean = {k: v for k, v in params.items() if v is not None}
-            if clean:
-                url += "?" + urllib.parse.urlencode(clean)
-
-        req = urllib.request.Request(url, method="GET")
-        if self._instance.token:
-            req.add_header("Authorization", f"Bearer {self._instance.token}")
-
         try:
+            # Construction inside the try. urlencode and Request both raise on
+            # input this module does not fully control (a lone surrogate in a
+            # label or an address), and building outside meant each new site
+            # needed its own guard -- which is why there is already a surrogate
+            # check in _sender(). One boundary is better than N patches.
+            url = self._instance.base_url + path
+            if params:
+                clean = {k: v for k, v in params.items() if v is not None}
+                if clean:
+                    url += "?" + urllib.parse.urlencode(clean)
+
+            req = urllib.request.Request(url, method="GET")
+            if self._instance.token:
+                req.add_header("Authorization", f"Bearer {self._instance.token}")
             with self._opener.open(req, timeout=self._timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:

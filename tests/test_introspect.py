@@ -9,6 +9,8 @@ school mail.
 
 from __future__ import annotations
 
+import urllib.request
+
 import pytest
 
 from cortex_utils.introspect.client import CortexClient, CortexReadError
@@ -414,7 +416,7 @@ def test_a_gated_instance_pointed_at_an_ungated_gateway_is_refused() -> None:
         def __exit__(self, *a):
             return False
 
-    client._opener = type("O", (), {"open": staticmethod(lambda *a, **k: Resp())})()
+    client._probe_opener = type("O", (), {"open": staticmethod(lambda *a, **k: Resp())})()
     with pytest.raises(CortexReadError, match="answers WITHOUT one"):
         client.verify_instance()
 
@@ -424,7 +426,7 @@ def test_an_ungated_instance_is_not_probed() -> None:
 
     called = []
     c = CortexClient(Instance("work", "http://work", None))
-    c._opener = type("O", (), {"open": staticmethod(lambda *a, **k: called.append(1))})()
+    c._probe_opener = type("O", (), {"open": staticmethod(lambda *a, **k: called.append(1))})()
     c.verify_instance()
     assert called == [], "an instance with no token must not be probed"
 
@@ -438,7 +440,7 @@ def test_a_properly_gated_instance_passes_the_probe() -> None:
         raise urllib.error.HTTPError("http://gw/config", 401, "Unauthorized", {}, None)
 
     c = CortexClient(Instance("personal", "http://gw", "tok"))
-    c._opener = type("O", (), {"open": staticmethod(challenge)})()
+    c._probe_opener = type("O", (), {"open": staticmethod(challenge)})()
     c.verify_instance()
 
 
@@ -570,20 +572,93 @@ def test_redirects_leaving_the_origin_are_refused(start, target, allowed) -> Non
         assert "Authorization header would go with it" in str(ei.value.reason)
 
 
-def test_the_probe_does_not_fail_open_when_a_redirect_is_refused() -> None:
-    """A probe that cannot complete has verified nothing."""
+def test_a_redirect_on_the_probe_is_inconclusive_not_a_verdict() -> None:
+    """A 3xx says nothing about gating, in either direction.
+
+    The probe does not follow redirects, so a gated gateway answering /config
+    with a 302 to a login page arrives here. Treating that as "ungated" would
+    abort a correct configuration; treating it as "verified" would claim
+    something unproven. It is neither.
+    """
     import urllib.error
 
     client = CortexClient(Instance("personal", "https://gw", "tok"))
 
-    def refused(*a, **k):
-        raise urllib.error.HTTPError(
-            "https://evil/x", 302, "refusing to follow a redirect ...", {}, None
-        )
+    def redirected(*a, **k):
+        raise urllib.error.HTTPError("https://gw/login", 302, "Found", {}, None)
 
-    client._opener = type("O", (), {"open": staticmethod(refused)})()
-    with pytest.raises(CortexReadError, match="cannot verify gating"):
-        client.verify_instance()
+    client._probe_opener = type("O", (), {"open": staticmethod(redirected)})()
+    client.verify_instance()  # must not raise
+
+
+def test_a_hostile_location_header_does_not_escape_the_probe() -> None:
+    """Our own urlsplit() raises ValueError on some Location values.
+
+    verify_instance caught URLError/OSError/InvalidURL but not ValueError, so
+    that escaped past the CLI as a traceback -- from a header the gateway's
+    peer controls.
+    """
+    client = CortexClient(Instance("personal", "https://gw", "tok"))
+
+    def boom(*a, **k):
+        raise ValueError("Invalid IPv6 URL")
+
+    client._probe_opener = type("O", (), {"open": staticmethod(boom)})()
+    client.verify_instance()  # must not raise
+
+
+def test_the_client_actually_installs_the_redirect_handler() -> None:
+    """Pin the WIRING, not just the predicate.
+
+    Round 3: `build_opener(_NoCrossHostRedirect)` -> `build_opener()` left all
+    46 tests green, and that one argument IS the entire token protection. Six
+    tests exercised the handler's logic while nothing checked it was reachable.
+    """
+    from cortex_utils.introspect.client import _NoCrossHostRedirect, _NoRedirect
+
+    client = CortexClient(Instance("personal", "https://gw", "tok"))
+    installed = [type(h) for h in client._opener.handlers]
+    assert _NoCrossHostRedirect in installed, (
+        "the cross-host redirect guard is not installed on the read opener; "
+        "the bearer token would follow a redirect off-origin"
+    )
+    probe_installed = [type(h) for h in client._probe_opener.handlers]
+    assert _NoRedirect in probe_installed
+
+    # ...and the default handler it must displace is not also present
+    assert urllib.request.HTTPRedirectHandler not in installed, (
+        "the stock redirect handler is installed alongside ours"
+    )
+
+
+def test_flatten_does_not_itself_crash_on_a_lone_surrogate() -> None:
+    """A hardening function that raises has not hardened anything.
+
+    A lone surrogate survives translate() and then kills click.echo on write,
+    one frame outside the function meant to prevent exactly that.
+    """
+    from cortex_utils.introspect.session import flatten_for_terminal
+
+    out = flatten_for_terminal("before\udcffafter")
+    out.encode("utf-8")  # must not raise
+    assert "before" in out and "after" in out
+    assert "؜" not in flatten_for_terminal("a؜b")
+
+
+def test_both_exits_report_budget_exhausted(monkeypatch) -> None:
+    """The key must always be present; the two exits disagreed."""
+    from cortex_utils.introspect.session import ask
+
+    _stub_chat(monkeypatch, [{"content": "plain"}])
+    assert ask(_tools(), "q", ollama_url="http://o", model="m")["budget_exhausted"] is False
+
+    # ...and the OTHER exit, which the name promised and the body omitted.
+    _stub_chat(
+        monkeypatch,
+        [{"tool_calls": [{"function": {"name": "sender_history", "arguments": {}}}]}],
+    )
+    spent = ask(_tools(), "q", ollama_url="http://o", model="m", max_tool_calls=1)
+    assert spent["budget_exhausted"] is True
 
 
 def test_flatten_strips_bidi_and_c1_not_just_ansi() -> None:
@@ -626,3 +701,32 @@ def test_an_unencodable_sender_is_a_tool_error_not_a_crash() -> None:
     tools = CortexTools(SurrogateClient(), "abc123")
     with pytest.raises(CortexReadError, match="unencodable from_addr"):
         tools.dispatch("sender_history", {})
+
+
+def test_the_gating_probe_sends_no_credential() -> None:
+    """Anonymity is the entire point of the probe.
+
+    Adding an Authorization header to it left the suite green, at HEAD and
+    after the patch that introduced the separate probe opener. The probe asks
+    "do you challenge an anonymous request" -- sending a credential makes the
+    question meaningless while the code still reads as if it asked it.
+    """
+    seen: dict[str, object] = {}
+
+    class Recorder:
+        @staticmethod
+        def open(req, timeout=None):
+            seen["headers"] = dict(req.headers)
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    import urllib.error
+
+    client = CortexClient(Instance("personal", "https://gw", "super-secret"))
+    client._probe_opener = Recorder()
+    client.verify_instance()
+
+    headers = seen.get("headers") or {}
+    assert not any(k.lower() == "authorization" for k in headers), (
+        f"the probe sent a credential: {list(headers)}"
+    )
+    assert "super-secret" not in str(headers)

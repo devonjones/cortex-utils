@@ -140,6 +140,9 @@ def ask(
                 "tool_calls": trace,
                 "instance": tools_impl._client.instance.name,
                 "gmail_id": tools_impl._gmail_id,
+                # Always present, so a caller can test it without .get():
+                # the two exits used to disagree about whether the key exists.
+                "budget_exhausted": False,
             }
 
         messages.append(msg)
@@ -210,6 +213,7 @@ _CONTROL = (
     | {
         c: None
         for c in (
+            0x061C,  # ARABIC LETTER MARK -- missed by the first list
             0x200E,
             0x200F,
             0x202A,
@@ -245,4 +249,8 @@ def flatten_for_terminal(text: str, limit: int = 4000) -> str:
     if text is None or text == "":
         return ""
     collapsed = " ".join(str(text).split())
-    return collapsed.translate(_CONTROL)[:limit]
+    flattened = collapsed.translate(_CONTROL)[:limit]
+    # A hardening function that raises has not hardened anything. A lone
+    # surrogate survives translate() and then kills click.echo on write, so
+    # the crash lands one frame outside the function meant to prevent it.
+    return flattened.encode("utf-8", "replace").decode("utf-8", "replace")
