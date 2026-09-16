@@ -40,6 +40,19 @@ class Instance:
     def has_token(self) -> bool:
         return bool(self.token)
 
+    @property
+    def requires_token(self) -> bool:
+        """Whether this instance is EXPECTED to challenge an anonymous request.
+
+        Configuring a token is the statement that this deployment is gated.
+        CortexClient.verify_instance() checks the gateway agrees, which is what
+        catches the mistake that matters: pointing a name at the wrong
+        deployment. Personal is gated and work is not, so aiming
+        CORTEX_INSTANCE_PERSONAL_URL at the work gateway would otherwise read
+        work mail while every log line said "personal".
+        """
+        return self.has_token
+
     def __repr__(self) -> str:  # never print the token
         return (
             f"Instance(name={self.name!r}, base_url={self.base_url!r}, has_token={self.has_token})"

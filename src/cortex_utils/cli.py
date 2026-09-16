@@ -946,7 +946,16 @@ def introspect_ask(
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
-    tools = CortexTools(CortexClient(inst), gmail_id)
+    client = CortexClient(inst)
+    try:
+        # One request, before anything is read: does this gateway agree it is
+        # gated? Catches a name pointed at the wrong deployment, which would
+        # otherwise read one mailbox while reporting the other's name.
+        client.verify_instance()
+    except CortexReadError as e:
+        raise click.ClickException(str(e)) from e
+
+    tools = CortexTools(client, gmail_id)
     if verbose:
         click.echo(
             f"instance={inst.name} url={inst.base_url} token={'yes' if inst.has_token else 'no'}"

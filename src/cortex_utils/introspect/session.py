@@ -73,10 +73,32 @@ def ask(
     ]
     trace: list[dict[str, Any]] = []
 
-    for _ in range(max_tool_calls + 1):
+    # Budget CALLS, not turns. The previous loop counted assistant messages,
+    # so one reply carrying 100 tool_calls executed all 100 authenticated GETs
+    # under a limit of 3 -- while the flag is named --max-tool-calls.
+    spent = 0
+
+    while True:
         reply = _chat(ollama_url, model, messages, specs, timeout)
         msg = reply.get("message") or {}
-        calls = msg.get("tool_calls") or []
+        raw_calls = msg.get("tool_calls") or []
+        calls = [c for c in raw_calls if isinstance(c, dict)]
+
+        if raw_calls and not calls:
+            # It meant to call something; every entry was malformed. Returning
+            # here would hand back that message's content, which is empty --
+            # the caller gets nothing and no reason. Say so and let it retry.
+            messages.append(msg)
+            messages.append(
+                {
+                    "role": "tool",
+                    "name": "error",
+                    "content": json.dumps(
+                        {"refused": "tool_calls were malformed; call a tool or answer plainly"}
+                    ),
+                }
+            )
+            continue
 
         if not calls:
             return {
@@ -88,6 +110,21 @@ def ask(
 
         messages.append(msg)
         for call in calls:
+            if spent >= max_tool_calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": "budget",
+                        "content": json.dumps(
+                            {
+                                "refused": f"tool-call budget of {max_tool_calls} is "
+                                "spent; answer from what you have"
+                            }
+                        ),
+                    }
+                )
+                break
+            spent += 1
             fn = call.get("function") or {}
             name = fn.get("name", "")
             args = fn.get("arguments") or {}
@@ -96,6 +133,11 @@ def ask(
                     args = json.loads(args)
                 except ValueError:
                     args = {}
+            if not isinstance(args, dict):
+                # A JSON string can decode to a list, a number or a bare
+                # string. dispatch() expects a mapping, and without this the
+                # TypeError escapes ask() entirely.
+                args = {}
             try:
                 result = tools_impl.dispatch(name, args)
                 ok = True
@@ -113,10 +155,14 @@ def ask(
                 {"role": "tool", "name": name, "content": json.dumps(result, default=str)[:4000]}
             )
 
-    return {
-        "answer": "",
-        "tool_calls": trace,
-        "instance": tools_impl._client.instance.name,
-        "gmail_id": tools_impl._gmail_id,
-        "error": f"gave up after {max_tool_calls} tool calls without an answer",
-    }
+        if spent >= max_tool_calls:
+            # One final turn with the budget spent, so the model answers from
+            # what it already has rather than the caller getting nothing.
+            final = _chat(ollama_url, model, messages, [], timeout)
+            return {
+                "answer": ((final.get("message") or {}).get("content") or "").strip(),
+                "tool_calls": trace,
+                "instance": tools_impl._client.instance.name,
+                "gmail_id": tools_impl._gmail_id,
+                "budget_exhausted": True,
+            }

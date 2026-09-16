@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 from cortex_utils.introspect.client import CortexClient, CortexReadError
 
@@ -85,7 +86,21 @@ class CortexTools:
 
     def sender_history(self) -> dict[str, Any]:
         sender = self._sender()
-        data = self._client.get(f"/emails/sender/{sender}/classifications") or {}
+        # quote(safe="") -- the sender comes from the inbound From: header,
+        # which is attacker-controlled text, and parseaddr() is a PARSER, not a
+        # validator. Unquoted it chooses the endpoint, not just the path
+        # segment. Verified on the wire before this fix:
+        #   From: <a@b.com#>              -> fragment stripped "/classifications"
+        #                                    off the selector; the GET became
+        #                                    /emails/sender/a@b.com
+        #   From: <a@b.com?limit=9>       -> remainder became a query string
+        #   From: <x/../../config?@evil>  -> dot segments reached the wire
+        # Only a route converter in ANOTHER repo stopped the last one resolving
+        # to GET /config -- the whole triage ruleset, handed back to the model
+        # as a tool result. agent-isolation.md calls escaping weak and
+        # inexpressibility structural; quoting makes traversal inexpressible
+        # here rather than merely unlikely downstream.
+        data = self._client.get(f"/emails/sender/{quote(sender, safe='')}/classifications") or {}
         return {
             "sender": sender,
             "total_messages": data.get("total"),

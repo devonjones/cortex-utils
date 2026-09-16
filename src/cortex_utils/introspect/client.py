@@ -14,6 +14,7 @@ of the boundary the model does not reach.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -39,6 +40,37 @@ class CortexClient:
     @property
     def instance(self) -> Instance:
         return self._instance
+
+    def verify_instance(self, probe_path: str = "/config") -> None:
+        """Check the gateway agrees about whether it is gated.
+
+        A token says "this deployment is gated". If an anonymous request to a
+        gated path succeeds anyway, this is not the gateway we think it is --
+        the name has been pointed at another deployment. Reading one person's
+        mail while reporting the other's name is the failure this whole module
+        is shaped around, so it is worth one request to rule out.
+
+        Cheap and one-shot. Silent when it cannot tell (network trouble is the
+        caller's problem to surface, not this check's to guess at).
+        """
+        if not self._instance.requires_token:
+            return
+        req = urllib.request.Request(self._instance.base_url + probe_path, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as e:
+            return None if e.code in (401, 403) else None
+        except (urllib.error.URLError, OSError, http.client.InvalidURL):
+            return
+        if code == 200:
+            raise CortexReadError(
+                f"{self._instance.name}: a token is configured, but "
+                f"{self._instance.base_url}{probe_path} answers WITHOUT one. "
+                "That gateway is not gated, so this name is probably pointed at "
+                "the wrong deployment -- check CORTEX_INSTANCE_"
+                f"{self._instance.name.upper()}_URL."
+            )
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """GET one path on the bound instance.
@@ -85,5 +117,13 @@ class CortexClient:
                     )
                 ) from e
             raise CortexReadError(f"{self._instance.name}: GET {path} -> HTTP {e.code}") from e
+        except http.client.InvalidURL as e:
+            # NOT a ValueError or OSError, so without this it escapes the
+            # client, escapes ask(), escapes the CLI handler and prints a
+            # traceback. Any From: header with a space in it triggers it --
+            # which is to say, any spammer.
+            raise CortexReadError(
+                f"{self._instance.name}: GET {path} is not a usable URL: {e}"
+            ) from e
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise CortexReadError(f"{self._instance.name}: GET {path} failed: {e}") from e
