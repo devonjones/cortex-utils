@@ -453,3 +453,24 @@ def test_model_output_is_flattened_before_it_reaches_a_terminal() -> None:
     assert "Totally safe" in out and "second line" in out
     assert flatten_for_terminal("") == ""
     assert flatten_for_terminal("a" * 9000, 100) == "a" * 100
+
+
+def test_an_unusable_url_is_a_cortex_read_error_not_a_traceback() -> None:
+    """http.client.InvalidURL is neither ValueError nor OSError.
+
+    It is raised inside putrequest -- after the try: is entered, but matched by
+    none of its excepts -- so before this it walked out of get(), out of ask()
+    (which catches only ToolRefusalError and CortexReadError) and out of the
+    CLI handler, printing a raw traceback. Reachable with no effort:
+    `From: <a b@c.com>` survives parseaddr intact.
+    """
+    import http.client
+
+    client = CortexClient(Instance("personal", "http://gw", "tok"))
+
+    def boom(*a, **k):
+        raise http.client.InvalidURL("URL can't contain control characters.")
+
+    client._opener = type("O", (), {"open": staticmethod(boom)})()
+    with pytest.raises(CortexReadError, match="not a usable URL"):
+        client.get("/emails/sender/a%20b@c.com/classifications")
