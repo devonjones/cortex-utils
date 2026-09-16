@@ -32,6 +32,17 @@ Set the gateway URL via environment variable or CLI flag:
 
 ```bash
 export CORTEX_GATEWAY_URL=http://localhost:8097  # Example
+
+# AUTH (since 2026-09-15): requests from outside the Docker network need a
+# token. That includes the LAN, so it includes you unless you are running
+# inside cortex_default.
+#
+#   source ~/.cortex.env          # on Hades; defines CORTEX_API_TOKEN
+#   curl -H "Authorization: Bearer $CORTEX_API_TOKEN" http://10.5.2.21:8097/config
+#
+# Peer services and anything inside the compose network use
+# http://cortex-gateway:8080 and need no token. /health and /metrics stay
+# open. See CLAUDE.md "Gateway API authentication".
 cortex --url http://custom-host:8097 <command>
 ```
 
@@ -223,6 +234,7 @@ Triage rules configuration is managed via the Gateway REST API (not CLI).
 2. **Upload via API**:
 ```bash
 curl -X PUT http://10.5.2.21:8097/config \
+  -H "Authorization: Bearer $CORTEX_API_TOKEN" \
   -H "Content-Type: text/plain" \
   -H "X-Created-By: your-name@context" \
   -H "X-Notes: Description of changes" \
@@ -255,6 +267,7 @@ ssh devon@10.5.2.21 "docker logs cortex-triage-worker 2>&1 | grep -E 'reload|ver
 
 ```bash
 curl -X POST http://10.5.2.21:8097/config/validate \
+  -H "Authorization: Bearer $CORTEX_API_TOKEN" \
   -H "Content-Type: text/plain" \
   --data-binary @/path/to/rules.yaml
 ```
