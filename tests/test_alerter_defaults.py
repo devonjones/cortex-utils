@@ -191,3 +191,66 @@ class TestPatternsMustBePrecise:
         result = classify("cortex-gmail-sync", line)
         assert result is not None
         assert result.title == "API Server Error", f"missed a real 5xx: {line!r}"
+
+
+class TestCriticalPatternsDoNotMatchRoutineTraffic:
+    """Two CRITICAL patterns matched healthy traffic, found by measurement.
+
+    Both are the same defect as the 5xx one: a substring match where a token
+    match was meant. Both are CRITICAL, and the history one has a ZERO
+    cooldown, so every match pings the channel.
+
+    Neither fired in production, but only because the daemon's is_error_line()
+    gate drops INFO lines before classify() sees them. That is accidental
+    protection, not design -- the patterns are reached directly by any other
+    caller, and the gate is not what makes them correct.
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # A Gmail history ID is a plain integer that routinely CONTAINS
+            # "404". 9 of these in 24h of healthy Pub/Sub traffic.
+            '{"event": "Notification for a@b.com, historyId=79564045", "level": "info"}',
+            '{"event": "Notification for a@b.com, historyId=40412345", "level": "info"}',
+            '{"event": "sync complete", "historyId": 404999, "level": "info"}',
+        ],
+    )
+    def test_a_history_id_containing_404_is_not_an_expiry(self, line: str) -> None:
+        result = classify("cortex-gmail-sync", line)
+        assert (
+            result is None or result.title != "Gmail History Expired"
+        ), f"routine notification read as history expiry: {line[:70]!r}"
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # Unanchored OOM matches inside ordinary words. This one is real:
+            # a Gmail label called Cortex/Automated/Zoom.
+            "add_label=['Cortex/Automated/Zoom'] remove_label=None",
+            "INFO joining room 12345",
+            "INFO bloom filter rebuilt",
+        ],
+    )
+    def test_a_word_containing_oom_is_not_an_oom_kill(self, line: str) -> None:
+        result = classify("cortex-triage-worker", line)
+        assert (
+            result is None or result.title != "Out of Memory"
+        ), f"ordinary word read as an OOM kill: {line[:70]!r}"
+
+    @pytest.mark.parametrize(
+        ("line", "title"),
+        [
+            ("CRITICAL History expired, full resync required", "Gmail History Expired"),
+            (
+                "ERROR HttpError 404 fetching history for devon: historyId too old",
+                "Gmail History Expired",
+            ),
+            ("ERROR MemoryError: cannot allocate 4GiB", "Out of Memory"),
+            ("ERROR container exited with exit code 137", "Out of Memory"),
+        ],
+    )
+    def test_the_real_conditions_still_alert(self, line: str, title: str) -> None:
+        result = classify("cortex-gmail-sync", line)
+        assert result is not None, f"missed a real condition: {line!r}"
+        assert result.title == title

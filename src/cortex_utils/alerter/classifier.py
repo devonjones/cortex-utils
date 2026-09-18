@@ -30,14 +30,36 @@ class Classification:
 PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
     # === CRITICAL (data loss risk, auth failures) ===
     (
-        re.compile(r"History expired|historyId.*404|history.*too old", re.IGNORECASE),
+        # NOT historyId.*404 -- a Gmail history ID is a plain integer and
+        # routinely CONTAINS "404" as a substring. Measured: 9 routine INFO
+        # Pub/Sub notifications in 24h matched, e.g. historyId=79564045, each
+        # of which would have fired this CRITICAL zero-cooldown alert saying
+        # "Emails may be lost. Run manual backfill." They stayed quiet only
+        # because the daemon's is_error_line() gate drops INFO lines first --
+        # an accidental protection, not a designed one.
+        re.compile(
+            r"History expired"
+            r"|history.*too old"
+            r"|\bHttpError 404\b.*histor"
+            r"|histor\w*\b.*\bHttpError 404\b"
+            r"|startHistoryId.*\b404\b",
+            re.IGNORECASE,
+        ),
         Severity.CRITICAL,
         0,  # No cooldown - always alert
         "Gmail History Expired",
         "History ID is too old. Emails may be lost. Run manual backfill.",
     ),
     (
-        re.compile(r"MemoryError|exit code 137|OOM|Out of memory", re.IGNORECASE),
+        # \bOOM\b, not OOM -- unanchored it matches inside ordinary words.
+        # Measured: it fired on a Gmail label "Cortex/Automated/Zoom", which
+        # would have been a CRITICAL "Container ran out of memory and may have
+        # crashed". Same defect class as the 5xx pattern below: a substring
+        # match where a token match was meant.
+        re.compile(
+            r"\bMemoryError\b|\bexit code 137\b|\bOOM\b|\bOut of memory\b",
+            re.IGNORECASE,
+        ),
         Severity.CRITICAL,
         0,
         "Out of Memory",
