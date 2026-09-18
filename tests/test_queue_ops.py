@@ -591,9 +591,9 @@ def test_dedup_predicate_is_scoped_to_queue_and_live_rows() -> None:
     enqueue(conn, "triage", {"gmail_id": "abc"}, dedup_key="gmail_id")
     where = [s for s, _ in conn.cur.executed if "NOT EXISTS" in s][0].split("NOT EXISTS")[1]
     assert "queue_name = %s" in where
-    assert "status IN ('pending', 'processing')" in where, (
-        "completed rows must not suppress a replay"
-    )
+    assert (
+        "status IN ('pending', 'processing')" in where
+    ), "completed rows must not suppress a replay"
 
 
 @pytest.mark.parametrize("dedup_key", [None, "gmail_id"])
@@ -660,9 +660,9 @@ def test_partition_creation_is_lock_bounded() -> None:
     assert all(t[0] == f"{PARTITION_LOCK_TIMEOUT_MS}ms" for t in timeouts)
     # A bare SET leaks the bound into the whole session rather than the statement.
     assert all("SET LOCAL lock_timeout" in s for s, _ in conn.cur.executed if "lock_timeout" in s)
-    assert PARTITION_LOCK_TIMEOUT_MS < MIGRATION_LOCK_TIMEOUT_MS, (
-        "the live producer path must give up sooner than the deploy path"
-    )
+    assert (
+        PARTITION_LOCK_TIMEOUT_MS < MIGRATION_LOCK_TIMEOUT_MS
+    ), "the live producer path must give up sooner than the deploy path"
 
 
 def test_losing_the_partition_lock_consults_the_catalogue() -> None:
@@ -908,9 +908,9 @@ def test_conceding_a_partition_still_attempts_tomorrow() -> None:
     conn.cur.preexisting_after_create = True  # the duplicate is a real partition
     enqueue(conn, "triage", {"gmail_id": "abc"})
     assert len([s for s, _ in conn.cur.executed if "CREATE TABLE" in s]) == 2
-    assert [s for s, _ in conn.cur.executed if "pg_inherits" in s], (
-        "a concession must be confirmed, not assumed"
-    )
+    assert [
+        s for s, _ in conn.cur.executed if "pg_inherits" in s
+    ], "a concession must be confirmed, not assumed"
 
 
 def test_server_date_probe_closes_its_transaction() -> None:
@@ -1253,9 +1253,9 @@ def test_worker_identity_is_unique_per_process_and_legible() -> None:
     host, pid, nonce = rest.rsplit(":", 2)
     assert host == socket.gethostname()
     assert pid == str(os.getpid())
-    assert len(nonce) == 8 and int(nonce, 16) >= 0, (
-        f"token is {token!r} -- host and pid alone collide across containers"
-    )
+    assert (
+        len(nonce) == 8 and int(nonce, 16) >= 0
+    ), f"token is {token!r} -- host and pid alone collide across containers"
 
     with pytest.raises(QueueError, match="service is required"):
         worker_identity("")

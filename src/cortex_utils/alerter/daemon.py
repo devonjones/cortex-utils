@@ -22,15 +22,39 @@ from .rate_limiter import RateLimiter
 
 log = get_logger()
 
-# Default containers to monitor
-DEFAULT_CONTAINERS = [
-    "cortex-gmail-sync",
-    "cortex-duckdb-api",
-    "cortex-parse-worker",
-    "cortex-attachment-worker",
-    "cortex-triage-worker",
-    "cortex-labeling-worker",
-]
+# Containers to monitor: EVERYTHING under the prefix, minus an explicit
+# denylist. This was an allowlist of six names, and the property that matters
+# is which way forgetting fails.
+#
+# Under an allowlist, adding a service to the estate silently adds an UNWATCHED
+# service -- nothing tells you, and you find out when it fails quietly. Measured
+# 2026-09-18: of 11 cortex containers running on hades, FIVE were unwatched --
+# cortex-gateway (the API everything goes through), cortex-actions-router
+# (dispatches downstream workflows), cortex-postgres, cortex-teach, and
+# cortex-alerter ITSELF.
+#
+# Under a denylist, forgetting is safe: a new service is watched by default and
+# the failure mode is noise, which somebody notices, rather than silence, which
+# nobody does.
+CONTAINER_PREFIX = "cortex-"
+
+# The alerter cannot usefully watch itself -- if it dies, it is not reading
+# anything, including its own logs. Self-observation is not a health check;
+# that needs an EXTERNAL watcher (the estate's pattern for this is
+# scripts/checks.d/ in ~/HomeLab, e.g. ofelia-jobs-check). Excluded here so the
+# denylist does not imply coverage it cannot provide. See cortex-ogqq.
+DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
+
+
+def discover_containers(names: list[str]) -> list[str]:
+    """Every cortex container except the denylisted ones.
+
+    Takes the live container list rather than a hardcoded one, so a service
+    added tonight is watched tonight.
+    """
+    return sorted(
+        n for n in names if n.startswith(CONTAINER_PREFIX) and n not in DENYLISTED_CONTAINERS
+    )
 
 
 class AlerterDaemon:
@@ -53,7 +77,9 @@ class AlerterDaemon:
         """
         self.discord = DiscordClient(webhook_url)
         self.rate_limiter = RateLimiter()
-        self.containers = containers or DEFAULT_CONTAINERS
+        # None means DISCOVER once Docker is connected; run() fills it in.
+        self.containers: list[str] = containers or []
+        self._discover = not containers
         self.ping_critical = ping_critical
         self.summary_hour = summary_hour
 
@@ -77,6 +103,25 @@ class AlerterDaemon:
         except docker.errors.DockerException as e:
             log.error("Failed to connect to Docker", error=str(e))
             return False
+
+    def _discover_running_containers(self) -> list[str]:
+        """Live cortex containers, minus the denylist.
+
+        Falls back to an empty list rather than a stale hardcoded set: an
+        alerter that cannot see Docker should say so loudly at startup, not
+        quietly watch six names that may no longer be the right six.
+        """
+        if self.docker_client is None:
+            log.error("Container discovery before Docker connect; watching NOTHING")
+            return []
+        try:
+            names = [c.name for c in self.docker_client.containers.list()]
+        except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+            log.error("Cannot list containers; alerter is watching NOTHING", error=str(exc))
+            return []
+        found = discover_containers(names)
+        log.info("Discovered containers to watch", count=len(found), containers=found)
+        return found
 
     def _process_log_line(self, container: str, log_line: str) -> None:
         """Process a single log line and send alerts if needed."""
@@ -247,12 +292,20 @@ class AlerterDaemon:
 
     def run(self) -> None:
         """Start the alerter daemon."""
-        log.info("Starting alerter daemon", containers=self.containers)
+        log.info("Starting alerter daemon")
 
         # Connect to Docker
         if not self._connect_docker():
             log.error("Cannot start without Docker connection")
             return
+
+        # Discovery needs the connected client, so it happens HERE rather than
+        # in __init__. An explicit -c list still wins; this is the default path.
+        if self._discover:
+            self.containers = self._discover_running_containers()
+        if not self.containers:
+            log.error("Alerter is watching NOTHING -- no containers to monitor")
+        log.info("Monitoring containers", count=len(self.containers), names=self.containers)
 
         # Schedule daily summary
         schedule.every().day.at(f"{self.summary_hour:02d}:00").do(self._send_daily_summary)

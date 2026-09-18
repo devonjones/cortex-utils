@@ -77,9 +77,9 @@ def test_sender_is_read_off_the_bound_message_not_supplied() -> None:
     from urllib.parse import unquote
 
     looked_up = unquote(lookups[0].split("/")[3])
-    assert looked_up == "sender@example.com", (
-        f"sender lookup must come from the bound message, not the model; got {looked_up!r}"
-    )
+    assert (
+        looked_up == "sender@example.com"
+    ), f"sender lookup must come from the bound message, not the model; got {looked_up!r}"
 
 
 def test_arguments_to_no_argument_tools_are_dropped() -> None:
@@ -87,9 +87,9 @@ def test_arguments_to_no_argument_tools_are_dropped() -> None:
     c = FakeClient()
     tools = CortexTools(c, "abc123")
     tools.dispatch("message_details", {"gmail_id": "someone-elses-id"})
-    assert all("someone-elses-id" not in p for p in c.paths), (
-        f"a model-supplied gmail_id reached the client: {c.paths}"
-    )
+    assert all(
+        "someone-elses-id" not in p for p in c.paths
+    ), f"a model-supplied gmail_id reached the client: {c.paths}"
     assert "/emails/abc123" in c.paths
 
 
@@ -198,9 +198,9 @@ def test_sender_mapping_returns_only_the_bound_senders_rows() -> None:
     tools = CortexTools(MappingClient(), "abc123")
     out = tools.dispatch("sender_mapping", {})
     assert out["has_mapping"] is True
-    assert [m["label"] for m in out["mappings"]] == ["Mine/Label"], (
-        f"only the bound sender's mapping may be returned, got {out['mappings']}"
-    )
+    assert [m["label"] for m in out["mappings"]] == [
+        "Mine/Label"
+    ], f"only the bound sender's mapping may be returned, got {out['mappings']}"
 
 
 def test_sender_mapping_reports_absence_rather_than_someone_elses_row() -> None:
@@ -256,17 +256,21 @@ def test_a_hostile_from_header_cannot_leave_its_path_segment(hostile: str) -> No
     assert len(looked_up) == 1, looked_up
     path = looked_up[0]
 
-    assert path.endswith("/classifications"), (
-        f"the endpoint itself was changed by the From: header: {path!r}"
-    )
+    assert path.endswith(
+        "/classifications"
+    ), f"the endpoint itself was changed by the From: header: {path!r}"
 
     # The structural property, not a character blocklist: the sender must
     # occupy exactly ONE path segment. ".." inside a segment is inert --
     # traversal needs separators, and quote(safe="") escapes them -- so
     # asserting on ".." would fail the correct encoding. Assert the shape.
-    assert path.split("/") == ["", "emails", "sender", path.split("/")[3], "classifications"], (
-        f"the sender escaped its path segment: {path!r}"
-    )
+    assert path.split("/") == [
+        "",
+        "emails",
+        "sender",
+        path.split("/")[3],
+        "classifications",
+    ], f"the sender escaped its path segment: {path!r}"
     middle = path.split("/")[3]
     for ch in ("?", "#", "\n", "\r", " "):
         assert ch not in middle, f"{ch!r} survived unencoded into the path: {path!r}"
@@ -626,9 +630,9 @@ def test_the_client_actually_installs_the_redirect_handler() -> None:
     assert _NoRedirect in probe_installed
 
     # ...and the default handler it must displace is not also present
-    assert urllib.request.HTTPRedirectHandler not in installed, (
-        "the stock redirect handler is installed alongside ours"
-    )
+    assert (
+        urllib.request.HTTPRedirectHandler not in installed
+    ), "the stock redirect handler is installed alongside ours"
 
 
 def test_flatten_does_not_itself_crash_on_a_lone_surrogate() -> None:
@@ -684,9 +688,11 @@ def test_the_gmail_id_site_is_quoted_too() -> None:
     c = FakeClient()
     CortexTools(c, "../../config").dispatch("message_details", {})
     first = c.paths[0]
-    assert first.split("/") == ["", "emails", first.split("/")[2]], (
-        f"gmail_id escaped its segment: {first!r}"
-    )
+    assert first.split("/") == [
+        "",
+        "emails",
+        first.split("/")[2],
+    ], f"gmail_id escaped its segment: {first!r}"
 
 
 def test_an_unencodable_sender_is_a_tool_error_not_a_crash() -> None:
@@ -726,9 +732,9 @@ def test_the_gating_probe_sends_no_credential() -> None:
     client.verify_instance()
 
     headers = seen.get("headers") or {}
-    assert not any(k.lower() == "authorization" for k in headers), (
-        f"the probe sent a credential: {list(headers)}"
-    )
+    assert not any(
+        k.lower() == "authorization" for k in headers
+    ), f"the probe sent a credential: {list(headers)}"
     assert "super-secret" not in str(headers)
 
 

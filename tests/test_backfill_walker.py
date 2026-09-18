@@ -90,9 +90,9 @@ def test_an_unrelated_old_window_cannot_hijack_the_watermark() -> None:
     assert current_watermark(walker_windows, seed) == date(2024, 11, 1)
 
     hand_queued = _job("2010-03-01", "2010-03-08")
-    assert current_watermark([*walker_windows, hand_queued], seed) == date(2024, 11, 1), (
-        "a disconnected operator window must not become the frontier"
-    )
+    assert current_watermark([*walker_windows, hand_queued], seed) == date(
+        2024, 11, 1
+    ), "a disconnected operator window must not become the frontier"
 
 
 def test_windows_tile_without_gaps() -> None:

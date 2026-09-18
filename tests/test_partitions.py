@@ -297,9 +297,9 @@ def test_retention_cutoff_uses_the_server_clock() -> None:
     the cutoff forward and drops a partition still holding live rows."""
     manager, executed = _manager_capturing_sql(fetchall=[])
     manager.drop_old_partitions(retention_days=7)
-    assert any("SELECT CURRENT_DATE" in sql for sql in executed), (
-        "the retention cutoff must come from the server, not this process"
-    )
+    assert any(
+        "SELECT CURRENT_DATE" in sql for sql in executed
+    ), "the retention cutoff must come from the server, not this process"
 
 
 def test_retention_drops_only_partitions_older_than_the_window() -> None:
@@ -450,9 +450,9 @@ def test_a_concurrent_creator_does_not_abort_the_maintenance_run() -> None:
 
     assert manager.create_partition(date(2026, 8, 6)) is True
     manager.conn.rollback.assert_called_once()
-    assert [sql for sql in executed if "pg_inherits" in sql], (
-        "losing the race is not proof the partition exists -- ask the catalogue"
-    )
+    assert [
+        sql for sql in executed if "pg_inherits" in sql
+    ], "losing the race is not proof the partition exists -- ask the catalogue"
 
 
 def test_a_shadowed_name_still_raises_when_the_create_is_lost() -> None:

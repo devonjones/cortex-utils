@@ -145,9 +145,9 @@ def test_an_empty_queue_is_anchored_on_the_server_clock() -> None:
         m.analyze_existing_queue = original  # type: ignore[assignment]
 
     assert out["partition_range"].startswith(f"queue_{SERVER_TODAY.strftime('%Y_%m_%d')}")
-    assert any("CURRENT_DATE" in s for s, _ in conn.cur.executed), (
-        "the anchor must be the server's date, not this process's"
-    )
+    assert any(
+        "CURRENT_DATE" in s for s, _ in conn.cur.executed
+    ), "the anchor must be the server's date, not this process's"
 
 
 def test_a_preview_does_not_drop_the_migration_rollback_path() -> None:
@@ -206,9 +206,10 @@ def test_the_sequence_is_reseeded_by_asking_the_table_which_one_it_uses() -> Non
 
     setval = [(s, p) for s, p in conn.cur.executed if "setval" in s][0]
     assert "pg_get_serial_sequence" in _sql(conn, "pg_get_serial_sequence")
-    assert setval[1] == ("public.queue_new_id_seq", 42), (
-        "must reseed the sequence the table reports, not a hardcoded name"
-    )
+    assert setval[1] == (
+        "public.queue_new_id_seq",
+        42,
+    ), "must reseed the sequence the table reports, not a hardcoded name"
     assert "queue_id_seq" not in setval[0], "the name must be bound, not interpolated"
 
 
