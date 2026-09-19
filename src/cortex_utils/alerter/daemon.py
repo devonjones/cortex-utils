@@ -237,8 +237,8 @@ class AlerterDaemon:
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
-        # READ, do not reset. The reset used to happen here, 38 lines before the
-        # send, with the send's return value discarded -- so one Discord 5xx,
+        # READ, do not reset. The reset used to happen here, thirty lines above
+        # the send, with the send's return value discarded -- so one Discord 5xx,
         # timeout or 429 deleted the whole day's warnings unrecoverably, and
         # DiscordClient logged that failure into cortex-alerter, the one
         # container the denylist excludes. The alerter's report that it could

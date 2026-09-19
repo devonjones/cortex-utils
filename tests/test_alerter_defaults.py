@@ -2,9 +2,21 @@
 
 Population: every distinct string literal passed to log.error / log.critical /
 log.exception across postmark, triage, utils, gateway, actions and reflex,
-collected by AST walk on 2026-09-19 -- 67 messages, no length or content
-filter. These are what the code CAN report, not what it has reported; see the
-separate live figure below.
+collected by AST walk on 2026-09-19 -- no length or content filter. These are
+what the code CAN report, not what it has reported; see the separate live
+figure below.
+
+THE FIGURES BELOW WERE TAKEN AT 67, AT COMMIT 0e6b4f1. At HEAD the same walk
+gives 69, and the population is SELF-REFERENTIAL: it was 64 on main, and this
+PR has since added two log.error calls of its own ("Daily summary was NOT
+delivered" and "Scheduled job raised"). A change that makes error messages
+visible adds error messages to the set it measures.
+
+The ratios are unaffected -- both additions fall on the same side of every one
+of them -- so they are left as measured rather than restated against a
+denominator nobody took them against. Cite the commit if you quote them, and
+re-derive rather than trusting a number whose denominator moves with the
+branch.
 
     containers   5 of 11 running cortex containers were unwatched, including
                  cortex-gateway, cortex-actions-router, cortex-postgres and
@@ -444,7 +456,8 @@ class TestTheDedupKeyCollapsesRealTraffic:
 
     It did not. Hashing `log_line[:200]` hashed a NONCE: structlog renders a
     per-emit "timestamp" field that lands inside the window for any event under
-    ~137 characters, and Postgres prefixes its own clock. Measured 2026-09-19
+    ~87 characters in the envelope cortex actually emits, and Postgres prefixes
+    its own clock. Measured 2026-09-19
     over 7 days of all 11 cortex containers: 42 unclassified errors produced 42
     distinct keys -- a collapse rate of zero. With normalisation, 25.
 
@@ -919,8 +932,9 @@ class TestTheTailerDelivers:
 
     Rounds 1-4 fixed the gate, the dedup key, the summary's content and its
     delivery. All four assume a line arrives here. `grep -rn "_tail_container"
-    tests/` returned three hits before this class and all three were
-    `mock.patch.object` -- the function was never executed, so ten mutations of
+    tests/` returned three hits before this class -- two `mock.patch.object`
+    and one passing mention in a docstring. None of them executed it, so ten
+    mutations of
     it shipped green, including `self._process_log_line(...)` replaced by
     `pass`. The alerter could ingest NOTHING and 591 tests agreed it was fine.
 

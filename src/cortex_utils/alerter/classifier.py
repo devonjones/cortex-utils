@@ -181,8 +181,13 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
 # fault. Hashing the raw line made the digest unique per LINE rather than per
 # ERROR, which is the opposite of dedup:
 #
-#   * structlog renders a "timestamp" field, and for any event under ~137
-#     characters it lands INSIDE the 200-char window -- so two identical
+#   * structlog renders a "timestamp" field, and for any event under ~87
+#     characters -- in the five-field envelope cortex services actually emit,
+#     {event, service, logger, level, timestamp}; it is ~137 in a bare
+#     three-field one, which is what an earlier revision of this comment
+#     measured and wrongly generalised -- the clock lands INSIDE the 200-char
+#     window. A real Hades line is 170 chars with a 45-char event, so it is
+#     not near the boundary. Two identical
 #     messages one second apart got two different keys. Measured 2026-09-19:
 #     "Config reload failed" at .111111Z and at .222222Z hashed to 7949f4e4
 #     and 31df69bf.
@@ -311,16 +316,16 @@ def classify(container: str, log_line: str) -> Classification | None:
     # property shipped before the property did; that is what the tests in
     # TestTheDedupKeyCollapsesRealTraffic now hold in place.
     #
-    # The digest is what does the work here: the
-    # daemon's WARNING branch calls increment_warning() only, never
-    # should_alert(), so cooldown_minutes is inert on the path that actually
-    # consumes this classification. It is set for the case where a tuned
-    # pattern later raises the severity to HIGH or CRITICAL, which are the
-    # branches that do consult it.
-    # WARNING, deliberately: this severity aggregates into the daily summary
-    # rather than pinging the channel, which is exactly the right landing place
-    # for "an error nobody has triaged yet". A tuned pattern can still raise
-    # something to HIGH or CRITICAL once someone decides it deserves that.
+    # WARNING, deliberately: it aggregates into the daily summary rather than
+    # pinging the channel, which is the right landing place for "an error
+    # nobody has triaged yet". A tuned pattern can still raise something to
+    # HIGH or CRITICAL once someone decides it deserves that.
+    #
+    # cooldown_minutes does nothing at all on this path. The WARNING branch
+    # calls increment_warning() only, never should_alert(), and a tuned pattern
+    # returns its OWN Classification from the loop above and never reaches this
+    # line -- so no value here is ever consulted. It is 60 because the
+    # dataclass requires a number.
     digest = hashlib.sha1(_dedup_source(log_line).encode("utf-8", "replace")).hexdigest()[:8]
     return Classification(
         severity=Severity.WARNING,
