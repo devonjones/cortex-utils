@@ -6,11 +6,11 @@ collected by AST walk on 2026-09-19 -- no length or content filter. These are
 what the code CAN report, not what it has reported; see the separate live
 figure below.
 
-THE FIGURES BELOW WERE TAKEN AT 67, AT COMMIT 0e6b4f1. At HEAD the same walk
-gives 69, and the population is SELF-REFERENTIAL: it was 64 on main, and this
-PR has since added two log.error calls of its own ("Daily summary was NOT
-delivered" and "Scheduled job raised"). A change that makes error messages
-visible adds error messages to the set it measures.
+THE FIGURES BELOW WERE TAKEN AT 67, AT COMMIT 0e6b4f1. The same walk gives 64
+on main and 69 at HEAD, because the population is SELF-REFERENTIAL: this PR
+adds log.error calls of its own, five of them across the branch and two of
+them after the figures were taken. A change that makes error messages visible
+adds error messages to the set it measures.
 
 The ratios are unaffected -- both additions fall on the same side of every one
 of them -- so they are left as measured rather than restated against a
@@ -456,8 +456,9 @@ class TestTheDedupKeyCollapsesRealTraffic:
 
     It did not. Hashing `log_line[:200]` hashed a NONCE: structlog renders a
     per-emit "timestamp" field that lands inside the window for any event under
-    ~87 characters in the envelope cortex actually emits, and Postgres prefixes
-    its own clock. Measured 2026-09-19
+    a short enough event -- 71 to 90 characters depending on the service and
+    logger names in front of it -- and Postgres prefixes its own clock.
+    Measured 2026-09-19
     over 7 days of all 11 cortex containers: 42 unclassified errors produced 42
     distinct keys -- a collapse rate of zero. With normalisation, 25.
 
@@ -788,7 +789,7 @@ class TestDedupSourceSurvivesAnythingDockerEmits:
 class TestAFailedSummaryDoesNotDeleteTheDay:
     """The summary used to clear the day BEFORE it sent, and ignore the result.
 
-    `reset_warning_counts()` ran 38 lines above the send, and the send's bool
+    `reset_warning_counts()` ran thirty lines above the send, and the send's bool
     was discarded -- so one Discord 5xx, timeout or 429 destroyed every warning
     accumulated that day, unrecoverably. Worse in a way that is easy to miss:
     DiscordClient logs that failure into cortex-alerter, the one container

@@ -181,16 +181,18 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
 # fault. Hashing the raw line made the digest unique per LINE rather than per
 # ERROR, which is the opposite of dedup:
 #
-#   * structlog renders a "timestamp" field, and for any event under ~87
-#     characters -- in the five-field envelope cortex services actually emit,
-#     {event, service, logger, level, timestamp}; it is ~137 in a bare
-#     three-field one, which is what an earlier revision of this comment
-#     measured and wrongly generalised -- the clock lands INSIDE the 200-char
-#     window. A real Hades line is 170 chars with a 45-char event, so it is
-#     not near the boundary. Two identical
-#     messages one second apart got two different keys. Measured 2026-09-19:
-#     "Config reload failed" at .111111Z and at .222222Z hashed to 7949f4e4
-#     and 31df69bf.
+#   * structlog renders a "timestamp" field, and for a short enough event it
+#     lands INSIDE the 200-char window. The threshold is not one number: it is
+#     where the clock stops changing sha1(line[:200]), so it moves with the
+#     length of the service and logger names in front of it. Measured across
+#     the envelopes cortex actually emits, 71 to 90 characters of event; ~138
+#     in a bare {event, level, timestamp} line, which is what an earlier
+#     revision measured and wrongly generalised to production. Real events are
+#     well inside every one of those. Two identical
+#     messages one second apart got two different keys. That is asserted by
+#     test_the_same_fault_one_second_later_is_the_same_key rather than quoted
+#     here: an earlier revision printed the two digests without the line they
+#     were taken from, so nobody could re-derive them.
 #   * messages embed per-item ids. The six "Pattern detection failed for
 #     <gmail-id>" lines Hades emitted in 14 days are ONE recurring fault and
 #     produced SIX distinct keys.
