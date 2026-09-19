@@ -10,7 +10,7 @@ import schedule
 
 from cortex_utils.log import get_logger
 
-from .classifier import Severity, classify, is_error_line
+from .classifier import Severity, _dedup_source, classify, is_error_line
 from .discord import (
     COLOR_CRITICAL,
     COLOR_HIGH,
@@ -188,7 +188,12 @@ class AlerterDaemon:
 
             elif classification.severity == Severity.WARNING:
                 # Warnings are just counted for daily summary
-                self.rate_limiter.increment_warning(classification.error_key)
+                # The NORMALISED message, not the raw line: it is what the
+                # key was computed from, so it describes the whole bucket
+                # rather than whichever occurrence happened to arrive first.
+                self.rate_limiter.increment_warning(
+                    classification.error_key, _dedup_source(log_line)
+                )
                 log.debug(
                     "Warning counted",
                     container=container,
@@ -233,6 +238,8 @@ class AlerterDaemon:
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
         with self._lock:
+            # Samples BEFORE the reset, which clears them.
+            samples = dict(self.rate_limiter.warning_samples)
             counts = self.rate_limiter.reset_warning_counts()
 
         if not counts:
@@ -253,8 +260,16 @@ class AlerterDaemon:
             # error_key format: "container:error_type"
             parts = error_key.split(":", 1)
             container = parts[0] if len(parts) > 1 else "unknown"
-            error_type = parts[1].replace("_", " ").title() if len(parts) > 1 else error_key
-            warning_lines.append(f"- **{error_type}** ({container}): {count}")
+            error_type = parts[1].replace("_", " ") if len(parts) > 1 else error_key
+            # .title() used to be applied here and case-mangled the hex digest,
+            # so the string printed was not the key anyone could grep for.
+            if not error_type.startswith("unclassified"):
+                error_type = error_type.title()
+            line = f"- **{error_type}** ({container}): {count}"
+            sample = samples.get(error_key, "").strip()
+            if sample:
+                line += f"\n  {sample[:120]}"
+            warning_lines.append(line)
 
         description = f"**{datetime.now().strftime('%Y-%m-%d')}**\n\n"
         description += "**Warnings:**\n" + "\n".join(warning_lines[:20])  # Limit to 20 items

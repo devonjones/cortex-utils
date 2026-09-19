@@ -578,12 +578,18 @@ class TestTheDailySummaryTruncatesLoudly:
         d.discord = mock.Mock()
         return d
 
-    def _summary_of(self, n):
+    def _summary_of(self, n, sample="something went wrong"):
+        """Drives a REAL RateLimiter.
+
+        The first version of this stubbed it, which hid the defect the summary
+        actually had: the message was discarded at increment_warning(), so the
+        rendered line was a digest and a count and no error text at all. A
+        mocked rate limiter cannot show that, because the test supplies the
+        dict the real one would have failed to populate.
+        """
         d = self._daemon()
-        d.rate_limiter = mock.Mock()
-        d.rate_limiter.reset_warning_counts.return_value = {
-            f"cortex-x:unclassified:{i:04x}": 1 for i in range(n)
-        }
+        for i in range(n):
+            d.rate_limiter.increment_warning(f"cortex-x:unclassified:{i:04x}", sample)
         d._send_daily_summary()
         return d.discord.send_embed.call_args.kwargs["description"]
 
@@ -600,8 +606,6 @@ class TestTheDailySummaryTruncatesLoudly:
     def test_an_empty_day_still_reports(self):
         """Silence and 'nothing happened' must be distinguishable."""
         d = self._daemon()
-        d.rate_limiter = mock.Mock()
-        d.rate_limiter.reset_warning_counts.return_value = {}
         d._send_daily_summary()
         assert "No warnings" in d.discord.send_embed.call_args.kwargs["description"]
 
@@ -657,3 +661,111 @@ class TestClientFaultFilterNeverSuppressesCorruption:
         line = 'ERROR:  relation "nosuch" does not exist'
         assert is_client_sql_fault("cortex-postgres", line)
         assert not is_client_sql_fault("cortex-triage-worker", line)
+
+
+class TestTheSummarySaysWhatFailed:
+    """The PR's declared landing place must carry the error, not just a tally.
+
+    084c7fe made the daily summary the destination for every untriaged error in
+    the estate. It rendered them as
+
+        - **Unclassified:8A416200** (cortex-gateway): 2
+
+    -- container, count, opaque digest, no message. The text was discarded at
+    `increment_warning()`, which took only the key. `.title()` then case-mangled
+    the hex, so the string printed was not even the key you could grep for.
+
+    A summary nobody can act on is the silence this PR exists to end, wearing
+    the fix's clothes.
+    """
+
+    @staticmethod
+    def _summary(container, event, times=1):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=[container])
+        d.discord = mock.Mock()
+        for i in range(times):
+            d._process_log_line(
+                container,
+                json.dumps(
+                    {"event": event, "level": "error", "timestamp": f"2026-09-19T0{i}:00:00Z"}
+                ),
+            )
+        d._send_daily_summary()
+        return d.discord.send_embed.call_args.kwargs["description"]
+
+    def test_the_message_reaches_the_summary(self):
+        body = self._summary("cortex-gateway", "Missing required environment variables: PG_PASS")
+        assert "Missing required environment variables: PG_PASS" in body
+
+    def test_the_count_is_still_there(self):
+        body = self._summary("cortex-gateway", "Config reload failed", times=3)
+        assert "): 3" in body
+        assert "Config reload failed" in body
+
+    def test_the_digest_is_left_greppable(self):
+        """.title() on a hex digest prints a string that matches no key."""
+        body = self._summary("cortex-gateway", "Config reload failed")
+        digest = classify(
+            "cortex-gateway",
+            json.dumps(
+                {
+                    "event": "Config reload failed",
+                    "level": "error",
+                    "timestamp": "2026-09-19T00:00:00Z",
+                }
+            ),
+        ).error_key.rsplit(":", 1)[1]
+        assert digest == digest.lower(), "precondition: keys are lowercase hex"
+        assert digest in body, "the printed key must be the real one"
+
+    def test_the_sample_represents_the_bucket_not_one_arrival(self):
+        """Six ids collapse to one key, so the sample must be the normalised form."""
+        body = self._summary(
+            "cortex-triage-worker", "Pattern detection failed for 1a06430fa5df4c3e"
+        )
+        assert "Pattern detection failed for <>" in body
+
+
+class TestDedupSourceSurvivesAnythingDockerEmits:
+    """An exception here does not fail one line, it drops a container.
+
+    `_tail_container` wraps the whole tail loop in `except Exception`, sleeps
+    30s and restarts with `since=now` -- so a raise inside classify silently
+    discards every line that container emitted in between. Both isinstance
+    guards and the `errors="replace"` on the hash are load-bearing on input
+    Docker can really produce, and none of them was tested.
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "null",
+            "[]",
+            '"just a string"',
+            "123456",
+            '{"event": {"nested": "object"}}',
+            '{"event": null}',
+            '{"event": 5}',
+            '{"event": "truncated by the log driver...',
+            "",
+            "\udcff a lone surrogate",
+            "a NUL\x00byte",
+            "plain text, not JSON at all",
+        ],
+    )
+    def test_it_returns_a_string_and_does_not_raise(self, line):
+        from cortex_utils.alerter.classifier import _dedup_source
+
+        assert isinstance(_dedup_source(line), str)
+
+    def test_a_surrogate_can_still_be_hashed(self):
+        """errors='replace' on the encode, or classify() raises on real input."""
+        assert classify("cortex-x", "ERROR \udcff broke") is not None
+
+    def test_a_very_long_line_is_bounded(self):
+        from cortex_utils.alerter.classifier import _dedup_source
+
+        assert len(_dedup_source("ERROR " + "x" * 100_000)) <= 200

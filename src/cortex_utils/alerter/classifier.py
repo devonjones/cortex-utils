@@ -198,8 +198,13 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
 _VOLATILE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?"  # ISO timestamps
     r"|\b[0-9a-f]{6,}\b"  # hex ids -- gmail ids, sha digests, uuids
-    r"|\[\d+\]"  # postgres's [pid] -- bracketed, so any width
-    r"|\b\d{3,}\b",  # counts, durations, ports
+    r"|\[\d+\]",  # postgres's [pid] -- bracketed, so any width
+    # Deliberately NOT a bare \b\d{3,}\b. Measured over 7 days of all 11
+    # cortex containers it collapsed nothing the other three did not already
+    # collapse (25 keys with it, 25 without), while merging faults that are
+    # genuinely different: "exit code 137" (OOM) with "exit code 139"
+    # (segfault), "HttpError 404" with "HttpError 410", sqlstate 53300 with
+    # 53200, port 5432 with 8097. All downside, no measured upside.
     re.IGNORECASE,
 )
 
