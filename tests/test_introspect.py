@@ -264,9 +264,13 @@ def test_a_hostile_from_header_cannot_leave_its_path_segment(hostile: str) -> No
     # occupy exactly ONE path segment. ".." inside a segment is inert --
     # traversal needs separators, and quote(safe="") escapes them -- so
     # asserting on ".." would fail the correct encoding. Assert the shape.
-    assert path.split("/") == ["", "emails", "sender", path.split("/")[3], "classifications"], (
-        f"the sender escaped its path segment: {path!r}"
-    )
+    assert path.split("/") == [
+        "",
+        "emails",
+        "sender",
+        path.split("/")[3],
+        "classifications",
+    ], f"the sender escaped its path segment: {path!r}"
     middle = path.split("/")[3]
     for ch in ("?", "#", "\n", "\r", " "):
         assert ch not in middle, f"{ch!r} survived unencoded into the path: {path!r}"
@@ -684,9 +688,11 @@ def test_the_gmail_id_site_is_quoted_too() -> None:
     c = FakeClient()
     CortexTools(c, "../../config").dispatch("message_details", {})
     first = c.paths[0]
-    assert first.split("/") == ["", "emails", first.split("/")[2]], (
-        f"gmail_id escaped its segment: {first!r}"
-    )
+    assert first.split("/") == [
+        "",
+        "emails",
+        first.split("/")[2],
+    ], f"gmail_id escaped its segment: {first!r}"
 
 
 def test_an_unencodable_sender_is_a_tool_error_not_a_crash() -> None:

@@ -206,9 +206,10 @@ def test_the_sequence_is_reseeded_by_asking_the_table_which_one_it_uses() -> Non
 
     setval = [(s, p) for s, p in conn.cur.executed if "setval" in s][0]
     assert "pg_get_serial_sequence" in _sql(conn, "pg_get_serial_sequence")
-    assert setval[1] == ("public.queue_new_id_seq", 42), (
-        "must reseed the sequence the table reports, not a hardcoded name"
-    )
+    assert setval[1] == (
+        "public.queue_new_id_seq",
+        42,
+    ), "must reseed the sequence the table reports, not a hardcoded name"
     assert "queue_id_seq" not in setval[0], "the name must be bound, not interpolated"
 
 

@@ -14,6 +14,10 @@ class RateLimiter:
     def __init__(self):
         self.last_alert: dict[str, datetime] = {}
         self.warning_counts: dict[str, int] = defaultdict(int)
+        # One representative message per key. The counts alone rendered a
+        # summary of opaque digests -- "Unclassified:8A416200 (cortex-gateway):
+        # 2" -- which told a reader nothing about what had failed.
+        self.warning_samples: dict[str, str] = {}
         self.last_reset: datetime = datetime.now()
 
     def should_alert(self, error_key: str, cooldown_minutes: int) -> bool:
@@ -40,9 +44,17 @@ class RateLimiter:
 
         return False
 
-    def increment_warning(self, error_key: str) -> None:
-        """Increment warning count for daily summary aggregation."""
+    def increment_warning(self, error_key: str, sample: str = "") -> None:
+        """Increment warning count for daily summary aggregation.
+
+        `sample` is one representative message for this key, kept so the daily
+        summary can say what failed rather than only how often. The FIRST is
+        kept: every later occurrence shares the key, so they describe the same
+        fault, and keeping the first avoids re-writing the dict on every line.
+        """
         self.warning_counts[error_key] += 1
+        if sample and error_key not in self.warning_samples:
+            self.warning_samples[error_key] = sample
 
     def get_warning_counts(self) -> dict[str, int]:
         """Get accumulated warning counts since last reset."""
@@ -55,6 +67,7 @@ class RateLimiter:
         """
         counts = dict(self.warning_counts)
         self.warning_counts.clear()
+        self.warning_samples.clear()
         self.last_reset = datetime.now()
         return counts
 

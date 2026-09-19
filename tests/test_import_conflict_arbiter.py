@@ -81,8 +81,7 @@ def _index_is_dropped_after_being_established(name: str) -> bool:
         re.IGNORECASE,
     )
     drops = re.compile(
-        rf"DROP\s+INDEX(\s+CONCURRENTLY)?(\s+IF\s+EXISTS)?\s+"
-        rf"(\w+\.)?{re.escape(name)}\b",
+        rf"DROP\s+INDEX(\s+CONCURRENTLY)?(\s+IF\s+EXISTS)?\s+" rf"(\w+\.)?{re.escape(name)}\b",
         re.IGNORECASE,
     )
 
