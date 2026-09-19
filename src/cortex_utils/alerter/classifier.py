@@ -31,13 +31,9 @@ class Classification:
 PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
     # === CRITICAL (data loss risk, auth failures) ===
     (
-        # NOT historyId.*404 -- a Gmail history ID is a plain integer and
-        # routinely CONTAINS "404" as a substring. Measured: 9 routine INFO
-        # Pub/Sub notifications in 24h matched, e.g. historyId=79564045, each
-        # of which would have fired this CRITICAL zero-cooldown alert saying
-        # "Emails may be lost. Run manual backfill." They stayed quiet only
-        # because the daemon's is_error_line() gate drops INFO lines first --
-        # an accidental protection, not a designed one.
+        # Not historyId.*404: history ids are integers that routinely
+        # contain "404" (historyId=79564045). Require 404 to be an HTTP
+        # status.
         re.compile(
             r"History expired"
             r"|history.*too old"
@@ -52,11 +48,8 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
         "History ID is too old. Emails may be lost. Run manual backfill.",
     ),
     (
-        # \bOOM\b, not OOM -- unanchored it matches inside ordinary words.
-        # Measured: it fired on a Gmail label "Cortex/Automated/Zoom", which
-        # would have been a CRITICAL "Container ran out of memory and may have
-        # crashed". Same defect class as the 5xx pattern below: a substring
-        # match where a token match was meant.
+        # Word-bounded: unanchored, OOM matches inside ordinary words --
+        # it fired on the Gmail label "Cortex/Automated/Zoom".
         re.compile(
             r"\bMemoryError\b|\bexit code 137\b|\bOOM\b|\bOut of memory\b",
             re.IGNORECASE,
@@ -106,11 +99,9 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
         "Gmail API rate limit hit. Service is backing off.",
     ),
     (
-        # NOT a bare \b5\d{2}\b -- that matches ANY three-digit number from
-        # 500-599 anywhere in a line. Measured: it MATCHED 122 times in 24h on
-        # Postgres checkpoint logs ("wrote 571 buffers"). It reads a traceback
-        # frame at capture_worker.py:517 as an HTTP status the same way -- a
-        # source line number. Require HTTP context.
+        # Require HTTP context. A bare \b5\d{2}\b matches any number in
+        # 500-599 anywhere in a line -- Postgres's "wrote 571 buffers", a
+        # traceback's line 517.
         re.compile(
             r"HttpError 5\d{2}"
             r"|\bHTTP[/ ]?\d?\.?\d?\s*5\d{2}\b"
@@ -177,41 +168,23 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
 ]
 
 
-# Everything in a log line that changes between two occurrences of the SAME
-# fault. Hashing the raw line made the digest unique per LINE rather than per
-# ERROR, which is the opposite of dedup:
+# Everything that differs between two occurrences of the SAME fault. The key
+# must identify the fault, not the line: structlog stamps every emit with a
+# timestamp that lands inside the 200-char window, and messages embed per-item
+# ids, so hashing the raw line gave one key per line. Measured over 7 days of
+# all cortex containers: 42 unclassified errors, 42 distinct keys without
+# normalisation, 25 with.
 #
-#   * structlog renders a "timestamp" field, and for a short enough event it
-#     lands INSIDE the 200-char window. The threshold is not one number: it is
-#     where the clock stops changing sha1(line[:200]), so it moves with the
-#     length of the service and logger names in front of it. Measured across
-#     the envelopes cortex actually emits, 71 to 90 characters of event; ~138
-#     in a bare {event, level, timestamp} line, which is what an earlier
-#     revision measured and wrongly generalised to production. Real events are
-#     well inside every one of those. Two identical
-#     messages one second apart got two different keys. That is asserted by
-#     test_the_same_fault_one_second_later_is_the_same_key rather than quoted
-#     here: an earlier revision printed the two digests without the line they
-#     were taken from, so nobody could re-derive them.
-#   * messages embed per-item ids. The six "Pattern detection failed for
-#     <gmail-id>" lines Hades emitted in 14 days are ONE recurring fault and
-#     produced SIX distinct keys.
-#
-# Both matter because the catch-all's survivability rests entirely on this
-# dedup: a service failing in a loop must collapse to one summary line, and
-# the daily summary truncates at 20 entries. Without normalisation the first
-# real incident renders 20 near-identical lines and "... and N more", which is
-# useless exactly when it is needed.
+# This is load-bearing. The daily summary truncates at 20 entries, so without
+# it one looping service fills the summary with near-identical lines exactly
+# when something is wrong.
 _VOLATILE = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?"  # ISO timestamps
     r"|\b[0-9a-f]{6,}\b"  # hex ids -- gmail ids, sha digests, uuids
     r"|\[\d+\]",  # postgres's [pid] -- bracketed, so any width
-    # Deliberately NOT a bare \b\d{3,}\b. Measured over 7 days of all 11
-    # cortex containers it collapsed nothing the other three did not already
-    # collapse (25 keys with it, 25 without), while merging faults that are
-    # genuinely different: "exit code 137" (OOM) with "exit code 139"
-    # (segfault), "HttpError 404" with "HttpError 410", sqlstate 53300 with
-    # 53200, port 5432 with 8097. All downside, no measured upside.
+    # No bare \b\d{3,}\b: on real traffic it collapsed nothing the rules
+    # above did not (25 keys either way) while merging distinct faults --
+    # exit code 137 with 139, HttpError 404 with 410.
     re.IGNORECASE,
 )
 
@@ -246,26 +219,14 @@ def classify(container: str, log_line: str) -> Classification | None:
     Returns:
         Classification if this is an error worth tracking, None otherwise
     """
-    # FIRST, unconditionally: a client's bad SQL is not our error, whatever it
-    # matches below. This is a source filter, not a severity gate -- Postgres
-    # logs a rejected query at ERROR level and it is still Postgres working
-    # correctly. See the note on is_client_sql_fault for the measurement.
+    # A client's bad SQL is not our error, whatever it matches below.
     if is_client_sql_fault(container, log_line):
         return None
 
-    # The tuned patterns run FIRST and are deliberately NOT gated on
-    # is_error_line(). They encode domain knowledge the generic indicator list
-    # lacks: "History expired for historyId 12345" and "HttpError 503 Service
-    # Unavailable" are both real failures, and neither contains ERROR, Failed
-    # or Traceback. Gating them broke four existing tests, correctly.
-    #
-    # The price is that a BAD pattern can classify a line that is not an error
-    # at all, so the patterns carry the burden of precision. One did not: a
-    # bare \b5\d{2}\b MATCHED "checkpoint complete: wrote 571 buffers" 122
-    # times in 24h. It never alerted -- cortex-postgres was not in the watched
-    # set, and the daemon gates on is_error_line() before classifying -- so
-    # this was a live landmine rather than a live incident. Fixed at the
-    # pattern, not by gating the patterns.
+    # Tuned patterns are deliberately NOT gated on is_error_line(): "History
+    # expired for historyId 12345" and "HttpError 503" are real failures
+    # containing no error word. The price is that an over-broad pattern
+    # classifies a non-error, so the patterns carry the burden of precision.
     for pattern, severity, cooldown, title, description in PATTERNS:
         if pattern.search(log_line):
             # Create unique key for deduplication
@@ -279,55 +240,21 @@ def classify(container: str, log_line: str) -> Classification | None:
                 description=description,
             )
 
-    # The catch-all IS gated, because it is generic where the patterns are
-    # specific. Without it, "INFO: Processed 10 emails successfully" would
-    # alert for any caller that skipped the daemon's own gate -- a pre-existing
-    # test caught exactly that.
+    # The catch-all IS gated: it is generic where the patterns are specific,
+    # so ungated it would classify "INFO: Processed 10 emails successfully".
     if not is_error_line(log_line):
         return None
 
-    # NO SPECIFIC PATTERN, BUT is_error_line() ALREADY SAID THIS IS AN ERROR.
-    # Falling through to None here is what made this component decorative:
-    # measured 2026-09-19 by AST walk over every string literal logged at
-    # error/critical/exception across six cortex services -- 67 messages -- the
-    # tuned patterns matched 3. "Failed to create required label" and "Gmail
-    # batch modify failed" reached this point and were dropped because nobody
-    # had written a pattern for that phrasing.
+    # No tuned pattern, but the line is an error: alert on it anyway. Before
+    # this, an unrecognised error was dropped here, and of 67 error messages
+    # cortex can emit, 3 matched a pattern and 0 could reach the channel.
+    # The patterns are ENRICHMENT -- tuned severity and cooldown -- not a gate.
     #
-    # The other failure was upstream and larger: only 15 of the 67 got past the
-    # gate at all, because it read the message text and a cortex service puts
-    # its severity in a structlog "level" field. None of the 3 pattern-matchers
-    # was among those 15, and daemon.py gates before it classifies -- so the
-    # number of these 67 that could actually reach the channel was ZERO. Fixed
-    # in is_error_line; the two together take the 67 from 0 reachable to 67.
-    #
-    # An alerter whose default is silence reports only the failures someone
-    # already thought of, which are the ones least likely to surprise anyone.
-    # Alert on the rest and let the specific patterns be ENRICHMENT -- they
-    # keep their tuned severities and cooldowns; they no longer act as a gate.
-    #
-    # The key is hashed off the NORMALISED message (see _dedup_source) so a
-    # service failing in a loop collapses to one summary line rather than
-    # hundreds. That dedup is what makes a noisy default survivable.
-    #
-    # It did not work when first written, and the failure was total rather than
-    # partial: hashing the raw log_line[:200] hashed a per-emit timestamp, so
-    # the key was unique per LINE. Measured over 7 days of all 11 cortex
-    # containers, 42 unclassified errors produced 42 distinct keys -- a
-    # collapse rate of ZERO. With normalisation, 25. The comment claiming the
-    # property shipped before the property did; that is what the tests in
-    # TestTheDedupKeyCollapsesRealTraffic now hold in place.
-    #
-    # WARNING, deliberately: it aggregates into the daily summary rather than
-    # pinging the channel, which is the right landing place for "an error
-    # nobody has triaged yet". A tuned pattern can still raise something to
-    # HIGH or CRITICAL once someone decides it deserves that.
-    #
-    # cooldown_minutes does nothing at all on this path. The WARNING branch
-    # calls increment_warning() only, never should_alert(), and a tuned pattern
-    # returns its OWN Classification from the loop above and never reaches this
-    # line -- so no value here is ever consulted. It is 60 because the
-    # dataclass requires a number.
+    # WARNING is deliberate: it aggregates into the daily summary rather than
+    # pinging the channel, which is where an untriaged error belongs.
+    # cooldown_minutes is unused on this path (the WARNING branch only counts,
+    # and a tuned pattern returns before reaching here); the dataclass
+    # requires a number.
     digest = hashlib.sha1(_dedup_source(log_line).encode("utf-8", "replace")).hexdigest()[:8]
     return Classification(
         severity=Severity.WARNING,
@@ -339,17 +266,12 @@ def classify(container: str, log_line: str) -> Classification | None:
 
 
 # Postgres logs CLIENT SQL faults at ERROR level. A database rejecting bad SQL
-# is working correctly -- the bug is in whoever sent the query, and in this
-# estate that is usually an agent at a psql prompt. Measured over 24h of real
-# logs: 21 error lines, ALL from cortex-postgres, and 17 of them were failed
-# ad-hoc queries typed by agents that evening (including several of mine:
-# "aggregate functions are not allowed in GROUP BY", "unterminated quoted
-# identifier", "ORDER BY position 2 is not in select list").
+# is working correctly -- the bug is in whoever sent the query, and here that
+# is usually an agent at a psql prompt. Without this filter the catch-all
+# turns the channel into a feed of our own typos.
 #
-# Without this filter the catch-all above turns the notifications channel into
-# a feed of our own typos, which is the fastest way to teach someone to ignore
-# it. Server-side trouble -- FATAL, PANIC, shared memory, disk, corruption --
-# is not matched here and still alerts.
+# Deliberately narrow. Server-side distress -- FATAL, PANIC, shared memory,
+# disk, and btree corruption (see cortex-rj2b) -- must NOT be matched here.
 _CLIENT_SQL_FAULT = re.compile(
     r"ERROR:\s+(?:"
     r"column .* does not exist"
@@ -377,10 +299,7 @@ _ERROR_INDICATORS = [
     "ERROR",
     "CRITICAL",
     "FATAL",
-    # Postgres's HIGHEST severity -- the server is aborting, usually disk or
-    # corruption. It was missing, so a PANIC line was not even recognised as an
-    # error, let alone classified. Found by a test written for the catch-all
-    # change rather than by looking for it.
+    # Postgres's highest severity: the server is aborting.
     "PANIC",
     "Exception",
     "Traceback",
@@ -391,23 +310,10 @@ _ERROR_INDICATORS = [
 ]
 
 
-# Cortex services log structlog JSON, where the severity lives in a "level"
-# field and NOT in the message text: {"event": "Missing required environment
-# variables: ...", "level": "error", ...}. The indicator list above reads the
-# text only, so such a line was not recognised as an error at all -- the
-# service announcing it cannot start was invisible to the alerter.
-#
-# Measured 2026-09-19 against every error-level line Hades emitted in 14 days
-# -- 8 lines, cortex-triage-worker and cortex-labeling-worker. The text-only
-# list caught 8 of 8, but NOT for the reason it looks like: six of them read
-# "Pattern detection failed for <id>", and bare lowercase "failed" is not an
-# indicator ("Failed" and "failed:" are). Those six matched on "Traceback",
-# which structlog had serialised into the exception payload. On the event text
-# alone only the 2 "Gmail batch modify failed:" lines would have passed.
-#
-# So the coverage rested on those six carrying exc_info. A line reporting a
-# fatal condition without a traceback and without an error word -- a startup
-# abort is exactly that shape -- was invisible.
+# Cortex services log structlog JSON with the severity in a "level" field,
+# not in the message text: {"event": "Missing required environment variables",
+# "level": "error"}. The indicator list above reads text only, so a service
+# reporting it cannot start was not recognised as an error at all.
 _LEVEL_FIELD = re.compile(r'"level"\s*:\s*"(error|critical)"')
 
 

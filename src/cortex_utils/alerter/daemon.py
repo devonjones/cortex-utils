@@ -22,27 +22,15 @@ from .rate_limiter import RateLimiter
 
 log = get_logger()
 
-# Containers to monitor: EVERYTHING under the prefix, minus an explicit
-# denylist. This was an allowlist of six names, and the property that matters
-# is which way forgetting fails.
-#
-# Under an allowlist, adding a service to the estate silently adds an UNWATCHED
-# service -- nothing tells you, and you find out when it fails quietly. Measured
-# 2026-09-18: of 11 cortex containers running on hades, FIVE were unwatched --
-# cortex-gateway (the API everything goes through), cortex-actions-router
-# (dispatches downstream workflows), cortex-postgres, cortex-teach, and
-# cortex-alerter ITSELF.
-#
-# Under a denylist, forgetting is safe: a new service is watched by default and
-# the failure mode is noise, which somebody notices, rather than silence, which
-# nobody does.
+# Everything under the prefix, minus a denylist. This was an allowlist of six
+# names, which left 5 of 11 running containers unwatched -- including the
+# gateway and the alerter itself. A denylist fails toward noise, which someone
+# notices; an allowlist fails toward silence, which nobody does.
 CONTAINER_PREFIX = "cortex-"
 
-# The alerter cannot usefully watch itself -- if it dies, it is not reading
-# anything, including its own logs. Self-observation is not a health check;
-# that needs an EXTERNAL watcher (the estate's pattern for this is
-# scripts/checks.d/ in ~/HomeLab, e.g. ofelia-jobs-check). Excluded here so the
-# denylist does not imply coverage it cannot provide. See cortex-ogqq.
+# The alerter cannot watch itself: if it dies it reads nothing, including its
+# own logs. That needs an external watcher (~/HomeLab scripts/checks.d/), so it
+# is excluded rather than implying coverage it cannot provide. cortex-ogqq.
 DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
 
 
@@ -187,10 +175,9 @@ class AlerterDaemon:
                     )
 
             elif classification.severity == Severity.WARNING:
-                # Warnings are just counted for daily summary
-                # The NORMALISED message, not the raw line: it is what the
-                # key was computed from, so it describes the whole bucket
-                # rather than whichever occurrence happened to arrive first.
+                # Counted for the daily summary. The sample is the
+                # NORMALISED message, so it describes the whole bucket rather
+                # than whichever occurrence arrived first.
                 self.rate_limiter.increment_warning(
                     classification.error_key, _dedup_source(log_line)
                 )
@@ -237,12 +224,8 @@ class AlerterDaemon:
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
-        # READ, do not reset. The reset used to happen here, thirty lines above
-        # the send, with the send's return value discarded -- so one Discord 5xx,
-        # timeout or 429 deleted the whole day's warnings unrecoverably, and
-        # DiscordClient logged that failure into cortex-alerter, the one
-        # container the denylist excludes. The alerter's report that it could
-        # not report went to the one log nothing watches.
+        # READ, do not reset -- see _clear_if_delivered. Resetting here and
+        # ignoring the send result meant one Discord 5xx deleted the day.
         with self._lock:
             samples = dict(self.rate_limiter.warning_samples)
             counts = self.rate_limiter.get_warning_counts()
@@ -296,12 +279,11 @@ class AlerterDaemon:
         )
 
     def _clear_if_delivered(self, delivered: bool, warning_count: int = 0) -> None:
-        """Drop the day's warnings only once someone has actually seen them.
+        """Drop the day's warnings only once Discord has accepted them.
 
-        A failed send keeps them, so the next summary carries them instead of
-        losing them. The narrow race -- a warning arriving between the read and
-        this reset is cleared without being reported -- is one HTTP request
-        wide, and is a far smaller loss than the whole day.
+        A failed send keeps them for the next summary. A warning arriving
+        between the read and this reset is lost, but that window is one HTTP
+        request wide.
         """
         if not delivered:
             log.error(

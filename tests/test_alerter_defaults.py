@@ -1,57 +1,13 @@
-"""The alerter's three defaults, all of which used to fail toward silence.
+"""The alerter's defaults, all of which used to fail toward silence.
 
-Population: every distinct string literal passed to log.error / log.critical /
-log.exception across postmark, triage, utils, gateway, actions and reflex,
-collected by AST walk on 2026-09-19 -- no length or content filter. These are
-what the code CAN report, not what it has reported; see the separate live
-figure below.
+Three things were wrong and each hid the next: the gate could not see
+structlog's "level" field, the dedup key hashed a per-emit timestamp, and the
+daily summary printed a count with no message. Measured before the change, of
+67 error messages cortex can emit, zero could reach a human.
 
-THE FIGURES BELOW WERE TAKEN AT 67, AT COMMIT 0e6b4f1. The same walk gives 64
-on main and 69 at HEAD, because the population is SELF-REFERENTIAL: this PR
-adds log.error calls of its own, five of them across the branch and two of
-them after the figures were taken. A change that makes error messages visible
-adds error messages to the set it measures.
-
-The ratios are unaffected -- both additions fall on the same side of every one
-of them -- so they are left as measured rather than restated against a
-denominator nobody took them against. Cite the commit if you quote them, and
-re-derive rather than trusting a number whose denominator moves with the
-branch.
-
-    containers   5 of 11 running cortex containers were unwatched, including
-                 cortex-gateway, cortex-actions-router, cortex-postgres and
-                 cortex-alerter itself
-    patterns      3 of 67 matched a tuned pattern
-    gate         15 of 67 were recognised as errors at all. The severity of a
-                 cortex log line lives in a structlog "level" field, and the
-                 indicator list read the message TEXT only -- so "Config reload
-                 failed", "Cannot start without Docker connection" and 50 other
-                 real failures were invisible before any pattern was consulted
-    reachable     0. None of the 3 pattern-matchers was among the 15, and the
-                 daemon gates on is_error_line() before it classifies, so
-                 nothing in this population could reach the channel at all
-
-An earlier revision of this docstring said "2 of 40 ... the other 38 were
-correctly identified as errors by is_error_line() and then dropped for want of
-a tuned pattern". The shape of that claim was wrong, not just the counts: most
-of those messages were never identified as errors in the first place, so the
-catch-all alone would have rescued 15 of 67 rather than all of them. Both
-halves were needed.
-
-That revision also said 66, from a walk that silently dropped literals under
-ten characters and so excluded "Peer down". The stated method did not
-reproduce the stated number, which is the more serious half of the error --
-hence "no length or content filter" above. Re-derive rather than trust it.
-
-The live figure looks like it disagrees and does not. Of the 8 error-level
-lines Hades emitted in the 14 days to 2026-09-19 the text-only gate caught 8,
-but six of those read "Pattern detection failed for <id>" and bare lowercase
-"failed" is not an indicator -- they matched on "Traceback" in the serialised
-exception payload. On the event text alone, 2 of 8 would have passed. The
-coverage rested on those six carrying exc_info.
-
-All three were allowlists. The property that matters is which way FORGETTING
-fails: silently under an allowlist, noisily under a denylist.
+Every test here asserts one of those stays fixed. They are written against
+real Hades log lines rather than synthetic ones, because the defects were all
+in the difference between the two.
 """
 
 from __future__ import annotations
@@ -81,12 +37,7 @@ class TestContainerDiscovery:
         assert discover_containers(["nginx", "postgres", "traefik"]) == []
 
     def test_the_alerter_does_not_watch_itself(self) -> None:
-        """Self-observation is not a health check.
-
-        A dead alerter reads nothing, including its own logs, so watching
-        itself would imply coverage it cannot provide. Noticing its death
-        needs an EXTERNAL check.
-        """
+        """If it dies it reads nothing, including its own logs. cortex-ogqq."""
         assert "cortex-alerter" not in discover_containers(["cortex-alerter", "cortex-gateway"])
         assert "cortex-alerter" in DENYLISTED_CONTAINERS
 
@@ -152,12 +103,7 @@ class TestClassifierFallsThroughToNoise:
 
 
 class TestPostgresClientFaultsAreNotOurErrors:
-    """A database rejecting bad SQL is working correctly.
-
-    Measured over 24h of real logs: 21 error lines, ALL from cortex-postgres,
-    and 17 were failed ad-hoc queries typed by agents that evening. Alerting on
-    those turns the notifications channel into a feed of our own typos.
-    """
+    """A database rejecting bad SQL is working correctly; the sender has the bug."""
 
     @pytest.mark.parametrize(
         "message",
@@ -193,19 +139,12 @@ class TestPostgresClientFaultsAreNotOurErrors:
 
 
 class TestPatternsMustBePrecise:
-    """A tuned pattern is NOT gated on is_error_line(), so it must be precise.
+    """A tuned pattern is not gated on is_error_line(), so it must be precise.
 
-    The patterns run before the generic gate, because they encode domain
-    knowledge it lacks -- "History expired for historyId 12345" is a real
-    failure containing none of ERROR, Failed or Traceback. The price is that an
-    over-broad pattern classifies lines that are not errors at all.
-
-    One did. `\\b5\\d{2}\\b` matches ANY three-digit number from 500-599
-    anywhere in a line, so routine Postgres bookkeeping MATCHED the API server
-    error pattern 122 times in 24 hours. It never alerted -- cortex-postgres
-    was unwatched and the daemon gates on is_error_line() first -- so the
-    number counts matches, not pings. The same pattern reads a traceback frame
-    at capture_worker.py:517 as an HTTP status: a source line number.
+    `\\b5\\d{2}\\b` matches any number in 500-599 anywhere in a line, so routine
+    Postgres bookkeeping matched the API-server-error pattern 122 times in 24h.
+    It never alerted -- postgres was unwatched and the daemon gates first -- so it
+    was a landmine, not an incident.
     """
 
     @pytest.mark.parametrize(
@@ -239,16 +178,10 @@ class TestPatternsMustBePrecise:
 
 
 class TestCriticalPatternsDoNotMatchRoutineTraffic:
-    """Two CRITICAL patterns matched healthy traffic, found by measurement.
+    """A CRITICAL pattern pings the channel, so a false positive is expensive.
 
-    Both are the same defect as the 5xx one: a substring match where a token
-    match was meant. Both are CRITICAL, and the history one has a ZERO
-    cooldown, so every match pings the channel.
-
-    Neither fired in production, but only because the daemon's is_error_line()
-    gate drops INFO lines before classify() sees them. That is accidental
-    protection, not design -- the patterns are reached directly by any other
-    caller, and the gate is not what makes them correct.
+    Each line here is real traffic that an over-broad version of one of these
+    patterns matched.
     """
 
     @pytest.mark.parametrize(
@@ -302,16 +235,11 @@ class TestCriticalPatternsDoNotMatchRoutineTraffic:
 
 
 class TestRegexesStillMatchTheRealCondition:
-    """The re-anchoring must not have silenced the failures it was tuning for.
+    """Every anchoring fix narrows a pattern, and a narrowed pattern fails silently.
 
-    Every anchoring fix in this PR narrows a pattern, and a narrowed pattern
-    fails SILENTLY -- a false negative is an alert that never arrives, with
-    nothing in any log to say so. The sibling class above proves these patterns
-    no longer match routine traffic; on its own that is satisfied by a pattern
-    that matches nothing at all.
-
-    Each case below is the real failure the alternation exists for, so deleting
-    that alternation fails a test rather than going quiet.
+    The sibling class proves these no longer match routine traffic; on its own
+    that is satisfied by a pattern matching nothing. Each case here is the real
+    failure its alternation exists for.
     """
 
     @pytest.mark.parametrize(
@@ -346,15 +274,11 @@ class TestRegexesStillMatchTheRealCondition:
 
 
 class TestStructlogLevelIsAnErrorSignal:
-    """Cortex services put the severity in a field, not in the message text.
+    """Cortex services put severity in a field, not in the message text.
 
-    ``{"event": "Missing required environment variables: ...", "level":
-    "error"}`` contains no word from _ERROR_INDICATORS, so a text-only gate
-    dropped it -- the alerter could not see a service reporting it cannot
-    start. Measured 2026-09-19 over 14 days of Hades logs: all 8 error-level
-    lines were caught, but six of them only via "Traceback" in the serialised
-    exception payload -- bare lowercase "failed" is not an indicator. On the
-    event text alone, 2 of 8 would have passed.
+    `{"event": "Missing required environment variables", "level": "error"}`
+    contains no word from _ERROR_INDICATORS, so a text-only gate dropped a
+    service reporting it could not start.
     """
 
     def test_structlog_error_level_is_an_error(self):
@@ -382,11 +306,7 @@ class TestStructlogLevelIsAnErrorSignal:
 class TestDiscoveryIsWiredIn:
     """discover_containers() is pure and tested above; this is the wiring.
 
-    The pure function can be perfect while the daemon never calls it. Each test
-    here kills a mutant that survived the whole suite: both `return []`
-    fallbacks rewritten to a stale hardcoded list, `if self._discover:` turned
-    off, the "watching NOTHING" alarm deleted, and `not containers` replaced by
-    True so an explicit -c list is silently discarded.
+    The pure function can be perfect while the daemon never calls it.
     """
 
     @staticmethod
@@ -452,19 +372,11 @@ class TestDiscoveryIsWiredIn:
 
 
 class TestTheDedupKeyCollapsesRealTraffic:
-    """The catch-all's survivability rests entirely on this key collapsing.
+    """One fault must produce one key, however many times it fires.
 
-    It did not. Hashing `log_line[:200]` hashed a NONCE: structlog renders a
-    per-emit "timestamp" field that lands inside the window for any event under
-    a short enough event -- 71 to 90 characters depending on the service and
-    logger names in front of it -- and Postgres prefixes its own clock.
-    Measured 2026-09-19
-    over 7 days of all 11 cortex containers: 42 unclassified errors produced 42
-    distinct keys -- a collapse rate of zero. With normalisation, 25.
-
-    The old test guarded only OVER-collapse. Under-collapse -- the live
-    behaviour -- was unasserted, because its fixture fed a string with no
-    timestamp, which production never emits.
+    Hashing the raw line hashed structlog's per-emit timestamp, so the key was
+    unique per LINE: 42 unclassified errors over 7 days gave 42 keys. With
+    normalisation, 25.
     """
 
     @staticmethod
@@ -532,12 +444,10 @@ class TestTheDedupKeyCollapsesRealTraffic:
 
 
 class TestWarningsNeverReachTheChannel:
-    """The whole noise-safety claim of this PR, and nothing held it.
+    """WARNING is now the path every untriaged error takes.
 
-    084c7fe made WARNING the primary path for every untriaged error in the
-    estate. If that branch ever pings Discord, the alerter becomes the flood it
-    was written to avoid -- and 'the WARNING branch also calls send_embed'
-    survived the full suite before this test existed.
+    If that branch ever pings Discord the alerter becomes the flood it exists to
+    avoid, and adding send_embed() to it passed the whole suite.
     """
 
     @staticmethod
@@ -577,12 +487,7 @@ class TestWarningsNeverReachTheChannel:
 
 
 class TestTheDailySummaryTruncatesLoudly:
-    """A summary that silently drops entries fails toward silence.
-
-    That is this PR's own bug class, one layer down: the 20-line cap and the
-    "... and N more" tail were both unasserted, so a cap that stopped saying it
-    had capped would ship green.
-    """
+    """A cap that stops saying it capped fails toward silence."""
 
     @staticmethod
     def _daemon():
@@ -596,11 +501,8 @@ class TestTheDailySummaryTruncatesLoudly:
     def _summary_of(self, n, sample="something went wrong"):
         """Drives a REAL RateLimiter.
 
-        The first version of this stubbed it, which hid the defect the summary
-        actually had: the message was discarded at increment_warning(), so the
-        rendered line was a digest and a count and no error text at all. A
-        mocked rate limiter cannot show that, because the test supplies the
-        dict the real one would have failed to populate.
+        Stubbing it hid the defect: the message was discarded at increment_warning(),
+        and a mocked limiter supplies the dict the real one failed to populate.
         """
         d = self._daemon()
         for i in range(n):
@@ -628,15 +530,10 @@ class TestTheDailySummaryTruncatesLoudly:
 class TestClientFaultFilterNeverSuppressesCorruption:
     """The filter drops OUR typos. It must never drop the database's distress.
 
-    A review suggested widening it to cover the 29 postgres lines a week that
-    still reach the channel. Declined, and locked down here instead: those lines
-    are not the typo class. `item order invariant violated for index` is btree
-    corruption -- the cortex-rj2b failure that returned 85 rows where a seqscan
-    returned 112, a 24% silent row loss that went undetected precisely because
-    it raised no alarm anyone was listening for.
-
-    Suppressing it to quieten the channel would rebuild that blindness on
-    purpose.
+    `item order invariant violated for index` is btree corruption -- the
+    cortex-rj2b failure that returned 85 rows where a seqscan returned 112, and
+    went undetected because nothing alerted on it. Quietening the channel by
+    widening this filter would rebuild that blindness on purpose.
     """
 
     @pytest.mark.parametrize(
@@ -679,19 +576,11 @@ class TestClientFaultFilterNeverSuppressesCorruption:
 
 
 class TestTheSummarySaysWhatFailed:
-    """The PR's declared landing place must carry the error, not just a tally.
+    """The summary must carry the error, not just a tally.
 
-    084c7fe made the daily summary the destination for every untriaged error in
-    the estate. It rendered them as
-
-        - **Unclassified:8A416200** (cortex-gateway): 2
-
-    -- container, count, opaque digest, no message. The text was discarded at
-    `increment_warning()`, which took only the key. `.title()` then case-mangled
-    the hex, so the string printed was not even the key you could grep for.
-
-    A summary nobody can act on is the silence this PR exists to end, wearing
-    the fix's clothes.
+    It rendered `- **Unclassified:8A416200** (cortex-gateway): 2` -- container,
+    count, opaque digest, no message -- because the text was discarded at
+    increment_warning(). A summary nobody can act on is the silence this fixes.
     """
 
     @staticmethod
@@ -747,11 +636,8 @@ class TestTheSummarySaysWhatFailed:
 class TestDedupSourceSurvivesAnythingDockerEmits:
     """An exception here does not fail one line, it drops a container.
 
-    `_tail_container` wraps the whole tail loop in `except Exception`, sleeps
-    30s and restarts with `since=now` -- so a raise inside classify silently
-    discards every line that container emitted in between. Both isinstance
-    guards and the `errors="replace"` on the hash are load-bearing on input
-    Docker can really produce, and none of them was tested.
+    _tail_container catches everything, sleeps 30s and restarts with since=now,
+    so a raise inside classify silently discards whatever was emitted meanwhile.
     """
 
     @pytest.mark.parametrize(
@@ -787,14 +673,11 @@ class TestDedupSourceSurvivesAnythingDockerEmits:
 
 
 class TestAFailedSummaryDoesNotDeleteTheDay:
-    """The summary used to clear the day BEFORE it sent, and ignore the result.
+    """A summary nobody received must not clear the day it reported.
 
-    `reset_warning_counts()` ran thirty lines above the send, and the send's bool
-    was discarded -- so one Discord 5xx, timeout or 429 destroyed every warning
-    accumulated that day, unrecoverably. Worse in a way that is easy to miss:
-    DiscordClient logs that failure into cortex-alerter, the one container
-    DENYLISTED_CONTAINERS excludes, so the alerter's report that it could not
-    report went to the one log nothing watches.
+    reset_warning_counts() ran before the send and the send's result was
+    discarded, so one Discord 5xx destroyed the day's warnings. The failure was
+    logged to cortex-alerter -- the one container the denylist excludes.
     """
 
     @staticmethod
@@ -850,11 +733,7 @@ class TestAFailedSummaryDoesNotDeleteTheDay:
 
 
 class TestTheSummaryIsActuallyScheduled:
-    """A summary that never fires is the same outcome as one with no content.
-
-    Every run() test patches the whole `schedule` module, so removing the
-    scheduling entirely, or scheduling a different job, both shipped green.
-    """
+    """A summary that never fires is the same outcome as one with no content."""
 
     @staticmethod
     def _run_once(daemon):
@@ -898,12 +777,10 @@ class TestTheSummaryIsActuallyScheduled:
 
 
 class TestOneRaiseDoesNotKillTheScheduler:
-    """`schedule.run_pending()` does not catch, and this is a daemon thread.
+    """schedule.run_pending() does not catch, and this is a daemon thread.
 
-    One exception out of a job killed the thread permanently: every later
-    summary silently never sent, the process still looking healthy, and
-    warning_counts filling with nothing draining it. Failing toward silence,
-    which is the bug this whole PR is about.
+    One exception ended it permanently: every later summary silently unsent, the
+    process still looking healthy.
     """
 
     def test_the_loop_survives_a_raising_job(self):
@@ -929,20 +806,12 @@ class TestOneRaiseDoesNotKillTheScheduler:
 
 
 class TestTheTailerDelivers:
-    """Ingestion: the stage every other stage rests on, and the one with no tests.
+    """Ingestion: every other stage assumes a line arrives here.
 
-    Rounds 1-4 fixed the gate, the dedup key, the summary's content and its
-    delivery. All four assume a line arrives here. `grep -rn "_tail_container"
-    tests/` returned three hits before this class -- two `mock.patch.object`
-    and one passing mention in a docstring. None of them executed it, so ten
-    mutations of
-    it shipped green, including `self._process_log_line(...)` replaced by
-    `pass`. The alerter could ingest NOTHING and 591 tests agreed it was fine.
-
-    The failure-recovery cases are not hypothetical: six cortex containers were
-    recreated by a redeploy on 2026-09-16, and a recreation is exactly the
-    NotFound window. A tailer thread that returns is indistinguishable from one
-    quietly watching, because they are all daemon threads with no supervision.
+    _tail_container had no test, so ten mutations of it passed -- including
+    replacing _process_log_line with `pass` and tailing no containers at all.
+    The recovery cases are real: six cortex containers were recreated by a
+    redeploy on 2026-09-16, which is the NotFound path.
     """
 
     @staticmethod
@@ -958,9 +827,8 @@ class TestTheTailerDelivers:
     def _client(d, lines, raise_first=None):
         """A docker client whose SECOND tail attempt stops the loop.
 
-        Stopping from inside logs() rather than after it means the loop
-        terminates whatever the mutant does -- including a mutant that removes
-        the handler which would otherwise have ended it.
+        Stopping from inside logs() means the loop terminates whatever the mutant
+        does, including one that removes the handler that would have ended it.
         """
         calls = []
         container = mock.Mock()
@@ -1030,17 +898,11 @@ class TestTheTailerDelivers:
         )
 
     def test_the_reconnect_resumes_from_now_and_so_drops_the_gap(self):
-        """PINS A KNOWN LOSS rather than asserting it is correct.
+        """Pins a KNOWN LOSS so that changing it is deliberate.
 
-        `since=datetime.now()` is re-evaluated on every pass of the while loop,
-        so a reconnect resumes from the moment it reconnects and whatever the
-        container emitted during the outage is gone. Measured on real traffic:
-        cortex-triage-worker logs ~2.1 lines/s, so a 30s catch-all sleep drops
-        ~63 lines, and cortex-labeling-worker logged two `Gmail batch modify
-        failed` errors 35 seconds apart on 2026-09-14 -- inside one window.
-
-        This asserts the CURRENT behaviour so that changing it is a deliberate
-        act with a failing test, not an accident. The redesign is cortex-okcx.
+        since=datetime.now() is inside the loop, so a reconnect resumes from now and
+        whatever was emitted during the outage is gone -- ~63 lines at triage-worker's
+        2.1/s. The redesign is cortex-okcx.
         """
         d = self._daemon()
         d.docker_client = self._client(d, [b"x\n"], raise_first=RuntimeError("boom"))
@@ -1074,12 +936,11 @@ class TestConnectDocker:
 
 
 class TestRunStartsATailerPerContainer:
-    """`_tail_container` is patched in every run() test and was never asserted on.
+    """Discovery is pointless if nothing tails what it finds.
 
-    So `for container_name in self.containers:` replaced by `for ... in []:`
-    started no tailer threads at all and the suite stayed green -- the alerter
-    would discover its containers, log that it was monitoring them, send its
-    startup notice, and watch nothing.
+    _tail_container is patched in every run() test, so starting zero tailers
+    passed: the alerter would discover, log, send its startup notice, and watch
+    nothing.
     """
 
     @staticmethod
@@ -1135,13 +996,7 @@ def _warn(n):
 
 
 def _drain(container, frames, ping_critical=True):
-    """One real line, all the way from a fake Docker socket to a Discord payload.
-
-    Real _tail_container, real classify, real _dedup_source, real RateLimiter,
-    real _send_daily_summary. Only DiscordClient is recorded. This is the one
-    test that would have failed on rounds 1, 3, 4 and 5's defects at once --
-    every stage had its own tests and nobody had ever run them together.
-    """
+    """A line from a fake Docker socket through every real component to Discord."""
     from cortex_utils.alerter.daemon import AlerterDaemon
 
     with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
@@ -1169,7 +1024,12 @@ def _drain(container, frames, ping_critical=True):
 
 
 class TestOneRealLineReachesDiscord:
-    """The stages agree about the same line, or they do not. Nothing checked."""
+    """One real line, from a fake Docker socket to a Discord payload.
+
+    Every stage had its own tests and nobody had run them together; this would
+    have failed on the gate, the summary content and the ingestion defects at
+    once.
+    """
 
     def test_a_critical_line_produces_exactly_one_alert_naming_its_container(self):
         d = _drain("cortex-gmail-sync", [_CRIT])
@@ -1199,12 +1059,10 @@ class TestOneRealLineReachesDiscord:
 
 
 class TestTheTestAlertNamesWhatItWouldWatch:
-    """`cortex alerter test` runs BEFORE run(), so self.containers is still empty.
+    """`cortex alerter test` runs before run(), so self.containers is still empty.
 
-    Replacing `containers or DEFAULT_CONTAINERS` with `containers or []` made
-    this render an empty Containers field where it used to name six. Discord's
-    schema requires a non-empty field value, and an operator running the test
-    learns nothing from a blank list.
+    Replacing the hardcoded default with `[]` made this render an empty field,
+    which Discord rejects and which tells an operator nothing.
     """
 
     @staticmethod
