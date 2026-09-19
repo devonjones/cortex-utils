@@ -1103,3 +1103,127 @@ class TestRunStartsATailerPerContainer:
     def test_watching_nothing_starts_nothing(self):
         tail = self._run_with(None, discovered=[])
         assert not tail.called
+
+
+_CRIT = (
+    b'{"event": "History expired for historyId 12345", "service": "gmail-sync",'
+    b' "level": "error", "timestamp": "2026-09-19T01:00:00Z"}\n'
+)
+
+
+def _warn(n):
+    return (
+        b'{"event": "Pattern detection failed for 1a0643' + str(n).encode() + b'fa5df4c3e",'
+        b' "service": "triage-worker", "level": "error",'
+        b' "timestamp": "2026-09-19T0' + str(n).encode() + b':00:00Z"}\n'
+    )
+
+
+def _drain(container, frames, ping_critical=True):
+    """One real line, all the way from a fake Docker socket to a Discord payload.
+
+    Real _tail_container, real classify, real _dedup_source, real RateLimiter,
+    real _send_daily_summary. Only DiscordClient is recorded. This is the one
+    test that would have failed on rounds 1, 3, 4 and 5's defects at once --
+    every stage had its own tests and nobody had ever run them together.
+    """
+    from cortex_utils.alerter.daemon import AlerterDaemon
+
+    with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+        d = AlerterDaemon(
+            "https://discord.test/hook", containers=[container], ping_critical=ping_critical
+        )
+    d.discord = mock.Mock()
+    d.discord.send_embed.return_value = True
+    calls = []
+    box = mock.Mock()
+
+    def logs(**kw):
+        calls.append(kw)
+        if len(calls) >= 2:
+            d._stop_event.set()
+            return iter(())
+        return iter(frames)
+
+    box.logs.side_effect = logs
+    d.docker_client = mock.Mock()
+    d.docker_client.containers.get.return_value = box
+    with mock.patch("cortex_utils.alerter.daemon.time.sleep"):
+        d._tail_container(container)
+    return d
+
+
+class TestOneRealLineReachesDiscord:
+    """The stages agree about the same line, or they do not. Nothing checked."""
+
+    def test_a_critical_line_produces_exactly_one_alert_naming_its_container(self):
+        d = _drain("cortex-gmail-sync", [_CRIT])
+        assert d.discord.send_embed.call_count == 1
+        kw = d.discord.send_embed.call_args.kwargs
+        fields = {f["name"]: f["value"] for f in kw["fields"]}
+        assert fields["Container"] == "cortex-gmail-sync"
+        assert "History expired" in fields["Log"]
+        assert kw["title"].startswith("CRITICAL:")
+
+    @pytest.mark.parametrize("ping_critical", [True, False])
+    def test_ping_critical_reaches_the_payload(self, ping_critical):
+        """`ping=True` hardcoded shipped green -- an operator's @here setting ignored."""
+        d = _drain("cortex-gmail-sync", [_CRIT], ping_critical=ping_critical)
+        assert d.discord.send_embed.call_args.kwargs["ping"] is ping_critical
+
+    def test_a_warning_reaches_nobody_until_the_summary_then_says_what_failed(self):
+        d = _drain("cortex-triage-worker", [_warn(1), _warn(2), _warn(3)])
+        assert d.discord.send_embed.call_count == 0, "a WARNING must not ping the channel"
+        assert list(d.rate_limiter.get_warning_counts().values()) == [3], (
+            "three ids, one fault, one key"
+        )
+        d._send_daily_summary()
+        desc = d.discord.send_embed.call_args.kwargs["description"]
+        assert "Pattern detection failed" in desc, "the summary must say what failed"
+        assert d.rate_limiter.get_warning_counts() == {}, "a delivered summary clears the day"
+
+
+class TestTheTestAlertNamesWhatItWouldWatch:
+    """`cortex alerter test` runs BEFORE run(), so self.containers is still empty.
+
+    Replacing `containers or DEFAULT_CONTAINERS` with `containers or []` made
+    this render an empty Containers field where it used to name six. Discord's
+    schema requires a non-empty field value, and an operator running the test
+    learns nothing from a blank list.
+    """
+
+    @staticmethod
+    def _fields(daemon):
+        daemon.send_test_alert()
+        return {f["name"]: f["value"] for f in daemon.discord.send_embed.call_args.kwargs["fields"]}
+
+    @staticmethod
+    def _daemon(containers=None):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=containers)
+        d.discord = mock.Mock()
+        return d
+
+    def test_it_discovers_rather_than_reporting_an_empty_list(self):
+        d = self._daemon()
+        with (
+            mock.patch.object(d, "_connect_docker", return_value=True),
+            mock.patch.object(
+                d, "_discover_running_containers", return_value=["cortex-a", "cortex-b"]
+            ),
+        ):
+            assert self._fields(d)["Containers"] == "cortex-a, cortex-b"
+
+    def test_the_field_is_never_empty_even_when_docker_is_down(self):
+        """A webhook test must still work when Docker does not."""
+        d = self._daemon()
+        with mock.patch.object(d, "_connect_docker", return_value=False):
+            value = self._fields(d)["Containers"]
+        assert value, "Discord rejects an empty field value"
+        assert "none discovered" in value
+
+    def test_an_explicit_list_is_reported_as_given(self):
+        d = self._daemon(containers=["cortex-only"])
+        assert self._fields(d)["Containers"] == "cortex-only"

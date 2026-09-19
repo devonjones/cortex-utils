@@ -329,7 +329,22 @@ class AlerterDaemon:
             time.sleep(60)
 
     def send_test_alert(self) -> bool:
-        """Send a test alert to verify webhook is working."""
+        """Send a test alert to verify webhook is working.
+
+        `self.containers` is EMPTY until run() fills it from discovery, and
+        `cortex alerter test` calls this before run() -- so replacing the old
+        `containers or DEFAULT_CONTAINERS` with `containers or []` made this
+        render an empty Containers field where it used to name six. Discord's
+        schema requires a non-empty field value, and an operator running the
+        test learns nothing from a blank list.
+
+        Discovery is best-effort here: a webhook test must still work when
+        Docker does not, so a failure falls back to an honest string rather
+        than to silence or an exception.
+        """
+        watched = self.containers
+        if not watched and self._discover and self._connect_docker():
+            watched = self._discover_running_containers()
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return self.discord.send_embed(
             title="Test Alert",
@@ -337,7 +352,11 @@ class AlerterDaemon:
             color=COLOR_INFO,
             fields=[
                 {"name": "Time", "value": time_str, "inline": True},
-                {"name": "Containers", "value": ", ".join(self.containers), "inline": False},
+                {
+                    "name": "Containers",
+                    "value": ", ".join(watched) or "(none discovered -- Docker unreachable?)",
+                    "inline": False,
+                },
             ],
             ping=False,
         )
