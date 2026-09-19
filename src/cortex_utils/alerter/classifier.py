@@ -106,10 +106,10 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
     ),
     (
         # NOT a bare \b5\d{2}\b -- that matches ANY three-digit number from
-        # 500-599 anywhere in a line. Measured: it fired 122 times in 24h on
-        # Postgres checkpoint logs ("wrote 571 buffers"), and it is why a
-        # traceback frame at capture_worker.py:517 alerted as an API error in a
-        # sibling project. Require HTTP context.
+        # 500-599 anywhere in a line. Measured: it MATCHED 122 times in 24h on
+        # Postgres checkpoint logs ("wrote 571 buffers"). It reads a traceback
+        # frame at capture_worker.py:517 as an HTTP status the same way -- a
+        # source line number. Require HTTP context.
         re.compile(
             r"HttpError 5\d{2}"
             r"|\bHTTP[/ ]?\d?\.?\d?\s*5\d{2}\b"
@@ -186,12 +186,10 @@ def classify(container: str, log_line: str) -> Classification | None:
     Returns:
         Classification if this is an error worth tracking, None otherwise
     """
-    # GATE FIRST. This used to sit below the pattern loop, so a tuned pattern
-    # could classify a line that is not an error at all -- and one did, 122
-    # times in 24h: "checkpoint complete: wrote 571 buffers" matched the 5xx
-    # pattern below and alerted as API Server Error. Nothing in that line is an
-    # error; it is routine Postgres bookkeeping.
-    # A client's bad SQL is not our error, whatever it matches below.
+    # FIRST, unconditionally: a client's bad SQL is not our error, whatever it
+    # matches below. This is a source filter, not a severity gate -- Postgres
+    # logs a rejected query at ERROR level and it is still Postgres working
+    # correctly. See the note on is_client_sql_fault for the measurement.
     if is_client_sql_fault(container, log_line):
         return None
 
@@ -203,9 +201,11 @@ def classify(container: str, log_line: str) -> Classification | None:
     #
     # The price is that a BAD pattern can classify a line that is not an error
     # at all, so the patterns carry the burden of precision. One did not: a
-    # bare \b5\d{2}\b matched "checkpoint complete: wrote 571 buffers" and
-    # alerted as API Server Error 122 times in 24h. Fixed at the pattern, not
-    # by gating the patterns.
+    # bare \b5\d{2}\b MATCHED "checkpoint complete: wrote 571 buffers" 122
+    # times in 24h. It never alerted -- cortex-postgres was not in the watched
+    # set, and the daemon gates on is_error_line() before classifying -- so
+    # this was a live landmine rather than a live incident. Fixed at the
+    # pattern, not by gating the patterns.
     for pattern, severity, cooldown, title, description in PATTERNS:
         if pattern.search(log_line):
             # Create unique key for deduplication
@@ -228,21 +228,32 @@ def classify(container: str, log_line: str) -> Classification | None:
 
     # NO SPECIFIC PATTERN, BUT is_error_line() ALREADY SAID THIS IS AN ERROR.
     # Falling through to None here is what made this component decorative:
-    # measured 2026-09-18 against 40 distinct log.error/exception/critical
-    # message strings harvested from cortex's own services, the tuned patterns
-    # matched 2. The other 38 -- "Failed to create required label",
-    # "Gmail batch modify failed", "Missing required environment variables" --
-    # were correctly identified as errors by is_error_line() and then dropped
-    # here because nobody had written a pattern for that phrasing.
+    # measured 2026-09-19 by AST walk over every string literal logged at
+    # error/critical/exception across six cortex services -- 67 messages -- the
+    # tuned patterns matched 3. "Failed to create required label" and "Gmail
+    # batch modify failed" reached this point and were dropped because nobody
+    # had written a pattern for that phrasing.
+    #
+    # The other failure was upstream and larger: only 15 of the 67 got past the
+    # gate at all, because it read the message text and a cortex service puts
+    # its severity in a structlog "level" field. None of the 3 pattern-matchers
+    # was among those 15, and daemon.py gates before it classifies -- so the
+    # number of these 67 that could actually reach the channel was ZERO. Fixed
+    # in is_error_line; the two together take the 67 from 0 reachable to 67.
     #
     # An alerter whose default is silence reports only the failures someone
     # already thought of, which are the ones least likely to surprise anyone.
     # Alert on the rest and let the specific patterns be ENRICHMENT -- they
     # keep their tuned severities and cooldowns; they no longer act as a gate.
     #
-    # The key is hashed off the message so a service failing in a loop is one
-    # alert per cooldown rather than thousands. That dedup is what makes a
-    # noisy default survivable.
+    # The key is hashed off the message so a service failing in a loop collapses
+    # to ONE summary line rather than thousands. That dedup is what makes a
+    # noisy default survivable, and it is the digest doing the work: the
+    # daemon's WARNING branch calls increment_warning() only, never
+    # should_alert(), so cooldown_minutes is inert on the path that actually
+    # consumes this classification. It is set for the case where a tuned
+    # pattern later raises the severity to HIGH or CRITICAL, which are the
+    # branches that do consult it.
     # WARNING, deliberately: this severity aggregates into the daily summary
     # rather than pinging the channel, which is exactly the right landing place
     # for "an error nobody has triaged yet". A tuned pattern can still raise
@@ -310,9 +321,33 @@ _ERROR_INDICATORS = [
 ]
 
 
+# Cortex services log structlog JSON, where the severity lives in a "level"
+# field and NOT in the message text: {"event": "Missing required environment
+# variables: ...", "level": "error", ...}. The indicator list above reads the
+# text only, so such a line was not recognised as an error at all -- the
+# service announcing it cannot start was invisible to the alerter.
+#
+# Measured 2026-09-19 against every error-level line Hades emitted in 14 days
+# -- 8 lines, cortex-triage-worker and cortex-labeling-worker. The text-only
+# list caught 8 of 8, but NOT for the reason it looks like: six of them read
+# "Pattern detection failed for <id>", and bare lowercase "failed" is not an
+# indicator ("Failed" and "failed:" are). Those six matched on "Traceback",
+# which structlog had serialised into the exception payload. On the event text
+# alone only the 2 "Gmail batch modify failed:" lines would have passed.
+#
+# So the coverage rested on those six carrying exc_info. A line reporting a
+# fatal condition without a traceback and without an error word -- a startup
+# abort is exactly that shape -- was invisible.
+_LEVEL_FIELD = re.compile(r'"level"\s*:\s*"(error|critical)"')
+
+
 def is_error_line(log_line: str) -> bool:
     """Quick check if a log line looks like an error.
 
-    Use this to pre-filter before full classification.
+    Use this to pre-filter before full classification. Matches either an error
+    word in the message text or a structlog ``"level": "error"`` field, because
+    a service can report a fatal condition without using any of those words.
     """
-    return any(indicator in log_line for indicator in _ERROR_INDICATORS)
+    if any(indicator in log_line for indicator in _ERROR_INDICATORS):
+        return True
+    return _LEVEL_FIELD.search(log_line) is not None

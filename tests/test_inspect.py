@@ -315,9 +315,9 @@ def test_a_cancel_that_hit_no_row_rolls_back_the_new_one() -> None:
     # `except JobNotFailedError: continue` would then swallow a broken internal
     # invariant and report it as a stale click. That is the exact outcome the
     # subclass was added to prevent, so it is asserted where it happens.
-    assert not isinstance(
-        caught.value, JobNotFailedError
-    ), "the cancel-rollback path is a bug, not a row to skip"
+    assert not isinstance(caught.value, JobNotFailedError), (
+        "the cancel-rollback path is a bug, not a row to skip"
+    )
     conn.commit.assert_not_called()
     conn.rollback.assert_called_once()
 

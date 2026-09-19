@@ -215,9 +215,9 @@ def test_upsert_arbiter_matches_the_vendored_index_shape() -> None:
     assert match, "mapping upsert must infer an arbiter by columns + predicate"
 
     columns = tuple(c.strip() for c in match.group(1).split(","))
-    assert (
-        columns == EXPECTED_COLUMNS
-    ), f"arbiter columns {columns} != {EXPECTED_COLUMNS} from migration 003"
+    assert columns == EXPECTED_COLUMNS, (
+        f"arbiter columns {columns} != {EXPECTED_COLUMNS} from migration 003"
+    )
     assert EXPECTED_PREDICATE.lower() in match.group(2).lower(), (
         f"arbiter predicate must be '{EXPECTED_PREDICATE}' -- uniqueness holds "
         "over live rows only, so a soft-deleted mapping can be recreated"

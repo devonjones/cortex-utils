@@ -93,9 +93,9 @@ def test_the_primitives_run_against_the_shape_this_module_emits(conn) -> None:
     assert [j["id"] for j in again] == [job_id]
 
     assert fail_or_retry(conn, job_id, "boom", "worker-a") == "pending"
-    assert (
-        claim(conn, "q", "worker-a") == []
-    ), "a retried job is deferred by next_attempt_at, so it is not claimable yet"
+    assert claim(conn, "q", "worker-a") == [], (
+        "a retried job is deferred by next_attempt_at, so it is not claimable yet"
+    )
 
     # Bring it forward the way a caller would, rather than waiting out the
     # backoff, and finish the cycle.
@@ -183,9 +183,9 @@ def test_it_answers_about_this_schemas_queue(conn) -> None:
         cur.execute("SET search_path = t_schema")
     conn.commit()
 
-    assert missing_columns(conn) == list(
-        REQUIRED_COLUMNS
-    ), "this schema has no queue at all, so every column is missing"
+    assert missing_columns(conn) == list(REQUIRED_COLUMNS), (
+        "this schema has no queue at all, so every column is missing"
+    )
 
 
 # --- indexes -----------------------------------------------------------------
@@ -323,9 +323,9 @@ def test_an_unpartitioned_queue_is_reported_rather_than_left_to_fail_later(conn)
 
     with structlog.testing.capture_logs() as logs:
         assert ensure_queue_table(conn) == "present"
-    assert any(
-        "not partitioned" in entry["event"] for entry in logs
-    ), f"a boot that finds an unpartitioned queue must say so: {logs}"
+    assert any("not partitioned" in entry["event"] for entry in logs), (
+        f"a boot that finds an unpartitioned queue must say so: {logs}"
+    )
     assert missing_columns(conn) == []
 
 
@@ -499,9 +499,9 @@ def test_a_partial_unique_index_dedups_within_a_transaction_only(conn) -> None:
 
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM queue WHERE payload->>'video_id' = 'v1'")
-            assert (
-                cur.fetchone()[0] == 2
-            ), "if this is ever 1 the index started backstopping and this note is stale"
+            assert cur.fetchone()[0] == 2, (
+                "if this is ever 1 the index started backstopping and this note is stale"
+            )
     finally:
         other.rollback()
         other.close()
@@ -854,9 +854,9 @@ def test_the_retry_migration_fails_fast_rather_than_wedging_the_queue(conn) -> N
         t.join(timeout=15)
         elapsed = time.monotonic() - start
 
-        assert (
-            not t.is_alive()
-        ), f"still waiting on the lock after {elapsed:.0f}s -- the ALTER is unbounded"
+        assert not t.is_alive(), (
+            f"still waiting on the lock after {elapsed:.0f}s -- the ALTER is unbounded"
+        )
         assert isinstance(outcome["result"], psycopg2.errors.LockNotAvailable), outcome
         assert elapsed < 10, f"failed after {elapsed:.1f}s; the bound is meant to be ~5s"
     finally:
@@ -983,9 +983,9 @@ def test_a_fresh_schema_is_not_reported_as_a_dead_maintenance_incident(conn) -> 
     enqueue(conn, "q", {"n": 1})
 
     got = health(conn)
-    assert (
-        got.self_healed_partitions == 0
-    ), "a fresh install routed its first write through the self-heal"
+    assert got.self_healed_partitions == 0, (
+        "a fresh install routed its first write through the self-heal"
+    )
     assert got.partition_headroom_days >= 1
     assert got.is_healthy is True, "a correctly configured fresh install reads unhealthy"
 

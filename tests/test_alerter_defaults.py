@@ -1,20 +1,50 @@
-"""The alerter's two defaults, both of which used to fail toward silence.
+"""The alerter's three defaults, all of which used to fail toward silence.
 
-Measured 2026-09-18 before this change:
+Population: every distinct string literal passed to log.error / log.critical /
+log.exception across postmark, triage, utils, gateway, actions and reflex,
+collected by AST walk on 2026-09-19 -- 67 messages, no length or content
+filter. These are what the code CAN report, not what it has reported; see the
+separate live figure below.
 
     containers   5 of 11 running cortex containers were unwatched, including
                  cortex-gateway, cortex-actions-router, cortex-postgres and
                  cortex-alerter itself
-    classifier   2 of 40 real log.error/exception/critical message strings
-                 harvested from cortex's own services were classified; the
-                 other 38 were correctly identified as errors by
-                 is_error_line() and then dropped for want of a tuned pattern
+    patterns      3 of 67 matched a tuned pattern
+    gate         15 of 67 were recognised as errors at all. The severity of a
+                 cortex log line lives in a structlog "level" field, and the
+                 indicator list read the message TEXT only -- so "Config reload
+                 failed", "Cannot start without Docker connection" and 50 other
+                 real failures were invisible before any pattern was consulted
+    reachable     0. None of the 3 pattern-matchers was among the 15, and the
+                 daemon gates on is_error_line() before it classifies, so
+                 nothing in this population could reach the channel at all
 
-Both were allowlists. The property that matters is which way FORGETTING fails:
-silently under an allowlist, noisily under a denylist.
+An earlier revision of this docstring said "2 of 40 ... the other 38 were
+correctly identified as errors by is_error_line() and then dropped for want of
+a tuned pattern". The shape of that claim was wrong, not just the counts: most
+of those messages were never identified as errors in the first place, so the
+catch-all alone would have rescued 15 of 67 rather than all of them. Both
+halves were needed.
+
+That revision also said 66, from a walk that silently dropped literals under
+ten characters and so excluded "Peer down". The stated method did not
+reproduce the stated number, which is the more serious half of the error --
+hence "no length or content filter" above. Re-derive rather than trust it.
+
+The live figure looks like it disagrees and does not. Of the 8 error-level
+lines Hades emitted in the 14 days to 2026-09-19 the text-only gate caught 8,
+but six of those read "Pattern detection failed for <id>" and bare lowercase
+"failed" is not an indicator -- they matched on "Traceback" in the serialised
+exception payload. On the event text alone, 2 of 8 would have passed. The
+coverage rested on those six carrying exc_info.
+
+All three were allowlists. The property that matters is which way FORGETTING
+fails: silently under an allowlist, noisily under a denylist.
 """
 
 from __future__ import annotations
+
+from unittest import mock
 
 import pytest
 
@@ -157,10 +187,11 @@ class TestPatternsMustBePrecise:
     over-broad pattern classifies lines that are not errors at all.
 
     One did. `\\b5\\d{2}\\b` matches ANY three-digit number from 500-599
-    anywhere in a line, so routine Postgres bookkeeping alerted as an API
-    server error 122 times in 24 hours. The same pattern is why a traceback
-    frame at capture_worker.py:517 alerted as an API error in a sibling
-    project -- a source line number, read as an HTTP status.
+    anywhere in a line, so routine Postgres bookkeeping MATCHED the API server
+    error pattern 122 times in 24 hours. It never alerted -- cortex-postgres
+    was unwatched and the daemon gates on is_error_line() first -- so the
+    number counts matches, not pings. The same pattern reads a traceback frame
+    at capture_worker.py:517 as an HTTP status: a source line number.
     """
 
     @pytest.mark.parametrize(
@@ -174,9 +205,9 @@ class TestPatternsMustBePrecise:
     )
     def test_a_bare_500_series_integer_is_not_an_http_status(self, line: str) -> None:
         result = classify("cortex-postgres", line)
-        assert (
-            result is None or result.title != "API Server Error"
-        ), f"a 5xx-looking integer was read as an HTTP status: {line!r}"
+        assert result is None or result.title != "API Server Error", (
+            f"a 5xx-looking integer was read as an HTTP status: {line!r}"
+        )
 
     @pytest.mark.parametrize(
         "line",
@@ -218,9 +249,9 @@ class TestCriticalPatternsDoNotMatchRoutineTraffic:
     )
     def test_a_history_id_containing_404_is_not_an_expiry(self, line: str) -> None:
         result = classify("cortex-gmail-sync", line)
-        assert (
-            result is None or result.title != "Gmail History Expired"
-        ), f"routine notification read as history expiry: {line[:70]!r}"
+        assert result is None or result.title != "Gmail History Expired", (
+            f"routine notification read as history expiry: {line[:70]!r}"
+        )
 
     @pytest.mark.parametrize(
         "line",
@@ -234,9 +265,9 @@ class TestCriticalPatternsDoNotMatchRoutineTraffic:
     )
     def test_a_word_containing_oom_is_not_an_oom_kill(self, line: str) -> None:
         result = classify("cortex-triage-worker", line)
-        assert (
-            result is None or result.title != "Out of Memory"
-        ), f"ordinary word read as an OOM kill: {line[:70]!r}"
+        assert result is None or result.title != "Out of Memory", (
+            f"ordinary word read as an OOM kill: {line[:70]!r}"
+        )
 
     @pytest.mark.parametrize(
         ("line", "title"),
@@ -254,3 +285,153 @@ class TestCriticalPatternsDoNotMatchRoutineTraffic:
         result = classify("cortex-gmail-sync", line)
         assert result is not None, f"missed a real condition: {line!r}"
         assert result.title == title
+
+
+class TestRegexesStillMatchTheRealCondition:
+    """The re-anchoring must not have silenced the failures it was tuning for.
+
+    Every anchoring fix in this PR narrows a pattern, and a narrowed pattern
+    fails SILENTLY -- a false negative is an alert that never arrives, with
+    nothing in any log to say so. The sibling class above proves these patterns
+    no longer match routine traffic; on its own that is satisfied by a pattern
+    that matches nothing at all.
+
+    Each case below is the real failure the alternation exists for, so deleting
+    that alternation fails a test rather than going quiet.
+    """
+
+    @pytest.mark.parametrize(
+        "line,expect_title",
+        [
+            # The three new history alternations. The OLD pattern was
+            # historyId.*404, which matched any history ID containing "404" as
+            # a substring; these require 404 to be an HTTP status.
+            (
+                "HttpError 404 when requesting history for startHistoryId 123",
+                "Gmail History Expired",
+            ),
+            (
+                "historyId 79564045 rejected: HttpError 404 Not Found",
+                "Gmail History Expired",
+            ),
+            (
+                "startHistoryId 12345 returned 404",
+                "Gmail History Expired",
+            ),
+            # \bOOM\b and \bOut of memory\b -- word-bounded, but still present.
+            ("Container killed: OOM", "Out of Memory"),
+            ("Out of memory: Killed process 1234 (python)", "Out of Memory"),
+            # HttpError 5\d{2} keeps the HTTP context it always had.
+            ("HttpError 503 Service Unavailable", "API Server Error"),
+        ],
+    )
+    def test_the_real_failure_still_classifies(self, line, expect_title):
+        result = classify("cortex-gmail-sync", line)
+        assert result is not None, f"pattern went silent on a real failure: {line!r}"
+        assert result.title == expect_title
+
+
+class TestStructlogLevelIsAnErrorSignal:
+    """Cortex services put the severity in a field, not in the message text.
+
+    ``{"event": "Missing required environment variables: ...", "level":
+    "error"}`` contains no word from _ERROR_INDICATORS, so a text-only gate
+    dropped it -- the alerter could not see a service reporting it cannot
+    start. Measured 2026-09-19 over 14 days of Hades logs: all 8 error-level
+    lines were caught, but six of them only via "Traceback" in the serialised
+    exception payload -- bare lowercase "failed" is not an indicator. On the
+    event text alone, 2 of 8 would have passed.
+    """
+
+    def test_structlog_error_level_is_an_error(self):
+        line = '{"event": "Missing required environment variables: PG_PASS", "level": "error"}'
+        assert is_error_line(line)
+
+    def test_structlog_critical_level_is_an_error(self):
+        assert is_error_line('{"event":"Shutting down","level":"critical"}')
+
+    def test_structlog_warning_level_is_not(self):
+        line = '{"event": "DuckDB API error for x: HTTP 404", "level": "warning"}'
+        assert not is_error_line(line)
+
+    def test_structlog_info_level_is_not(self):
+        assert not is_error_line('{"event": "Processed 10 emails", "level": "info"}')
+
+    def test_the_startup_abort_now_reaches_the_catch_all(self):
+        """The whole point: it is classified, not dropped."""
+        line = '{"event": "Missing required environment variables: PG_PASS", "level": "error"}'
+        result = classify("cortex-parse-worker", line)
+        assert result is not None
+        assert result.title == "Unclassified Error"
+
+
+class TestDiscoveryIsWiredIn:
+    """discover_containers() is pure and tested above; this is the wiring.
+
+    The pure function can be perfect while the daemon never calls it. Each test
+    here kills a mutant that survived the whole suite: both `return []`
+    fallbacks rewritten to a stale hardcoded list, `if self._discover:` turned
+    off, the "watching NOTHING" alarm deleted, and `not containers` replaced by
+    True so an explicit -c list is silently discarded.
+    """
+
+    @staticmethod
+    def _daemon(containers=None):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            return AlerterDaemon("https://discord.test/webhook", containers=containers)
+
+    def test_discovery_before_docker_connect_watches_nothing(self):
+        """NOT a stale hardcoded list. An alerter that cannot see Docker says so."""
+        d = self._daemon()
+        d.docker_client = None
+        assert d._discover_running_containers() == []
+
+    def test_docker_failure_watches_nothing(self):
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+        d.docker_client.containers.list.side_effect = RuntimeError("socket gone")
+        assert d._discover_running_containers() == []
+
+    def test_discovery_returns_live_cortex_containers_minus_denylist(self):
+        d = self._daemon()
+        d.docker_client = mock.Mock()
+
+        def named(n):  # Mock(name=...) names the mock, it does not set .name
+            m = mock.Mock()
+            m.name = n
+            return m
+
+        d.docker_client.containers.list.return_value = [
+            named(n) for n in ["cortex-gateway", "cortex-alerter", "traefik", "cortex-teach"]
+        ]
+        assert d._discover_running_containers() == ["cortex-gateway", "cortex-teach"]
+
+    def _run_once(self, daemon, discovered):
+        """Drive run() to completion without booting the daemon."""
+        daemon._stop_event.set()  # run() returns at the final wait()
+        with (
+            mock.patch.object(daemon, "_connect_docker", return_value=True),
+            mock.patch.object(daemon, "_tail_container"),
+            mock.patch.object(daemon, "_discover_running_containers", return_value=discovered),
+            mock.patch("cortex_utils.alerter.daemon.schedule"),
+        ):
+            daemon.run()
+        return daemon.containers
+
+    def test_run_discovers_when_no_explicit_list(self):
+        d = self._daemon()
+        assert self._run_once(d, ["cortex-gateway"]) == ["cortex-gateway"]
+
+    def test_an_explicit_container_list_is_not_discarded(self):
+        """-c wins. Discovery is the DEFAULT, not an override."""
+        d = self._daemon(containers=["cortex-only-this"])
+        assert d._discover is False
+        assert self._run_once(d, ["cortex-gateway"]) == ["cortex-only-this"]
+
+    def test_watching_nothing_is_reported_loudly(self, capsys):
+        """structlog renders to stderr, so caplog does not see this one."""
+        d = self._daemon()
+        self._run_once(d, [])
+        assert "NOTHING" in capsys.readouterr().err

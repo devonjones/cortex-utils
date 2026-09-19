@@ -453,9 +453,9 @@ def test_complete_can_leave_the_transaction_to_the_caller(conns) -> None:
         )
         other = cur.fetchone()[0]
     a.commit()
-    assert (
-        complete(a, other, "impostor", commit=False) is False
-    ), "commit=False must still refuse a claim this worker does not hold"
+    assert complete(a, other, "impostor", commit=False) is False, (
+        "commit=False must still refuse a claim this worker does not hold"
+    )
     a.rollback()
 
     # An autocommit connection has no transaction to withhold, so the UPDATE

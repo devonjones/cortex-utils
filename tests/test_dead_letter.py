@@ -271,9 +271,9 @@ def test_the_list_and_the_count_filter_identically() -> None:
         counted = [s for s, _ in conn.cur.executed if "COUNT(*)" in s]
         assert listed and counted
         assert ("dismissed_at IS NULL AND retried_at IS NULL" in listed[0]) == (not include)
-        assert ("dismissed_at IS NULL AND retried_at IS NULL" in counted[0]) == (
-            not include
-        ), "the count must count exactly what the list shows"
+        assert ("dismissed_at IS NULL AND retried_at IS NULL" in counted[0]) == (not include), (
+            "the count must count exactly what the list shows"
+        )
 
 
 def test_both_default_to_hiding_dismissed_rows() -> None:

@@ -145,9 +145,9 @@ def test_an_empty_queue_is_anchored_on_the_server_clock() -> None:
         m.analyze_existing_queue = original  # type: ignore[assignment]
 
     assert out["partition_range"].startswith(f"queue_{SERVER_TODAY.strftime('%Y_%m_%d')}")
-    assert any(
-        "CURRENT_DATE" in s for s, _ in conn.cur.executed
-    ), "the anchor must be the server's date, not this process's"
+    assert any("CURRENT_DATE" in s for s, _ in conn.cur.executed), (
+        "the anchor must be the server's date, not this process's"
+    )
 
 
 def test_a_preview_does_not_drop_the_migration_rollback_path() -> None:

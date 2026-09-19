@@ -588,9 +588,9 @@ def test_resubmit_resolves_the_dedup_key_from_the_row(conn) -> None:
     assert enqueue(conn, "drain", {"video_id": "v1"}, dedup_key="video_id") is not None
 
     keys = {"drain": "video_id", "triage": "gmail_id"}
-    assert (
-        resubmit(conn, failed, dedup_keys=keys) is None
-    ), "the key was not resolved from the row: it queued a duplicate"
+    assert resubmit(conn, failed, dedup_keys=keys) is None, (
+        "the key was not resolved from the row: it queued a duplicate"
+    )
 
     with conn.cursor() as cur:
         # Only the live one: the failed row still carries the same video_id and

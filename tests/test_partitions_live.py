@@ -178,9 +178,9 @@ def test_a_forced_move_does_not_promote_a_backfill_ahead_of_real_time_mail(
         cur.execute("SELECT priority, next_attempt_at, attempts FROM queue")
         priority, next_attempt_at, attempts = cur.fetchone()
     conn.commit()
-    assert (
-        priority == -100
-    ), f"backfill came back at priority {priority} -- it now outranks real-time mail"
+    assert priority == -100, (
+        f"backfill came back at priority {priority} -- it now outranks real-time mail"
+    )
     assert next_attempt_at is not None, "a job waiting out a backoff became ready early"
     assert attempts == 0, "a relocated job should arrive with a full budget"
 
@@ -196,9 +196,9 @@ def test_health_reports_how_old_the_oldest_partition_is(conn) -> None:
     """
     from cortex_utils.queue.inspect import health
 
-    assert (
-        health(conn).oldest_partition_age_days <= 0
-    ), "a fresh schema has only today's and future partitions"
+    assert health(conn).oldest_partition_age_days <= 0, (
+        "a fresh schema has only today's and future partitions"
+    )
 
     _old_partition_with(conn, ["pending"], days_old=30)
 
@@ -260,9 +260,9 @@ def test_partition_count_counts_real_partitions_and_ignores_the_default(conn) ->
     conn.commit()
 
     h = health(conn)
-    assert (
-        h.partition_count == attached > 0
-    ), f"partition_count={h.partition_count} but {attached} partitions are attached"
+    assert h.partition_count == attached > 0, (
+        f"partition_count={h.partition_count} but {attached} partitions are attached"
+    )
     assert h.oldest_partition_age_days is not None, "a non-zero count must mean a real age"
 
     with conn.cursor() as cur:

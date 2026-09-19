@@ -109,9 +109,9 @@ def test_running_the_cli_configures_logging_to_stderr() -> None:
     out2, err2 = _run(probe)
     assert "before: False" in out2, out2
     assert "after: True" in out2, out2
-    assert (
-        "a-log-line-that-must-not-be-on-stdout" not in out2
-    ), f"the CLI put a log line on stdout, where its own output goes: {out2!r}"
+    assert "a-log-line-that-must-not-be-on-stdout" not in out2, (
+        f"the CLI put a log line on stdout, where its own output goes: {out2!r}"
+    )
     assert "a-log-line-that-must-not-be-on-stdout" in err2, err2
 
 
@@ -221,9 +221,9 @@ def test_library_logs_carry_their_own_namespace_not_root() -> None:
             "ops.log.info('should-be-silenced')\n"
         )[1]
     )
-    assert (
-        "should-be-silenced" not in combined
-    ), "silencing the cortex_utils namespace did not silence us -- we are logging as root"
+    assert "should-be-silenced" not in combined, (
+        "silencing the cortex_utils namespace did not silence us -- we are logging as root"
+    )
 
 
 def test_the_log_stream_is_resolved_per_write_not_at_import() -> None:
@@ -242,9 +242,9 @@ def test_the_log_stream_is_resolved_per_write_not_at_import() -> None:
     with contextlib.redirect_stderr(captured):
         log.warning("redirected-marker")
 
-    assert (
-        "redirected-marker" in captured.getvalue()
-    ), "the stream was captured when the logger was built, not resolved per write"
+    assert "redirected-marker" in captured.getvalue(), (
+        "the stream was captured when the logger was built, not resolved per write"
+    )
 
 
 def test_the_conftest_fixture_restores_a_configuration_it_found() -> None:
