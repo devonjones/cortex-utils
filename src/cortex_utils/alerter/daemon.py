@@ -237,20 +237,27 @@ class AlerterDaemon:
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
+        # READ, do not reset. The reset used to happen here, 38 lines before the
+        # send, with the send's return value discarded -- so one Discord 5xx,
+        # timeout or 429 deleted the whole day's warnings unrecoverably, and
+        # DiscordClient logged that failure into cortex-alerter, the one
+        # container the denylist excludes. The alerter's report that it could
+        # not report went to the one log nothing watches.
         with self._lock:
-            # Samples BEFORE the reset, which clears them.
             samples = dict(self.rate_limiter.warning_samples)
-            counts = self.rate_limiter.reset_warning_counts()
+            counts = self.rate_limiter.get_warning_counts()
 
         if not counts:
             # No warnings to report
             log.info("Daily summary: no warnings")
             date_str = datetime.now().strftime("%Y-%m-%d")
-            self.discord.send_embed(
-                title="Cortex Daily Summary",
-                description=f"**{date_str}**\n\nNo warnings or errors to report.",
-                color=COLOR_INFO,
-                ping=False,
+            self._clear_if_delivered(
+                self.discord.send_embed(
+                    title="Cortex Daily Summary",
+                    description=f"**{date_str}**\n\nNo warnings or errors to report.",
+                    color=COLOR_INFO,
+                    ping=False,
+                )
             )
             return
 
@@ -278,17 +285,47 @@ class AlerterDaemon:
             description += f"\n... and {len(counts) - 20} more"
 
         log.info("Sending daily summary", warning_count=len(counts))
-        self.discord.send_embed(
-            title="Cortex Daily Summary",
-            description=description,
-            color=COLOR_WARNING if counts else COLOR_INFO,
-            ping=False,
+        self._clear_if_delivered(
+            self.discord.send_embed(
+                title="Cortex Daily Summary",
+                description=description,
+                color=COLOR_WARNING if counts else COLOR_INFO,
+                ping=False,
+            ),
+            len(counts),
         )
 
+    def _clear_if_delivered(self, delivered: bool, warning_count: int = 0) -> None:
+        """Drop the day's warnings only once someone has actually seen them.
+
+        A failed send keeps them, so the next summary carries them instead of
+        losing them. The narrow race -- a warning arriving between the read and
+        this reset is cleared without being reported -- is one HTTP request
+        wide, and is a far smaller loss than the whole day.
+        """
+        if not delivered:
+            log.error(
+                "Daily summary was NOT delivered; keeping the day's warnings",
+                warning_count=warning_count,
+            )
+            return
+        with self._lock:
+            self.rate_limiter.reset_warning_counts()
+
     def _schedule_loop(self) -> None:
-        """Run the scheduler loop."""
+        """Run the scheduler loop.
+
+        schedule.run_pending() does not catch, and this runs on a DAEMON
+        thread: one raise out of a job killed the thread permanently, every
+        later summary was silently never sent, and the process went on looking
+        healthy while warning_counts filled with nothing draining it. Catch,
+        report, keep the loop alive.
+        """
         while not self._stop_event.is_set():
-            schedule.run_pending()
+            try:
+                schedule.run_pending()
+            except Exception:
+                log.exception("Scheduled job raised; the scheduler stays up")
             time.sleep(60)
 
     def send_test_alert(self) -> bool:

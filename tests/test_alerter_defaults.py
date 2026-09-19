@@ -769,3 +769,145 @@ class TestDedupSourceSurvivesAnythingDockerEmits:
         from cortex_utils.alerter.classifier import _dedup_source
 
         assert len(_dedup_source("ERROR " + "x" * 100_000)) <= 200
+
+
+class TestAFailedSummaryDoesNotDeleteTheDay:
+    """The summary used to clear the day BEFORE it sent, and ignore the result.
+
+    `reset_warning_counts()` ran 38 lines above the send, and the send's bool
+    was discarded -- so one Discord 5xx, timeout or 429 destroyed every warning
+    accumulated that day, unrecoverably. Worse in a way that is easy to miss:
+    DiscordClient logs that failure into cortex-alerter, the one container
+    DENYLISTED_CONTAINERS excludes, so the alerter's report that it could not
+    report went to the one log nothing watches.
+    """
+
+    @staticmethod
+    def _daemon(delivered):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=["cortex-x"])
+        d.discord = mock.Mock()
+        d.discord.send_embed.return_value = delivered
+        for i in range(5):
+            d._process_log_line(
+                "cortex-x",
+                json.dumps(
+                    {
+                        "event": f"fault number {i}",
+                        "level": "error",
+                        "timestamp": f"2026-09-19T0{i}:00:00Z",
+                    }
+                ),
+            )
+        return d
+
+    def test_a_failed_send_keeps_the_warnings(self):
+        d = self._daemon(delivered=False)
+        assert len(d.rate_limiter.get_warning_counts()) == 5
+        d._send_daily_summary()
+        assert len(d.rate_limiter.get_warning_counts()) == 5, (
+            "a 5xx must not delete the day -- the next summary carries them instead"
+        )
+
+    def test_a_successful_send_does_clear(self):
+        """The control: keeping them forever is its own bug."""
+        d = self._daemon(delivered=True)
+        d._send_daily_summary()
+        assert d.rate_limiter.get_warning_counts() == {}
+
+    def test_a_failed_send_is_reported(self):
+        d = self._daemon(delivered=False)
+        with mock.patch("cortex_utils.alerter.daemon.log") as logger:
+            d._send_daily_summary()
+        assert logger.error.called, "an undelivered summary must be loud somewhere"
+
+    def test_an_empty_day_also_respects_delivery(self):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=["cortex-x"])
+        d.discord = mock.Mock()
+        d.discord.send_embed.return_value = False
+        d._send_daily_summary()  # must not raise on the no-warnings path
+        assert d.discord.send_embed.called
+
+
+class TestTheSummaryIsActuallyScheduled:
+    """A summary that never fires is the same outcome as one with no content.
+
+    Every run() test patches the whole `schedule` module, so removing the
+    scheduling entirely, or scheduling a different job, both shipped green.
+    """
+
+    @staticmethod
+    def _run_once(daemon):
+        daemon._stop_event.set()
+        with (
+            mock.patch.object(daemon, "_connect_docker", return_value=True),
+            mock.patch.object(daemon, "_tail_container"),
+            mock.patch.object(daemon, "_discover_running_containers", return_value=["cortex-x"]),
+            mock.patch("cortex_utils.alerter.daemon.schedule") as sched,
+        ):
+            daemon.run()
+        return sched
+
+    def _daemon(self, hour=6):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon(
+                "https://discord.test/hook", containers=["cortex-x"], summary_hour=hour
+            )
+        d.discord = mock.Mock()
+        return d
+
+    def test_it_schedules_the_summary_at_the_configured_hour(self):
+        d = self._daemon(hour=6)
+        sched = self._run_once(d)
+        sched.every.return_value.day.at.assert_called_once_with("06:00")
+
+    def test_the_hour_is_honoured(self):
+        d = self._daemon(hour=23)
+        sched = self._run_once(d)
+        sched.every.return_value.day.at.assert_called_once_with("23:00")
+
+    def test_it_schedules_the_summary_itself_not_some_other_job(self):
+        """`.do(lambda: None)` shipped green before this."""
+        d = self._daemon()
+        sched = self._run_once(d)
+        sched.every.return_value.day.at.return_value.do.assert_called_once_with(
+            d._send_daily_summary
+        )
+
+
+class TestOneRaiseDoesNotKillTheScheduler:
+    """`schedule.run_pending()` does not catch, and this is a daemon thread.
+
+    One exception out of a job killed the thread permanently: every later
+    summary silently never sent, the process still looking healthy, and
+    warning_counts filling with nothing draining it. Failing toward silence,
+    which is the bug this whole PR is about.
+    """
+
+    def test_the_loop_survives_a_raising_job(self):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=["cortex-x"])
+        calls = []
+
+        def boom():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("the summary blew up")
+            d._stop_event.set()
+
+        with (
+            mock.patch("cortex_utils.alerter.daemon.schedule.run_pending", side_effect=boom),
+            mock.patch("cortex_utils.alerter.daemon.time.sleep"),
+        ):
+            d._schedule_loop()
+
+        assert len(calls) == 2, "the loop must run again after a job raised"
