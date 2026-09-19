@@ -170,8 +170,9 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
 
 # Everything that differs between two occurrences of the SAME fault. The key
 # must identify the fault, not the line: structlog stamps every emit with a
-# timestamp that lands inside the 200-char window, and messages embed per-item
-# ids, so hashing the raw line gave one key per line. Measured over 7 days of
+# timestamp, which usually lands inside the 200-char window (7,043 of 7,660
+# lines over 48h; the exceptions are long triage-worker events), and messages
+# embed per-item ids -- so hashing the raw line gave one key per line. Measured over 7 days of
 # all cortex containers: 42 unclassified errors, 42 distinct keys without
 # normalisation, 25 with.
 #
@@ -225,8 +226,11 @@ def classify(container: str, log_line: str) -> Classification | None:
 
     # Tuned patterns are deliberately NOT gated on is_error_line(): "History
     # expired for historyId 12345" and "HttpError 503" are real failures
-    # containing no error word. The price is that an over-broad pattern
-    # classifies a non-error, so the patterns carry the burden of precision.
+    # containing no error word. (The daemon still gates before calling this,
+    # so those two reach a pattern only via the level field -- ungating here
+    # is what lets any other caller classify them.) The price is that an
+    # over-broad pattern classifies a non-error, so the patterns carry the
+    # burden of precision.
     for pattern, severity, cooldown, title, description in PATTERNS:
         if pattern.search(log_line):
             # Create unique key for deduplication
@@ -247,7 +251,9 @@ def classify(container: str, log_line: str) -> Classification | None:
 
     # No tuned pattern, but the line is an error: alert on it anyway. Before
     # this, an unrecognised error was dropped here, and of 67 error messages
-    # cortex can emit, 3 matched a pattern and 0 could reach the channel.
+    # cortex can emit, 3 matched a pattern and 0 could reach the channel --
+    # zero rather than three because daemon.py calls is_error_line() BEFORE
+    # classify(), and none of those 3 passed it.
     # The patterns are ENRICHMENT -- tuned severity and cooldown -- not a gate.
     #
     # WARNING is deliberate: it aggregates into the daily summary rather than
