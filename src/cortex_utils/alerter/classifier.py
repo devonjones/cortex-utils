@@ -1,6 +1,7 @@
 """Error pattern classifier for log lines."""
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -176,6 +177,53 @@ PATTERNS: list[tuple[re.Pattern, Severity, int, str, str]] = [
 ]
 
 
+# Everything in a log line that changes between two occurrences of the SAME
+# fault. Hashing the raw line made the digest unique per LINE rather than per
+# ERROR, which is the opposite of dedup:
+#
+#   * structlog renders a "timestamp" field, and for any event under ~137
+#     characters it lands INSIDE the 200-char window -- so two identical
+#     messages one second apart got two different keys. Measured 2026-09-19:
+#     "Config reload failed" at .111111Z and at .222222Z hashed to 7949f4e4
+#     and 31df69bf.
+#   * messages embed per-item ids. The six "Pattern detection failed for
+#     <gmail-id>" lines Hades emitted in 14 days are ONE recurring fault and
+#     produced SIX distinct keys.
+#
+# Both matter because the catch-all's survivability rests entirely on this
+# dedup: a service failing in a loop must collapse to one summary line, and
+# the daily summary truncates at 20 entries. Without normalisation the first
+# real incident renders 20 near-identical lines and "... and N more", which is
+# useless exactly when it is needed.
+_VOLATILE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?"  # ISO timestamps
+    r"|\b[0-9a-f]{6,}\b"  # hex ids -- gmail ids, sha digests, uuids
+    r"|\[\d+\]"  # postgres's [pid] -- bracketed, so any width
+    r"|\b\d{3,}\b",  # counts, durations, ports
+    re.IGNORECASE,
+)
+
+
+def _dedup_source(log_line: str) -> str:
+    """The part of a line that is the same on every occurrence of one fault.
+
+    structlog lines are JSON, and only "event" carries the fault; every other
+    field is either constant (service, logger, level) or volatile (timestamp).
+    Falls back to the raw line for anything that is not structlog JSON --
+    Postgres and Traefik log plain text.
+    """
+
+    def message(line: str) -> str:
+        try:
+            parsed = json.loads(line)
+        except (ValueError, TypeError):
+            return line
+        event = parsed.get("event") if isinstance(parsed, dict) else None
+        return event if isinstance(event, str) else line
+
+    return _VOLATILE.sub("<>", message(log_line))[:200]
+
+
 def classify(container: str, log_line: str) -> Classification | None:
     """Classify a log line and return alert info if it's an error.
 
@@ -246,9 +294,19 @@ def classify(container: str, log_line: str) -> Classification | None:
     # Alert on the rest and let the specific patterns be ENRICHMENT -- they
     # keep their tuned severities and cooldowns; they no longer act as a gate.
     #
-    # The key is hashed off the message so a service failing in a loop collapses
-    # to ONE summary line rather than thousands. That dedup is what makes a
-    # noisy default survivable, and it is the digest doing the work: the
+    # The key is hashed off the NORMALISED message (see _dedup_source) so a
+    # service failing in a loop collapses to one summary line rather than
+    # hundreds. That dedup is what makes a noisy default survivable.
+    #
+    # It did not work when first written, and the failure was total rather than
+    # partial: hashing the raw log_line[:200] hashed a per-emit timestamp, so
+    # the key was unique per LINE. Measured over 7 days of all 11 cortex
+    # containers, 42 unclassified errors produced 42 distinct keys -- a
+    # collapse rate of ZERO. With normalisation, 25. The comment claiming the
+    # property shipped before the property did; that is what the tests in
+    # TestTheDedupKeyCollapsesRealTraffic now hold in place.
+    #
+    # The digest is what does the work here: the
     # daemon's WARNING branch calls increment_warning() only, never
     # should_alert(), so cooldown_minutes is inert on the path that actually
     # consumes this classification. It is set for the case where a tuned
@@ -258,7 +316,7 @@ def classify(container: str, log_line: str) -> Classification | None:
     # rather than pinging the channel, which is exactly the right landing place
     # for "an error nobody has triaged yet". A tuned pattern can still raise
     # something to HIGH or CRITICAL once someone decides it deserves that.
-    digest = hashlib.sha1(log_line[:200].encode("utf-8", "replace")).hexdigest()[:8]
+    digest = hashlib.sha1(_dedup_source(log_line).encode("utf-8", "replace")).hexdigest()[:8]
     return Classification(
         severity=Severity.WARNING,
         error_key=f"{container}:unclassified:{digest}",

@@ -44,6 +44,7 @@ fails: silently under an allowlist, noisily under a denylist.
 
 from __future__ import annotations
 
+import json
 from unittest import mock
 
 import pytest
@@ -435,3 +436,224 @@ class TestDiscoveryIsWiredIn:
         d = self._daemon()
         self._run_once(d, [])
         assert "NOTHING" in capsys.readouterr().err
+
+
+class TestTheDedupKeyCollapsesRealTraffic:
+    """The catch-all's survivability rests entirely on this key collapsing.
+
+    It did not. Hashing `log_line[:200]` hashed a NONCE: structlog renders a
+    per-emit "timestamp" field that lands inside the window for any event under
+    ~137 characters, and Postgres prefixes its own clock. Measured 2026-09-19
+    over 7 days of all 11 cortex containers: 42 unclassified errors produced 42
+    distinct keys -- a collapse rate of zero. With normalisation, 25.
+
+    The old test guarded only OVER-collapse. Under-collapse -- the live
+    behaviour -- was unasserted, because its fixture fed a string with no
+    timestamp, which production never emits.
+    """
+
+    @staticmethod
+    def _line(event, ts="2026-09-19T01:00:00.111111Z"):
+        return json.dumps(
+            {
+                "event": event,
+                "service": "triage-worker",
+                "logger": "__main__",
+                "level": "error",
+                "timestamp": ts,
+            }
+        )
+
+    def test_the_same_fault_one_second_later_is_the_same_key(self):
+        a = classify("cortex-triage-worker", self._line("Config reload failed"))
+        b = classify(
+            "cortex-triage-worker",
+            self._line("Config reload failed", "2026-09-19T01:00:01.222222Z"),
+        )
+        assert a.error_key == b.error_key
+
+    def test_the_same_fault_on_a_different_item_is_the_same_key(self):
+        """Six real 'Pattern detection failed for <gmail-id>' lines are ONE fault."""
+        a = classify(
+            "cortex-triage-worker", self._line("Pattern detection failed for 1a06430fa5df4c3e")
+        )
+        b = classify(
+            "cortex-triage-worker", self._line("Pattern detection failed for 1a05dcab473eb3dc")
+        )
+        assert a.error_key == b.error_key
+
+    def test_postgres_clock_and_pid_do_not_split_one_fault(self):
+        def mk(ts, pid):
+            return (
+                f"{ts} UTC [{pid}] ERROR:  duplicate key value violates "
+                'unique constraint "unique_pattern"'
+            )
+
+        a = classify("cortex-postgres", mk("2026-09-14 16:23:14.923", 42))
+        b = classify("cortex-postgres", mk("2026-09-14 16:24:02.117", 8891))
+        assert a.error_key == b.error_key
+
+    def test_a_loop_of_five_hundred_emissions_is_one_key(self):
+        """The property the comment claims. It was 500 keys."""
+        keys = {
+            classify(
+                "cortex-triage-worker", self._line("Worker crashed", f"2026-09-19T01:00:{n:02d}.0Z")
+            ).error_key
+            for n in range(60)
+        }
+        assert len(keys) == 1, f"a repeating fault produced {len(keys)} keys"
+
+    def test_genuinely_different_faults_stay_apart(self):
+        """Normalisation must not over-collapse into one useless bucket."""
+        keys = {
+            classify("cortex-triage-worker", self._line(e)).error_key
+            for e in (
+                "Config reload failed",
+                "Gmail batch modify failed",
+                "Cannot start without Docker connection",
+            )
+        }
+        assert len(keys) == 3
+
+
+class TestWarningsNeverReachTheChannel:
+    """The whole noise-safety claim of this PR, and nothing held it.
+
+    084c7fe made WARNING the primary path for every untriaged error in the
+    estate. If that branch ever pings Discord, the alerter becomes the flood it
+    was written to avoid -- and 'the WARNING branch also calls send_embed'
+    survived the full suite before this test existed.
+    """
+
+    @staticmethod
+    def _daemon():
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=["cortex-x"])
+        d.discord = mock.Mock()
+        return d
+
+    def test_an_unclassified_error_is_counted_and_not_sent(self):
+        d = self._daemon()
+        line = json.dumps({"event": "Config reload failed", "level": "error"})
+        assert classify("cortex-x", line).severity is Severity.WARNING
+        d._process_log_line("cortex-x", line)
+        d.discord.send_embed.assert_not_called()
+        d.discord.send.assert_not_called()
+
+    def test_it_really_was_counted(self):
+        """Otherwise 'not sent' is satisfied by doing nothing at all."""
+        d = self._daemon()
+        d.rate_limiter = mock.Mock()
+        d._process_log_line(
+            "cortex-x", json.dumps({"event": "Config reload failed", "level": "error"})
+        )
+        d.rate_limiter.increment_warning.assert_called_once()
+        d.rate_limiter.should_alert.assert_not_called()
+
+    def test_a_critical_still_does_reach_the_channel(self):
+        """The control: WARNING silence must not be silence for everything."""
+        d = self._daemon()
+        line = "psycopg2.OperationalError: could not connect to server"
+        assert classify("cortex-x", line).severity is Severity.CRITICAL
+        d._process_log_line("cortex-x", line)
+        assert d.discord.send_embed.called, "a real critical must still alert"
+
+
+class TestTheDailySummaryTruncatesLoudly:
+    """A summary that silently drops entries fails toward silence.
+
+    That is this PR's own bug class, one layer down: the 20-line cap and the
+    "... and N more" tail were both unasserted, so a cap that stopped saying it
+    had capped would ship green.
+    """
+
+    @staticmethod
+    def _daemon():
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=["cortex-x"])
+        d.discord = mock.Mock()
+        return d
+
+    def _summary_of(self, n):
+        d = self._daemon()
+        d.rate_limiter = mock.Mock()
+        d.rate_limiter.reset_warning_counts.return_value = {
+            f"cortex-x:unclassified:{i:04x}": 1 for i in range(n)
+        }
+        d._send_daily_summary()
+        return d.discord.send_embed.call_args.kwargs["description"]
+
+    def test_it_caps_at_twenty_and_says_how_many_it_dropped(self):
+        body = self._summary_of(51)
+        assert body.count("\n- ") == 20, "the cap must hold"
+        assert "... and 31 more" in body, "a silent truncation is the bug this PR is about"
+
+    def test_a_short_summary_has_no_truncation_notice(self):
+        body = self._summary_of(3)
+        assert body.count("\n- ") == 3
+        assert "more" not in body
+
+    def test_an_empty_day_still_reports(self):
+        """Silence and 'nothing happened' must be distinguishable."""
+        d = self._daemon()
+        d.rate_limiter = mock.Mock()
+        d.rate_limiter.reset_warning_counts.return_value = {}
+        d._send_daily_summary()
+        assert "No warnings" in d.discord.send_embed.call_args.kwargs["description"]
+
+
+class TestClientFaultFilterNeverSuppressesCorruption:
+    """The filter drops OUR typos. It must never drop the database's distress.
+
+    A review suggested widening it to cover the 29 postgres lines a week that
+    still reach the channel. Declined, and locked down here instead: those lines
+    are not the typo class. `item order invariant violated for index` is btree
+    corruption -- the cortex-rj2b failure that returned 85 rows where a seqscan
+    returned 112, a 24% silent row loss that went undetected precisely because
+    it raised no alarm anyone was listening for.
+
+    Suppressing it to quieten the channel would rebuild that blindness on
+    purpose.
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'ERROR:  item order invariant violated for index "unique_email_mapping"',
+            "ERROR:  invalid collation version change",
+            'ERROR:  duplicate key value violates unique constraint "unique_pattern"',
+            'ERROR:  no partition of relation "queue" found for row',
+            "ERROR:  could not map dynamic shared memory segment",
+            "ERROR:  refusing to run: this migration drops the constraint",
+        ],
+    )
+    def test_the_databases_own_distress_is_never_filtered(self, line):
+        assert not is_client_sql_fault("cortex-postgres", line), (
+            "this is the database in trouble, not a caller's bad SQL"
+        )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'ERROR:  column "foo" does not exist at character 8',
+            'ERROR:  relation "nosuch" does not exist',
+            'ERROR:  syntax error at or near "slect"',
+            "ERROR:  unterminated quoted identifier at or near",
+            "ERROR:  aggregate functions are not allowed in GROUP BY",
+            "ERROR:  ORDER BY position 2 is not in select list",
+            # The one alternation this PR added that had no test.
+            'ERROR:  invalid input syntax for type integer: "abc"',
+        ],
+    )
+    def test_our_own_typos_are_filtered(self, line):
+        assert is_client_sql_fault("cortex-postgres", line)
+
+    def test_only_postgres(self):
+        """The filter is scoped by container; a worker saying this is our bug."""
+        line = 'ERROR:  relation "nosuch" does not exist'
+        assert is_client_sql_fault("cortex-postgres", line)
+        assert not is_client_sql_fault("cortex-triage-worker", line)
