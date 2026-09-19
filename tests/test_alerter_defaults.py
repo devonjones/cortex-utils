@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 from unittest import mock
 
+import docker
 import pytest
 
 from cortex_utils.alerter.classifier import (
@@ -911,3 +912,194 @@ class TestOneRaiseDoesNotKillTheScheduler:
             d._schedule_loop()
 
         assert len(calls) == 2, "the loop must run again after a job raised"
+
+
+class TestTheTailerDelivers:
+    """Ingestion: the stage every other stage rests on, and the one with no tests.
+
+    Rounds 1-4 fixed the gate, the dedup key, the summary's content and its
+    delivery. All four assume a line arrives here. `grep -rn "_tail_container"
+    tests/` returned three hits before this class and all three were
+    `mock.patch.object` -- the function was never executed, so ten mutations of
+    it shipped green, including `self._process_log_line(...)` replaced by
+    `pass`. The alerter could ingest NOTHING and 591 tests agreed it was fine.
+
+    The failure-recovery cases are not hypothetical: six cortex containers were
+    recreated by a redeploy on 2026-09-16, and a recreation is exactly the
+    NotFound window. A tailer thread that returns is indistinguishable from one
+    quietly watching, because they are all daemon threads with no supervision.
+    """
+
+    @staticmethod
+    def _daemon():
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=["cortex-x"])
+        d.discord = mock.Mock()
+        return d
+
+    @staticmethod
+    def _client(d, lines, raise_first=None):
+        """A docker client whose SECOND tail attempt stops the loop.
+
+        Stopping from inside logs() rather than after it means the loop
+        terminates whatever the mutant does -- including a mutant that removes
+        the handler which would otherwise have ended it.
+        """
+        calls = []
+        container = mock.Mock()
+
+        def logs(**kw):
+            calls.append(kw)
+            if len(calls) >= 2:
+                d._stop_event.set()
+                return iter(())
+            if raise_first is not None:
+                raise raise_first
+            return iter(lines)
+
+        container.logs.side_effect = logs
+        client = mock.Mock()
+        client.containers.get.return_value = container
+        client.logs_calls = calls
+        return client
+
+    def test_every_line_reaches_the_classifier_under_its_own_container_name(self):
+        d = self._daemon()
+        d.docker_client = self._client(
+            d, [b'{"event": "boom", "level": "error"}\n', b"  second line  \n"]
+        )
+        seen = []
+        d._process_log_line = lambda c, line: seen.append((c, line))
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep"):
+            d._tail_container("cortex-x")
+        assert seen == [
+            ("cortex-x", '{"event": "boom", "level": "error"}'),
+            ("cortex-x", "second line"),
+        ]
+
+    def test_undecodable_bytes_do_not_drop_the_line(self):
+        d = self._daemon()
+        d.docker_client = self._client(d, [b"ERROR \xff broke\n"])
+        seen = []
+        d._process_log_line = lambda c, line: seen.append(line)
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep"):
+            d._tail_container("cortex-x")
+        assert len(seen) == 1
+
+    def test_it_follows_a_live_stream_rather_than_reading_the_backlog(self):
+        d = self._daemon()
+        d.docker_client = self._client(d, [])
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep"):
+            d._tail_container("cortex-x")
+        kw = d.docker_client.logs_calls[0]
+        assert kw["stream"] is True and kw["follow"] is True
+        assert "since" in kw, "without since, every restart replays the whole history"
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            docker.errors.NotFound("container recreated by a redeploy"),
+            docker.errors.APIError("docker restarted"),
+            RuntimeError("classify raised on a hostile line"),
+        ],
+    )
+    def test_a_failure_does_not_end_the_watch(self, exc):
+        d = self._daemon()
+        d.docker_client = self._client(d, [b"x\n"], raise_first=exc)
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep"):
+            d._tail_container("cortex-x")
+        assert len(d.docker_client.logs_calls) == 2, (
+            f"{type(exc).__name__} left the container permanently unwatched"
+        )
+
+    def test_the_reconnect_resumes_from_now_and_so_drops_the_gap(self):
+        """PINS A KNOWN LOSS rather than asserting it is correct.
+
+        `since=datetime.now()` is re-evaluated on every pass of the while loop,
+        so a reconnect resumes from the moment it reconnects and whatever the
+        container emitted during the outage is gone. Measured on real traffic:
+        cortex-triage-worker logs ~2.1 lines/s, so a 30s catch-all sleep drops
+        ~63 lines, and cortex-labeling-worker logged two `Gmail batch modify
+        failed` errors 35 seconds apart on 2026-09-14 -- inside one window.
+
+        This asserts the CURRENT behaviour so that changing it is a deliberate
+        act with a failing test, not an accident. The redesign is cortex-okcx.
+        """
+        d = self._daemon()
+        d.docker_client = self._client(d, [b"x\n"], raise_first=RuntimeError("boom"))
+        with mock.patch("cortex_utils.alerter.daemon.time.sleep"):
+            d._tail_container("cortex-x")
+        first, second = d.docker_client.logs_calls[0], d.docker_client.logs_calls[1]
+        assert second["since"] > first["since"], (
+            "the reconnect moved `since` forward, which is the documented loss"
+        )
+
+
+class TestConnectDocker:
+    def test_a_docker_failure_is_reported_as_failure(self):
+        d = TestTheTailerDelivers._daemon()
+        with mock.patch(
+            "cortex_utils.alerter.daemon.docker.from_env",
+            side_effect=docker.errors.DockerException("no socket"),
+        ):
+            assert d._connect_docker() is False
+
+    def test_run_refuses_to_half_start_without_docker(self):
+        d = TestTheTailerDelivers._daemon()
+        with (
+            mock.patch.object(d, "_connect_docker", return_value=False),
+            mock.patch.object(d, "_tail_container") as tail,
+            mock.patch("cortex_utils.alerter.daemon.schedule"),
+        ):
+            d.run()
+        assert not tail.called
+        assert not d.discord.send.called
+
+
+class TestRunStartsATailerPerContainer:
+    """`_tail_container` is patched in every run() test and was never asserted on.
+
+    So `for container_name in self.containers:` replaced by `for ... in []:`
+    started no tailer threads at all and the suite stayed green -- the alerter
+    would discover its containers, log that it was monitoring them, send its
+    startup notice, and watch nothing.
+    """
+
+    @staticmethod
+    def _run_with(containers, discovered=None):
+        from cortex_utils.alerter.daemon import AlerterDaemon
+
+        with mock.patch("cortex_utils.alerter.daemon.DiscordClient"):
+            d = AlerterDaemon("https://discord.test/hook", containers=containers)
+        d.discord = mock.Mock()
+        d._stop_event.set()
+        with (
+            mock.patch.object(d, "_connect_docker", return_value=True),
+            mock.patch.object(d, "_tail_container") as tail,
+            mock.patch.object(d, "_discover_running_containers", return_value=discovered or []),
+            mock.patch("cortex_utils.alerter.daemon.schedule"),
+        ):
+            d.run()
+        return tail
+
+    def test_one_tailer_per_watched_container(self):
+        tail = self._run_with(["cortex-a", "cortex-b", "cortex-c"])
+        assert sorted(c.args[0] for c in tail.call_args_list) == [
+            "cortex-a",
+            "cortex-b",
+            "cortex-c",
+        ]
+
+    def test_discovered_containers_are_tailed_too(self):
+        """Discovery is pointless if nothing tails what it found."""
+        tail = self._run_with(None, discovered=["cortex-gateway", "cortex-teach"])
+        assert sorted(c.args[0] for c in tail.call_args_list) == [
+            "cortex-gateway",
+            "cortex-teach",
+        ]
+
+    def test_watching_nothing_starts_nothing(self):
+        tail = self._run_with(None, discovered=[])
+        assert not tail.called
