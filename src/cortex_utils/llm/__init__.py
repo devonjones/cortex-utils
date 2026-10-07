@@ -5,11 +5,13 @@ from cortex_utils.llm.client import (
     LLM_BODY_PREVIEW_LENGTH,
     LLMClient,
     LLMError,
+    LLMTruncatedError,
 )
 
 __all__ = [
     "LLMClient",
     "LLMError",
+    "LLMTruncatedError",
     "LLM_BODY_PREVIEW_LENGTH",
     "INVALID_LLM_EXTRACTION_VALUES",
 ]
