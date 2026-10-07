@@ -390,3 +390,81 @@ class TestTruncationBeatsAnUnreadableShape:
         with pytest.raises(LLMError) as e:
             c.classify("p", "m")
         assert not isinstance(e.value, LLMTruncatedError)
+
+
+class TestTheReturnTypeIsEnforcedNotJustAnnotated:
+    """`classify` is annotated `-> tuple[str, float, str]`; nothing enforced it.
+
+    cortex-to6h. Found by applying docs/agent-isolation.md item 3's assertion
+    -- a TYPE check must precede a MEMBERSHIP test -- to this client, after the
+    same assertion caught a defect in reflex. An annotation is a claim, and
+    three services read `category` on the strength of it.
+
+    The downstream test below is the point of this class. Asserting only that
+    the client raises would leave the reason unstated, and the reason is that
+    the consumer's membership test is what actually blows up:
+
+        triage/engine/matcher.py:1307   `if category in rule.routes`
+        rule.routes                     dict[str, Action]
+        -> TypeError: unhashable type: 'list'
+
+    past `except VariableError` (matcher.py:1227) to the worker's broad
+    `except Exception` -> three attempts -> dead letter. The email is never
+    classified, so it is never labelled, so the workflow never dispatches.
+    """
+
+    @pytest.mark.parametrize("category", [["Newsletter"], {"a": 1}, 3, None, True, 1.5])
+    def test_a_non_string_category_is_refused(self, category):
+        c = _client_returning(
+            _wrap(json.dumps({"category": category, "confidence": 0.9, "reasoning": "r"}))
+        )
+        with pytest.raises(LLMError, match="not a string"):
+            c.classify("p", "m")
+
+    @pytest.mark.parametrize("category", [["Newsletter"], {"a": 1}, 3, None, True, 1.5])
+    def test_the_extraction_variant_refuses_it_too(self, category):
+        """Both call sites, because fixing one is how this came back."""
+        c = _client_returning(
+            _wrap(json.dumps({"category": category, "confidence": 0.9, "reasoning": "r"}))
+        )
+        with pytest.raises(LLMError, match="not a string"):
+            c.classify_with_extraction("p", "m", ["f"])
+
+    def test_what_the_consumer_would_otherwise_do_with_it(self):
+        """Names the consequence, so the guard's reason survives a refactor.
+
+        If the client ever hands a list back again, this is what happens two
+        layers away -- not a refusal, a TypeError from the membership test the
+        code uses to decide the category is unknown.
+        """
+        routes = {"Newsletter": "some-action"}
+        assert "Newsletter" in routes  # the intended path
+        assert "Unknown" not in routes  # the intended refusal
+        with pytest.raises(TypeError, match="unhashable"):
+            ["Newsletter"] in routes  # noqa: B015 -- the raise IS the assertion
+
+    def test_an_explicit_unknown_string_is_still_honoured(self):
+        """The control: this guard is about TYPE, not about rejecting values.
+
+        `classify`'s own historical default was the string "unknown", which is
+        a legitimate answer and must still pass. A set that happens to exclude
+        "unknown" makes a sloppy normaliser look correct -- that is a property
+        of the set, not of the code.
+        """
+        c = _client_returning(
+            _wrap(json.dumps({"category": "unknown", "confidence": 0.1, "reasoning": "r"}))
+        )
+        assert c.classify("p", "m")[0] == "unknown"
+
+    def test_a_null_reasoning_is_coerced_not_raised(self):
+        """reasoning is free text feeding a trace line, not a decision.
+
+        `data.get("reasoning", "")` returns None when the key is PRESENT and
+        null -- the default only fires on absence. Coercing is right here
+        precisely because nothing branches on it; the same coercion on
+        `category` would be the forbidden one.
+        """
+        c = _client_returning(
+            _wrap(json.dumps({"category": "Newsletter", "confidence": 0.9, "reasoning": None}))
+        )
+        assert c.classify("p", "m")[2] == ""

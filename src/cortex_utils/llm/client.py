@@ -247,13 +247,12 @@ class LLMClient:
         """The value of `field`, or raise. Never a default.
 
         A default turns "the model said nothing" into "the model said this",
-        which is indistinguishable downstream. `confidence` defaulting to 0.5
-        was the worst of it: a missing value became a mid-range number that
-        reads as a considered judgement, and reflex compares it against a
-        threshold to decide whether to escalate.
+        which is indistinguishable downstream.
 
-        An explicit value is honoured, including an explicit "unknown" --
-        the distinction this draws is present-vs-absent, not a value check.
+        An explicit value is honoured, including an explicit "unknown": the
+        distinction drawn here is present-vs-absent, NOT a value or type
+        check. For a field a caller will use as a string, that is not enough
+        -- see _required_str.
         """
         if field not in data:
             raise LLMError(
@@ -261,6 +260,47 @@ class LLMClient:
                 "response is incomplete rather than a judgement of absence"
             )
         return data[field]
+
+    @classmethod
+    def _required_str(cls, data: dict[str, Any], field: str) -> str:
+        """Present AND a string. A type annotation is not a guard.
+
+        `classify` is annotated `-> tuple[str, float, str]` and three services
+        read `category` out of it, but nothing enforced the type, so a model
+        answering `{"category": ["Newsletter"]}` handed a LIST to callers that
+        had been told it was a str.
+
+        Where that lands, traced 2026-10-07 rather than assumed:
+
+            triage/engine/matcher.py:1301  unpacks the tuple
+            matcher.py:1307                `if category in rule.routes`
+            rule.routes                    dict[str, Action]
+            -> TypeError: unhashable type: 'list'
+
+        The nearest handler is `except VariableError` at matcher.py:1227,
+        which does not catch it, so it reaches the worker's broad
+        `except Exception` -> _fail_job -> three attempts -> dead letter. The
+        intended refusal (category not in routes, fall through to the next
+        rule) never happens, and the email is never classified and therefore
+        never labelled. "Labels are the API", so that is a workflow that never
+        dispatches.
+
+        Raising LLMError instead puts it where the callers already look:
+        school and triage both have `except LLMError` handlers, and in triage
+        a bad model response becomes a retried job rather than a crash.
+
+        Found by cortex-to6h, applying an assertion from
+        docs/agent-isolation.md item 3 -- a type check has to come BEFORE a
+        membership test, because the membership test is what raises.
+        """
+        value = cls._required(data, field)
+        if not isinstance(value, str):
+            raise LLMError(
+                f"LLM returned {field!r} as {type(value).__name__}, not a string: "
+                f"{value!r}. Callers are annotated for str and use this in a "
+                "membership test, which raises on an unhashable value."
+            )
+        return value
 
     @staticmethod
     def _reject_if_truncated(result: dict[str, Any]) -> None:
@@ -382,9 +422,9 @@ class LLMClient:
                 raise LLMError(f"LLM returned a non-numeric confidence {raw_confidence!r}") from e
 
             return (
-                self._required(data, "category"),
+                self._required_str(data, "category"),
                 confidence,
-                data.get("reasoning", ""),
+                str(data.get("reasoning") or ""),
             )
         except httpx.RequestError as e:
             logger.error(f"LLM network error: {e}")
@@ -657,9 +697,9 @@ class LLMClient:
                                 extracted[field] = val.strip()
 
             return (
-                self._required(data, "category"),
+                self._required_str(data, "category"),
                 confidence,
-                data.get("reasoning", ""),
+                str(data.get("reasoning") or ""),
                 extracted,
             )
         except httpx.RequestError as e:
