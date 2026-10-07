@@ -13,6 +13,8 @@ HTTP 200 and done_reason "length".
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from cortex_utils.llm.client import LLMClient, LLMError, LLMTruncatedError
@@ -109,53 +111,76 @@ def _wrap(content):
 
 
 class TestTheCallSitesActuallyRefuse:
-    """classify() and classify_with_extraction() must not invent a field."""
+    """classify() must not invent a field. Its sibling is covered below."""
 
     @pytest.mark.parametrize("missing", ["confidence", "category"])
     def test_classify_refuses_a_response_missing_a_required_field(self, missing):
         full = {"category": "admin", "confidence": 0.9, "reasoning": "because"}
         del full[missing]
-        c = _client_returning(_wrap(__import__("json").dumps(full)))
-        with pytest.raises(LLMError, match=missing):
+        c = _client_returning(_wrap(json.dumps(full)))
+        # match on _required's OWN message. `match=missing` was satisfied by a
+        # bare KeyError re-raised as LLMError("LLM error: 'confidence'"), so it
+        # could not tell the guard from no guard at all.
+        with pytest.raises(LLMError, match=f"has no {missing!r}"):
             c.classify("prompt", "some-model")
 
     def test_classify_accepts_a_complete_response(self):
         """The control: refusing everything would also pass the tests above."""
-        import json as _json
-
         c = _client_returning(
-            _wrap(_json.dumps({"category": "admin", "confidence": 0.9, "reasoning": "r"}))
+            _wrap(json.dumps({"category": "admin", "confidence": 0.9, "reasoning": "r"}))
         )
         assert c.classify("prompt", "some-model") == ("admin", 0.9, "r")
 
     def test_classify_refuses_a_non_numeric_confidence(self):
-        import json as _json
-
         c = _client_returning(
-            _wrap(_json.dumps({"category": "admin", "confidence": "high", "reasoning": "r"}))
+            _wrap(json.dumps({"category": "admin", "confidence": "high", "reasoning": "r"}))
         )
         with pytest.raises(LLMError, match="confidence"):
             c.classify("prompt", "some-model")
 
     def test_a_truncated_response_raises_from_the_public_method(self):
+        """Partial content, not empty.
+
+        Empty content now triggers the native think=False recovery FIRST -- see
+        the ordering test below. An earlier version used empty content and
+        passed only because the guard ran before the recovery, which made the
+        recovery unreachable for the one case it was written for.
+        """
         c = _client_returning(
-            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+            {"choices": [{"message": {"content": '{"category": "adm'}, "finish_reason": "length"}]}
         )
         with pytest.raises(LLMTruncatedError):
             c.classify("prompt", "some-model")
+
+    def test_an_empty_truncated_response_still_reaches_the_recovery(self):
+        """The ordering itself, pinned.
+
+        A reasoning model spends its budget on `thinking` and returns EMPTY
+        content with done_reason "length" -- both the fallback's trigger and the
+        guard's. Judging before recovering cancelled the fix.
+        """
+        c = _client_returning(
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            native_body={
+                "response": json.dumps({"category": "admin", "confidence": 0.9, "reasoning": "r"}),
+                "done_reason": "stop",
+            },
+        )
+        assert c.classify("prompt", "some-model") == ("admin", 0.9, "r")
+        assert any(p["url"].endswith("/api/generate") for p in c.posted), (
+            "the think=False recovery must run for an empty truncated response"
+        )
 
 
 class TestTheNativeFallbackDisablesThinking:
     """A reasoning model must not silently spend the budget on thinking."""
 
     def test_the_fallback_sends_think_false(self):
-        import json as _json
-
         # empty content on the chat API triggers the native fallback
         c = _client_returning(
             _wrap(""),
             native_body={
-                "response": _json.dumps({"category": "admin", "confidence": 0.5, "reasoning": "r"}),
+                "response": json.dumps({"category": "admin", "confidence": 0.5, "reasoning": "r"}),
                 "done_reason": "stop",
             },
         )
@@ -170,13 +195,77 @@ class TestTheNativeFallbackDisablesThinking:
 def test_the_truncation_error_is_importable_by_name():
     """A caller cannot catch what it cannot import.
 
-    LLMTruncatedError existed in client.py and was absent from the package's
-    __all__, so `from cortex_utils.llm import LLMTruncatedError` raised
-    ImportError -- the guard existed and could not be reached. Found when reflex
-    tried to catch it.
+    LLMTruncatedError existed in client.py but `__init__.py` never re-exported
+    it, so `from cortex_utils.llm import LLMTruncatedError` raised ImportError.
+    The guard existed and could not be reached.
+
+    `__all__` governs `import *` only and does NOT affect an explicit-name
+    import -- an earlier version of this docstring said it did, which would
+    teach the next reader a false rule about Python. The re-export is what
+    binds the name; this asserts both.
     """
     import cortex_utils.llm as pkg
     from cortex_utils.llm import LLMTruncatedError as Imported
 
     assert "LLMTruncatedError" in pkg.__all__
     assert Imported is LLMTruncatedError
+
+
+class TestTheOtherCallSiteRefusesToo:
+    """classify_with_extraction() is the LIVE path, not the fallback.
+
+    triage's matcher calls it whenever a rule sets `llm.extract` and only falls
+    back to classify() otherwise -- so the method the first version of this file
+    tested was the fallback, and the one it left uncovered was the feature.
+    Reverting its two _required calls shipped ('unknown', 0.5, 'r', {}) green:
+    the exact tuple this ticket exists to eliminate.
+    """
+
+    @pytest.mark.parametrize("missing", ["confidence", "category"])
+    def test_it_refuses_a_response_missing_a_required_field(self, missing):
+        full = {"category": "admin", "confidence": 0.9, "reasoning": "r"}
+        del full[missing]
+        c = _client_returning(_wrap(json.dumps(full)))
+        with pytest.raises(LLMError, match=f"has no {missing!r}"):
+            c.classify_with_extraction("prompt", "some-model", ["amount"])
+
+    def test_it_accepts_a_complete_response_and_strips_extracted(self):
+        """The control, which also covers the extracted filter loop."""
+        c = _client_returning(
+            _wrap(
+                json.dumps(
+                    {
+                        "category": "admin",
+                        "confidence": 0.9,
+                        "reasoning": "r",
+                        "extracted": {"amount": " 12 ", "unwanted": "x"},
+                    }
+                )
+            )
+        )
+        assert c.classify_with_extraction("prompt", "some-model", ["amount"]) == (
+            "admin",
+            0.9,
+            "r",
+            {"amount": "12"},
+        )
+
+
+def test_a_truncated_native_fallback_raises():
+    """The PR's headline fix, which had no test.
+
+    The native wrap used to drop `done_reason`, so a truncated native response
+    arrived looking complete. Deleting the carry-through, or the reject that
+    follows it, was green: classify() returned ('admin', 0.9, '') instead of
+    raising. The only other fallback test sets done_reason "stop", so it never
+    touches this.
+    """
+    c = _client_returning(
+        _wrap(""),  # empty chat content triggers the native retry
+        native_body={
+            "response": json.dumps({"category": "admin", "confidence": 0.9, "reasoning": ""}),
+            "done_reason": "length",
+        },
+    )
+    with pytest.raises(LLMTruncatedError):
+        c.classify("prompt", "some-model")

@@ -28,14 +28,25 @@ class LLMTruncatedError(LLMError):
 
     A truncated response is indistinguishable from a complete one by shape --
     valid JSON, plausible fields -- which is why this is raised rather than
-    returned. Measured: gemma4:26b emits a `thinking` field before `content`,
-    so under a tight max_tokens the whole budget goes on thinking and `content`
-    is an EMPTY STRING with HTTP 200 and done_reason "length".
+    returned.
 
-    NOT RETRYABLE, and that is the point. At temperature 0 a retry reproduces
-    the identical truncation, so a caller that retries loops on the same bytes
-    while only the attempt counter moves. The escape is to change an input --
-    a larger budget, a different model, think=False -- not to repeat the call.
+    Observed on this estate's ollama with gemma4:26b (measured in a sibling
+    project, NOT re-measured here, and no cortex service is configured to use
+    that model): a reasoning model emits a `thinking` field before `content`,
+    so under a tight max_tokens the whole budget goes on thinking and `content`
+    comes back an EMPTY STRING with HTTP 200 and done_reason "length".
+
+    NOT RETRYABLE, and that is the point. The stop is budget exhaustion, not a
+    sampling accident, so repeating the identical call mostly reproduces it
+    while only the attempt counter moves -- a sibling project measured a day
+    failing 23 times on the same unparseable bytes and staying blank for a week.
+    The escape is to change an input -- a larger budget, a different model,
+    think=False -- not to repeat the call.
+
+    An earlier version argued this from "at temperature 0 a retry is
+    deterministic". That premise does not hold here: only check_intent passes
+    temperature=0, and check_email_intent carries a comment explicitly refusing
+    it because some models return empty content at 0.
     """
 
     retryable = False
@@ -173,7 +184,14 @@ class LLMClient:
         )
         response.raise_for_status()
         result: dict[str, Any] = response.json()
-        self._reject_if_truncated(result)
+
+        # ORDER MATTERS: recover FIRST, judge second. Checking truncation here
+        # made the recovery below unreachable for the exact case it exists to
+        # fix -- a reasoning model spends the budget on `thinking` and returns
+        # EMPTY content with done_reason "length", which is both the fallback's
+        # trigger and the guard's. Measured: with the guard first, an empty
+        # finish_reason="length" response raised and never reached
+        # /api/generate, so the think=False retry could not run.
 
         # Some models (qwen3.5, qwen3) return empty content on the chat
         # completions API. Fall back to native Ollama /api/generate endpoint.
@@ -211,7 +229,9 @@ class LLMClient:
                     }
                 ]
             }
-            self._reject_if_truncated(result)
+        # Judge whatever we ended up with -- the recovery's result if it ran,
+        # the original otherwise.
+        self._reject_if_truncated(result)
 
         return result
 
