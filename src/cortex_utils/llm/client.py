@@ -19,7 +19,26 @@ logger = get_logger(__name__)
 class LLMError(Exception):
     """Raised when LLM call fails (network, HTTP, or invalid response)."""
 
-    pass
+    # Whether repeating the identical call could plausibly succeed.
+    retryable = True
+
+
+class LLMTruncatedError(LLMError):
+    """The model stopped because it ran out of budget, not because it finished.
+
+    A truncated response is indistinguishable from a complete one by shape --
+    valid JSON, plausible fields -- which is why this is raised rather than
+    returned. Measured: gemma4:26b emits a `thinking` field before `content`,
+    so under a tight max_tokens the whole budget goes on thinking and `content`
+    is an EMPTY STRING with HTTP 200 and done_reason "length".
+
+    NOT RETRYABLE, and that is the point. At temperature 0 a retry reproduces
+    the identical truncation, so a caller that retries loops on the same bytes
+    while only the attempt counter moves. The escape is to change an input --
+    a larger budget, a different model, think=False -- not to repeat the call.
+    """
+
+    retryable = False
 
 
 # Max characters of email body to include in LLM prompts
@@ -154,6 +173,7 @@ class LLMClient:
         )
         response.raise_for_status()
         result: dict[str, Any] = response.json()
+        self._reject_if_truncated(result)
 
         # Some models (qwen3.5, qwen3) return empty content on the chat
         # completions API. Fall back to native Ollama /api/generate endpoint.
@@ -164,6 +184,10 @@ class LLMClient:
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
+                # Reasoning models spend the budget on a `thinking` field and
+                # return empty `content`. Say so explicitly, so swapping in a
+                # reasoning model cannot silently empty every response.
+                "think": False,
             }
             # Don't pass num_predict — thinking models (qwen3.5) consume
             # the token budget on thinking tokens, leaving nothing for
@@ -180,12 +204,55 @@ class LLMClient:
                     {
                         "message": {
                             "content": native_result.get("response", ""),
-                        }
+                        },
+                        # Carried through, not dropped: the wrap used to lose it,
+                        # so a truncated native response arrived looking complete.
+                        "finish_reason": native_result.get("done_reason"),
                     }
                 ]
             }
+            self._reject_if_truncated(result)
 
         return result
+
+    @staticmethod
+    def _required(data: dict[str, Any], field: str) -> Any:
+        """The value of `field`, or raise. Never a default.
+
+        A default turns "the model said nothing" into "the model said this",
+        which is indistinguishable downstream. `confidence` defaulting to 0.5
+        was the worst of it: a missing value became a mid-range number that
+        reads as a considered judgement, and reflex compares it against a
+        threshold to decide whether to escalate.
+
+        An explicit value is honoured, including an explicit "unknown" --
+        the distinction this draws is present-vs-absent, not a value check.
+        """
+        if field not in data:
+            raise LLMError(
+                f"LLM response has no {field!r}; the prompt asks for it, so the "
+                "response is incomplete rather than a judgement of absence"
+            )
+        return data[field]
+
+    @staticmethod
+    def _reject_if_truncated(result: dict[str, Any]) -> None:
+        """Raise if the model stopped on a budget limit rather than finishing.
+
+        Checks both shapes: OpenAI's `choices[].finish_reason` and ollama's
+        native `done_reason`. A truncated answer is a failed call, not a short
+        one -- nothing downstream can tell the difference, and the fields this
+        client reads all default rather than fail.
+        """
+        choices = result.get("choices") or []
+        reasons = [c.get("finish_reason") for c in choices if isinstance(c, dict)]
+        reasons.append(result.get("done_reason"))
+        if "length" in reasons:
+            raise LLMTruncatedError(
+                "model stopped at the token budget (finish/done_reason='length'); "
+                "the response is incomplete. Raise max_tokens, set think=False, "
+                "or use a different model -- do NOT retry unchanged."
+            )
 
     def _get_content_from_response(self, result: dict[str, Any]) -> str:
         """Extracts message content from a completion response.
@@ -269,15 +336,14 @@ class LLMClient:
                 raise LLMError(f"LLM returned non-dict JSON: {text}")
 
             # Safe float conversion for confidence
-            raw_confidence = data.get("confidence")
+            raw_confidence = self._required(data, "confidence")
             try:
-                confidence = float(raw_confidence) if raw_confidence is not None else 0.5
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid confidence value from LLM: {raw_confidence}")
-                confidence = 0.5
+                confidence = float(raw_confidence)
+            except (ValueError, TypeError) as e:
+                raise LLMError(f"LLM returned a non-numeric confidence {raw_confidence!r}") from e
 
             return (
-                data.get("category", "unknown"),
+                self._required(data, "category"),
                 confidence,
                 data.get("reasoning", ""),
             )
@@ -525,12 +591,11 @@ class LLMClient:
                 raise LLMError(f"LLM returned non-dict JSON: {text}")
 
             # Safe float conversion for confidence
-            raw_confidence = data.get("confidence")
+            raw_confidence = self._required(data, "confidence")
             try:
-                confidence = float(raw_confidence) if raw_confidence is not None else 0.5
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid confidence value from LLM: {raw_confidence}")
-                confidence = 0.5
+                confidence = float(raw_confidence)
+            except (ValueError, TypeError) as e:
+                raise LLMError(f"LLM returned a non-numeric confidence {raw_confidence!r}") from e
 
             # Extract extracted fields if present
             extracted: dict[str, str] = {}
@@ -545,7 +610,7 @@ class LLMClient:
                                 extracted[field] = val.strip()
 
             return (
-                data.get("category", "unknown"),
+                self._required(data, "category"),
                 confidence,
                 data.get("reasoning", ""),
                 extracted,
