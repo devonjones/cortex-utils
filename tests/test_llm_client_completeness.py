@@ -165,3 +165,18 @@ class TestTheNativeFallbackDisablesThinking:
         assert native[0]["json"].get("think") is False, (
             "think must be explicitly disabled, or a reasoning model returns empty content"
         )
+
+
+def test_the_truncation_error_is_importable_by_name():
+    """A caller cannot catch what it cannot import.
+
+    LLMTruncatedError existed in client.py and was absent from the package's
+    __all__, so `from cortex_utils.llm import LLMTruncatedError` raised
+    ImportError -- the guard existed and could not be reached. Found when reflex
+    tried to catch it.
+    """
+    import cortex_utils.llm as pkg
+    from cortex_utils.llm import LLMTruncatedError as Imported
+
+    assert "LLMTruncatedError" in pkg.__all__
+    assert Imported is LLMTruncatedError
