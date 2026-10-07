@@ -329,7 +329,7 @@ DOCKER_HOST=unix:///var/run/docker.sock
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx/yyy
 
 # Ollama (for health checks)
-OLLAMA_URL=http://10.5.2.12:11434
+OLLAMA_URL=http://10.5.2.31:11434
 
 # Retention settings
 QUEUE_RETENTION_DAYS=7

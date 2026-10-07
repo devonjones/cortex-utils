@@ -10,7 +10,7 @@ import schedule
 
 from cortex_utils.log import get_logger
 
-from .classifier import Severity, classify, is_error_line
+from .classifier import Severity, _dedup_source, classify, is_error_line
 from .discord import (
     COLOR_CRITICAL,
     COLOR_HIGH,
@@ -22,15 +22,27 @@ from .rate_limiter import RateLimiter
 
 log = get_logger()
 
-# Default containers to monitor
-DEFAULT_CONTAINERS = [
-    "cortex-gmail-sync",
-    "cortex-duckdb-api",
-    "cortex-parse-worker",
-    "cortex-attachment-worker",
-    "cortex-triage-worker",
-    "cortex-labeling-worker",
-]
+# Everything under the prefix, minus a denylist. This was an allowlist of six
+# names, which left 5 of 11 running containers unwatched -- including the
+# gateway and the alerter itself. A denylist fails toward noise, which someone
+# notices; an allowlist fails toward silence, which nobody does.
+CONTAINER_PREFIX = "cortex-"
+
+# The alerter cannot watch itself: if it dies it reads nothing, including its
+# own logs. That needs an external watcher (~/HomeLab scripts/checks.d/), so it
+# is excluded rather than implying coverage it cannot provide. cortex-ogqq.
+DENYLISTED_CONTAINERS = frozenset({"cortex-alerter"})
+
+
+def discover_containers(names: list[str]) -> list[str]:
+    """Every cortex container except the denylisted ones.
+
+    Takes the live container list rather than a hardcoded one, so a service
+    added tonight is watched tonight.
+    """
+    return sorted(
+        n for n in names if n.startswith(CONTAINER_PREFIX) and n not in DENYLISTED_CONTAINERS
+    )
 
 
 class AlerterDaemon:
@@ -53,7 +65,9 @@ class AlerterDaemon:
         """
         self.discord = DiscordClient(webhook_url)
         self.rate_limiter = RateLimiter()
-        self.containers = containers or DEFAULT_CONTAINERS
+        # None means DISCOVER once Docker is connected; run() fills it in.
+        self.containers: list[str] = containers or []
+        self._discover = not containers
         self.ping_critical = ping_critical
         self.summary_hour = summary_hour
 
@@ -77,6 +91,25 @@ class AlerterDaemon:
         except docker.errors.DockerException as e:
             log.error("Failed to connect to Docker", error=str(e))
             return False
+
+    def _discover_running_containers(self) -> list[str]:
+        """Live cortex containers, minus the denylist.
+
+        Falls back to an empty list rather than a stale hardcoded set: an
+        alerter that cannot see Docker should say so loudly at startup, not
+        quietly watch six names that may no longer be the right six.
+        """
+        if self.docker_client is None:
+            log.error("Container discovery before Docker connect; watching NOTHING")
+            return []
+        try:
+            names = [c.name for c in self.docker_client.containers.list()]
+        except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+            log.error("Cannot list containers; alerter is watching NOTHING", error=str(exc))
+            return []
+        found = discover_containers(names)
+        log.info("Discovered containers to watch", count=len(found), containers=found)
+        return found
 
     def _process_log_line(self, container: str, log_line: str) -> None:
         """Process a single log line and send alerts if needed."""
@@ -142,8 +175,12 @@ class AlerterDaemon:
                     )
 
             elif classification.severity == Severity.WARNING:
-                # Warnings are just counted for daily summary
-                self.rate_limiter.increment_warning(classification.error_key)
+                # Counted for the daily summary. The sample is the
+                # NORMALISED message, so it describes the whole bucket rather
+                # than whichever occurrence arrived first.
+                self.rate_limiter.increment_warning(
+                    classification.error_key, _dedup_source(log_line)
+                )
                 log.debug(
                     "Warning counted",
                     container=container,
@@ -187,18 +224,23 @@ class AlerterDaemon:
 
     def _send_daily_summary(self) -> None:
         """Send daily summary of warnings."""
+        # READ, do not reset -- see _clear_if_delivered. Resetting here and
+        # ignoring the send result meant one Discord 5xx deleted the day.
         with self._lock:
-            counts = self.rate_limiter.reset_warning_counts()
+            samples = dict(self.rate_limiter.warning_samples)
+            counts = self.rate_limiter.get_warning_counts()
 
         if not counts:
             # No warnings to report
             log.info("Daily summary: no warnings")
             date_str = datetime.now().strftime("%Y-%m-%d")
-            self.discord.send_embed(
-                title="Cortex Daily Summary",
-                description=f"**{date_str}**\n\nNo warnings or errors to report.",
-                color=COLOR_INFO,
-                ping=False,
+            self._clear_if_delivered(
+                self.discord.send_embed(
+                    title="Cortex Daily Summary",
+                    description=f"**{date_str}**\n\nNo warnings or errors to report.",
+                    color=COLOR_INFO,
+                    ping=False,
+                )
             )
             return
 
@@ -208,8 +250,16 @@ class AlerterDaemon:
             # error_key format: "container:error_type"
             parts = error_key.split(":", 1)
             container = parts[0] if len(parts) > 1 else "unknown"
-            error_type = parts[1].replace("_", " ").title() if len(parts) > 1 else error_key
-            warning_lines.append(f"- **{error_type}** ({container}): {count}")
+            error_type = parts[1].replace("_", " ") if len(parts) > 1 else error_key
+            # .title() used to be applied here and case-mangled the hex digest,
+            # so the string printed was not the key anyone could grep for.
+            if not error_type.startswith("unclassified"):
+                error_type = error_type.title()
+            line = f"- **{error_type}** ({container}): {count}"
+            sample = samples.get(error_key, "").strip()
+            if sample:
+                line += f"\n  {sample[:120]}"
+            warning_lines.append(line)
 
         description = f"**{datetime.now().strftime('%Y-%m-%d')}**\n\n"
         description += "**Warnings:**\n" + "\n".join(warning_lines[:20])  # Limit to 20 items
@@ -218,21 +268,65 @@ class AlerterDaemon:
             description += f"\n... and {len(counts) - 20} more"
 
         log.info("Sending daily summary", warning_count=len(counts))
-        self.discord.send_embed(
-            title="Cortex Daily Summary",
-            description=description,
-            color=COLOR_WARNING if counts else COLOR_INFO,
-            ping=False,
+        self._clear_if_delivered(
+            self.discord.send_embed(
+                title="Cortex Daily Summary",
+                description=description,
+                color=COLOR_WARNING if counts else COLOR_INFO,
+                ping=False,
+            ),
+            len(counts),
         )
 
+    def _clear_if_delivered(self, delivered: bool, warning_count: int = 0) -> None:
+        """Drop the day's warnings only once Discord has accepted them.
+
+        A failed send keeps them for the next summary. A warning arriving
+        between the read and this reset is lost, but that window is one HTTP
+        request wide.
+        """
+        if not delivered:
+            log.error(
+                "Daily summary was NOT delivered; keeping the day's warnings",
+                warning_count=warning_count,
+            )
+            return
+        with self._lock:
+            self.rate_limiter.reset_warning_counts()
+
     def _schedule_loop(self) -> None:
-        """Run the scheduler loop."""
+        """Run the scheduler loop.
+
+        schedule.run_pending() does not catch, and this runs on a DAEMON
+        thread: one raise out of a job killed the thread permanently, every
+        later summary was silently never sent, and the process went on looking
+        healthy while warning_counts filled with nothing draining it. Catch,
+        report, keep the loop alive.
+        """
         while not self._stop_event.is_set():
-            schedule.run_pending()
+            try:
+                schedule.run_pending()
+            except Exception:
+                log.exception("Scheduled job raised; the scheduler stays up")
             time.sleep(60)
 
     def send_test_alert(self) -> bool:
-        """Send a test alert to verify webhook is working."""
+        """Send a test alert to verify webhook is working.
+
+        `self.containers` is EMPTY until run() fills it from discovery, and
+        `cortex alerter test` calls this before run() -- so replacing the old
+        `containers or DEFAULT_CONTAINERS` with `containers or []` made this
+        render an empty Containers field where it used to name six. Discord's
+        schema requires a non-empty field value, and an operator running the
+        test learns nothing from a blank list.
+
+        Discovery is best-effort here: a webhook test must still work when
+        Docker does not, so a failure falls back to an honest string rather
+        than to silence or an exception.
+        """
+        watched = self.containers
+        if not watched and self._discover and self._connect_docker():
+            watched = self._discover_running_containers()
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return self.discord.send_embed(
             title="Test Alert",
@@ -240,19 +334,31 @@ class AlerterDaemon:
             color=COLOR_INFO,
             fields=[
                 {"name": "Time", "value": time_str, "inline": True},
-                {"name": "Containers", "value": ", ".join(self.containers), "inline": False},
+                {
+                    "name": "Containers",
+                    "value": ", ".join(watched) or "(none discovered -- Docker unreachable?)",
+                    "inline": False,
+                },
             ],
             ping=False,
         )
 
     def run(self) -> None:
         """Start the alerter daemon."""
-        log.info("Starting alerter daemon", containers=self.containers)
+        log.info("Starting alerter daemon")
 
         # Connect to Docker
         if not self._connect_docker():
             log.error("Cannot start without Docker connection")
             return
+
+        # Discovery needs the connected client, so it happens HERE rather than
+        # in __init__. An explicit -c list still wins; this is the default path.
+        if self._discover:
+            self.containers = self._discover_running_containers()
+        if not self.containers:
+            log.error("Alerter is watching NOTHING -- no containers to monitor")
+        log.info("Monitoring containers", count=len(self.containers), names=self.containers)
 
         # Schedule daily summary
         schedule.every().day.at(f"{self.summary_hour:02d}:00").do(self._send_daily_summary)
