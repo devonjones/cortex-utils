@@ -151,8 +151,9 @@ class LLMClient:
         max_tokens: int,
         response_format: dict[str, str] | None = None,
         temperature: float | None = None,
+        reject_truncated: bool = True,
     ) -> dict[str, Any]:
-        """Helper to post to completions endpoint and return the result.
+        """Post to the completions endpoint and return the result.
 
         Args:
             model: Model name to use.
@@ -160,13 +161,16 @@ class LLMClient:
             max_tokens: Maximum tokens for the response.
             response_format: Optional response format (e.g., {"type": "json_object"}).
             temperature: Sampling temperature (0 = deterministic). None = model default.
-
-        Returns:
-            The JSON response from the API.
+            reject_truncated: Raise if the model stopped at the token budget.
+                On by default. Callers turn it OFF only where a truncated body
+                cannot produce a WRONG answer, just a negative one -- see
+                check_intent.
 
         Raises:
             httpx.RequestError: Network errors.
             httpx.HTTPStatusError: HTTP errors (non-2xx status).
+            LLMTruncatedError: The model stopped at the token budget.
+            LLMError: The response shape is unreadable.
         """
         payload: dict[str, Any] = {
             "model": model,
@@ -185,17 +189,17 @@ class LLMClient:
         response.raise_for_status()
         result: dict[str, Any] = response.json()
 
-        # ORDER MATTERS: recover FIRST, judge second. Checking truncation here
-        # made the recovery below unreachable for the exact case it exists to
-        # fix -- a reasoning model spends the budget on `thinking` and returns
-        # EMPTY content with done_reason "length", which is both the fallback's
-        # trigger and the guard's. Measured: with the guard first, an empty
-        # finish_reason="length" response raised and never reached
-        # /api/generate, so the think=False retry could not run.
-
         # Some models (qwen3.5, qwen3) return empty content on the chat
         # completions API. Fall back to native Ollama /api/generate endpoint.
-        content = self._get_content_from_response(result)
+        try:
+            content = self._get_content_from_response(result)
+        except LLMError:
+            # A body can be both truncated and unreadable -- content null, or
+            # choices cut off entirely. Truncation is the more specific
+            # diagnosis and the non-retryable one, so let it win.
+            if reject_truncated:
+                self._reject_if_truncated(result)
+            raise
         if not content.strip():
             logger.debug("Empty response from chat completions, falling back to native API")
             native_payload: dict[str, Any] = {
@@ -229,9 +233,12 @@ class LLMClient:
                     }
                 ]
             }
-        # Judge whatever we ended up with -- the recovery's result if it ran,
-        # the original otherwise.
-        self._reject_if_truncated(result)
+        # After the recovery, never before it: an empty length-stop has to
+        # reach /api/generate first, or the think=False retry is unreachable
+        # for the exact case it exists for. Pinned by
+        # test_an_empty_truncated_response_still_reaches_the_recovery.
+        if reject_truncated:
+            self._reject_if_truncated(result)
 
         return result
 
@@ -311,7 +318,19 @@ class LLMClient:
             LLMError: If the LLM call fails (network, HTTP, or other error).
         """
         try:
-            result = self._post_completion(model=model, prompt=prompt, max_tokens=10, temperature=0)
+            # reject_truncated=False: this returns `answer == "yes"`, so a
+            # truncated body can only ever make that False -- the same
+            # negative this method already returns when the model declines.
+            # 3 live rules reach this at a 10-token cap (measured on the
+            # active config 2026-10-07), where a cut-off answer is routine
+            # rather than a fault.
+            result = self._post_completion(
+                model=model,
+                prompt=prompt,
+                max_tokens=10,
+                temperature=0,
+                reject_truncated=False,
+            )
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
             return answer == "yes"
@@ -422,7 +441,15 @@ class LLMClient:
             # empty responses with temperature=0 on the chat completions API.
             # check_email_intent is used for Stage 2 verification which may
             # use larger models that have this issue.
-            result = self._post_completion(model=model, prompt=formatted_prompt, max_tokens=10)
+            # reject_truncated=False for the same reason as check_intent: the
+            # return is `answer == "yes"`, so truncation can only produce the
+            # negative this method already produces. 5 live rules.
+            result = self._post_completion(
+                model=model,
+                prompt=formatted_prompt,
+                max_tokens=10,
+                reject_truncated=False,
+            )
             content = self._get_content_from_response(result)
             answer: str = content.strip().lower()
             return answer == "yes"

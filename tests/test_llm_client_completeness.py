@@ -1,14 +1,18 @@
 """A truncated model response must not look like a complete one.
 
-The client read every field with a default, so a truncated or failed response
-produced a well-formed, plausible result: ("unknown", 0.5, ""). Nothing
-downstream could tell it from a real answer, and reflex compares that 0.5
-against a threshold to decide whether to escalate to a larger model.
+The client read every field of the parsed JSON with a default, so a truncated
+response produced a well-formed, plausible result: ("unknown", 0.5, ""). The
+shape errors were already loud; these three fields were not.
 
-Measured on the box this estate runs: gemma4:26b is a reasoning model. It emits
-a `thinking` field before `content`, so under a tight token budget the whole
-budget goes on thinking and `content` comes back as an EMPTY STRING with
-HTTP 200 and done_reason "length".
+The consumer is triage's matcher (matcher.py:1292, :1301) -- the only caller of
+classify/classify_with_extraction in the estate. It does not threshold the
+confidence, it records it, so the damage is a fabricated row rather than a
+wrong branch. reflex parses its own JSON and has its own guards.
+
+gemma4:26b is a reasoning model: it emits a `thinking` field before `content`,
+so under a tight token budget the whole budget goes on thinking and `content`
+comes back as an EMPTY STRING with HTTP 200 and done_reason "length". Measured
+in the foodcam project, not re-measured here.
 """
 
 from __future__ import annotations
@@ -51,11 +55,16 @@ class TestTruncationIsNotCompletion:
         LLMClient._reject_if_truncated(payload)
 
     def test_it_is_not_retryable_and_says_so(self):
-        """At temperature 0 a retry reproduces the identical truncation.
+        """A retry re-spends the same budget on the same prompt.
 
-        A guard that refuses correctly will refuse for ever, so the caller must
-        change an input rather than repeat the call. The flag is how a caller
-        can tell without parsing the message.
+        The generator is not the variable -- the budget is -- so the attempt
+        counter is the only thing a retry moves. The caller has to change an
+        input (raise max_tokens, think=False, another model) instead.
+
+        NOTHING BRANCHES ON THIS FLAG YET. triage's worker catches the base
+        LLMError and retries three times regardless (worker.py:1372 ->
+        fail_or_retry). Wiring it up is cortex-hox9; until then the flag is
+        machine-readable documentation, and the message carries the advice.
         """
         assert LLMTruncatedError.retryable is False
         assert LLMError.retryable is True, "the base class stays retryable"
@@ -269,3 +278,115 @@ def test_a_truncated_native_fallback_raises():
     )
     with pytest.raises(LLMTruncatedError):
         c.classify("prompt", "some-model")
+
+
+class TestEveryPublicMethodAgreesAboutTruncation:
+    """The guard lives in _post_completion, so it governs six public methods.
+
+    A mutant that moved it out of the shared helper and into classify() alone
+    survived the whole suite -- only classify was asserted, so the shared
+    POSITION was unpinned even though the behaviour was right.
+
+    Two methods opt OUT, and the rule is which direction a truncated body can
+    push the answer. check_intent and check_email_intent return
+    `answer == "yes"`, so truncation can only ever yield False -- the same
+    negative they already return when the model declines. Everything else
+    either parses structure or hands back a value that gets used, where a
+    partial body is a WRONG answer rather than a negative one.
+
+    Measured on the active config 2026-10-07: 3 live rules reach check_intent,
+    5 check_email_intent, 13 categorize_email, and 0 reach classify or
+    classify_with_extraction -- so the two methods this ticket was written
+    about have no live caller, and the guard's whole live effect is on the
+    other three. That is why the opt-out is not a detail.
+    """
+
+    TRUNCATED = {
+        "choices": [{"message": {"content": "yes, because the sender"}, "finish_reason": "length"}]
+    }
+
+    def _call(self, name):
+        c = _client_returning(self.TRUNCATED)
+        return {
+            "check_intent": lambda: c.check_intent("s", "p", "m"),
+            "check_email_intent": lambda: c.check_email_intent("f", "s", "b", "p", "m"),
+            "categorize_email": lambda: c.categorize_email(
+                "f", "s", "b", "p", "m", ["yes", "sales"]
+            ),
+            "extract_value": lambda: c.extract_value("f", "s", "b", "p", "m"),
+            "classify": lambda: c.classify("p", "m"),
+            "classify_with_extraction": lambda: c.classify_with_extraction("p", "m", ["f"]),
+        }[name]()
+
+    @pytest.mark.parametrize("method", ["categorize_email", "classify", "classify_with_extraction"])
+    def test_a_structured_reader_refuses_a_truncated_body(self, method):
+        """categorize_email is the non-obvious one, and it belongs here.
+
+        It falls back to a substring match over the category list, sorted
+        longest-first. A body cut from "sales_followup" to "sales" matches the
+        WRONG category and returns it as a confident answer -- which is this
+        ticket's defect with a different payload, so it keeps the guard.
+        """
+        with pytest.raises(LLMTruncatedError):
+            self._call(method)
+
+    def test_extraction_degrades_to_no_value_rather_than_a_partial_one(self):
+        """extract_value converts LLMError to None by documented design.
+
+        It must not return the partial string: the value becomes a rule
+        variable, so half an answer is substituted into a live rule.
+        """
+        assert self._call("extract_value") is None
+
+    @pytest.mark.parametrize("method", ["check_intent", "check_email_intent"])
+    def test_a_yes_no_check_tolerates_truncation(self, method):
+        """Deliberately NOT raising. Reverting this breaks 8 live rules.
+
+        A 10-token budget on a yes/no question truncates as a matter of
+        course; raising would dead-letter the job and leave the mail
+        unlabelled, which is worse than the False these already return.
+        """
+        assert self._call(method) is False
+
+    def test_the_opt_out_is_narrow(self):
+        """The yes/no pair tolerates truncation; it does not ignore it.
+
+        A truncated body whose answer IS "yes" still reads as yes -- the
+        method is tolerant because its match is robust, not because it stopped
+        looking.
+        """
+        c = _client_returning(
+            {"choices": [{"message": {"content": "yes"}, "finish_reason": "length"}]}
+        )
+        assert c.check_intent("s", "p", "m") is True
+
+
+class TestTruncationBeatsAnUnreadableShape:
+    """A body can be both truncated and unparseable; truncation is the cause.
+
+    The content read used to run first, so a response whose budget went on
+    `thinking` and came back with content null -- the exact case in the module
+    docstring -- was reported as a retryable shape error.
+    """
+
+    @pytest.mark.parametrize(
+        "payload,what",
+        [
+            (
+                {"choices": [{"message": {"content": None}, "finish_reason": "length"}]},
+                "content null",
+            ),
+            ({"choices": [], "done_reason": "length"}, "choices cut off entirely"),
+        ],
+    )
+    def test_it_is_reported_as_truncation_not_as_a_bad_shape(self, payload, what):
+        c = _client_returning(payload)
+        with pytest.raises(LLMTruncatedError):
+            c.classify("p", "m")
+
+    def test_an_unreadable_shape_that_is_not_truncated_still_raises_plainly(self):
+        """The control: truncation must not become the explanation for everything."""
+        c = _client_returning({"choices": [{"message": {"content": None}}]})
+        with pytest.raises(LLMError) as e:
+            c.classify("p", "m")
+        assert not isinstance(e.value, LLMTruncatedError)
